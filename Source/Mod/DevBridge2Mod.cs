@@ -39,39 +39,63 @@ namespace DevBridge2
 
     internal static class DevBridgeQuicktestActivation
     {
-        private static bool requested;
-        private static bool attempted;
+        private static QuicktestActivationController controller;
 
         internal static void Configure()
         {
-            requested = string.Equals(Environment.GetEnvironmentVariable("DEVBRIDGE_QUICKTEST_REQUESTED"), "1",
+            bool requested = string.Equals(Environment.GetEnvironmentVariable("DEVBRIDGE_QUICKTEST_REQUESTED"), "1",
                 StringComparison.Ordinal);
             if (requested)
+            {
+                controller = new QuicktestActivationController(requested, IsGenuineMainMenuReady,
+                    ActivateBuiltInDevQuicktestButton, maxWaits: 60);
                 LongEventHandler.ExecuteWhenFinished(TryActivate);
+            }
         }
 
         private static void TryActivate()
         {
-            if (!requested || attempted)
+            if (controller == null || controller.ActivationRequested || controller.TerminalFailure)
                 return;
 
-            attempted = true;
-            if (!GenScene.InEntryScene)
+            QuicktestActivationResult result = controller.Tick();
+            if (result == QuicktestActivationResult.WaitingForMainMenu)
             {
-                Log.Warning("[DevBridge2] Built-in Dev Quicktest was requested, but RimWorld was not at the main menu.");
+                LongEventHandler.ExecuteWhenFinished(TryActivate);
                 return;
             }
 
+            if (result == QuicktestActivationResult.Requested)
+            {
+                Log.Message("[DevBridge2] quicktestMainMenu=true; genuine main-menu UI is ready.");
+                Log.Message("[DevBridge2] quicktestRequested=true; built-in Dev Quicktest button activated.");
+            }
+            else
+            {
+                Log.Error("[DevBridge2] quicktest activation reached a bounded terminal failure: " +
+                    controller.Failure);
+            }
+        }
+
+        private static bool IsGenuineMainMenuReady()
+        {
             try
             {
-                PageUtility.InitGameStart();
-                Root_Play.SetupForQuickTestPlay();
-                Log.Message("[DevBridge2] quicktestRequested=true; built-in Dev Quicktest requested from the main menu.");
+                return GenScene.InEntryScene && Current.ProgramState == ProgramState.Entry &&
+                    Find.WindowStack != null && !LongEventHandler.AnyEventNowOrWaiting;
             }
-            catch (Exception exception)
+            catch
             {
-                Log.Error("[DevBridge2] Built-in Dev Quicktest activation failed: " + exception);
+                return false;
             }
+        }
+
+        private static void ActivateBuiltInDevQuicktestButton()
+        {
+            // This is the action wired by RimWorld's built-in main-menu Dev Quicktest
+            // control. It is called only after IsGenuineMainMenuReady succeeds.
+            PageUtility.InitGameStart();
+            Root_Play.SetupForQuickTestPlay();
         }
     }
 

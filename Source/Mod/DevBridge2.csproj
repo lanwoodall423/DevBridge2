@@ -14,6 +14,7 @@
     <OutputPath Condition="'$(OutputPath)' == ''">$(MSBuildThisFileDirectory)..\..\1.6\Assemblies\</OutputPath>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="..\Coordinator\QuicktestActivationCore.cs" Link="QuicktestActivationCore.cs" />
     <Reference Include="Assembly-CSharp">
       <HintPath>$(RimWorldManagedDir)\Assembly-CSharp.dll</HintPath>
       <Private>false</Private>

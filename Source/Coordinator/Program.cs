@@ -29,7 +29,7 @@ internal static class Program
             Directory.CreateDirectory(root);
 
             if (parsed.Server)
-                return CoordinatorServer.Run(root);
+                return CoordinatorServer.Run(root, parsed.RuntimeSlotId, parsed.TicketId);
 
             if (parsed.Command.Count == 0)
             {
@@ -37,7 +37,7 @@ internal static class Program
                 return 2;
             }
 
-            return CoordinatorClient.Run(root, parsed.Command);
+            return CoordinatorClient.Run(root, parsed.Command, parsed.RuntimeSlotId, parsed.TicketId);
         }
         catch (Exception exception)
         {
@@ -56,6 +56,9 @@ internal static class Program
 internal sealed class ParsedArguments
 {
     internal string Root { get; private set; }
+    internal string CoordinatorRoot { get; private set; }
+    internal string RuntimeSlotId { get; private set; }
+    internal string TicketId { get; private set; }
     internal bool Server { get; private set; }
     internal List<string> Command { get; } = new();
 
@@ -79,10 +82,110 @@ internal sealed class ParsedArguments
                 continue;
             }
 
+            if (argument.StartsWith("--root=", StringComparison.OrdinalIgnoreCase))
+            {
+                result.Root = argument.Substring("--root=".Length);
+                continue;
+            }
+
+            if (string.Equals(argument, "--coordinator-root", StringComparison.OrdinalIgnoreCase))
+            {
+                if (index + 1 >= args.Length)
+                    throw new ArgumentException("--coordinator-root needs a path");
+                result.CoordinatorRoot = args[++index];
+                continue;
+            }
+
+            if (argument.StartsWith("--coordinator-root=", StringComparison.OrdinalIgnoreCase))
+            {
+                result.CoordinatorRoot = argument.Substring("--coordinator-root=".Length);
+                continue;
+            }
+
+            if (string.Equals(argument, "--runtime-slot", StringComparison.OrdinalIgnoreCase))
+            {
+                if (index + 1 >= args.Length)
+                    throw new ArgumentException("--runtime-slot needs an identifier");
+                result.RuntimeSlotId = args[++index];
+                continue;
+            }
+
+            if (argument.StartsWith("--runtime-slot=", StringComparison.OrdinalIgnoreCase))
+            {
+                result.RuntimeSlotId = argument.Substring("--runtime-slot=".Length);
+                continue;
+            }
+
+            if (string.Equals(argument, "--ticket", StringComparison.OrdinalIgnoreCase))
+            {
+                if (index + 1 >= args.Length)
+                    throw new ArgumentException("--ticket needs an identifier");
+                result.TicketId = args[++index];
+                continue;
+            }
+
+            if (argument.StartsWith("--ticket=", StringComparison.OrdinalIgnoreCase))
+            {
+                result.TicketId = argument.Substring("--ticket=".Length);
+                continue;
+            }
+
             result.Command.Add(argument);
         }
 
+        if (!string.IsNullOrWhiteSpace(result.Root) && !string.IsNullOrWhiteSpace(result.CoordinatorRoot) &&
+            !RuntimeScope.PathsEqual(result.Root, result.CoordinatorRoot))
+            throw new ArgumentException("--root and --coordinator-root must identify the same directory");
+
+        result.CoordinatorRoot ??= result.Root;
+        result.Root ??= result.CoordinatorRoot;
+        result.TicketId ??= Environment.GetEnvironmentVariable("DEVBRIDGE_TICKET");
+        if (string.IsNullOrWhiteSpace(result.RuntimeSlotId) && !string.IsNullOrWhiteSpace(result.Root) &&
+            string.IsNullOrWhiteSpace(result.TicketId))
+            result.RuntimeSlotId = RuntimeScope.ForRoot(result.Root);
+
         return result;
+    }
+}
+
+internal static class RuntimeScope
+{
+    internal static string ForRoot(string root)
+    {
+        using SHA256 sha = SHA256.Create();
+        byte[] bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(Path.GetFullPath(root).TrimEnd(
+            Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).ToUpperInvariant()));
+        return "slot-" + Convert.ToHexString(bytes).Substring(0, 8);
+    }
+
+    internal static bool PathsEqual(string left, string right)
+    {
+        if (string.IsNullOrWhiteSpace(left) || string.IsNullOrWhiteSpace(right))
+            return false;
+        return string.Equals(Path.GetFullPath(left).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+            Path.GetFullPath(right).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    internal static string ResolveTicketSlot(string root, string ticketId)
+    {
+        if (string.IsNullOrWhiteSpace(ticketId))
+            return null;
+
+        try
+        {
+            string statePath = Path.Combine(root, "Runtime", "state.json");
+            if (!File.Exists(statePath))
+                return null;
+            PersistedState persisted = JsonSerializer.Deserialize<PersistedState>(
+                File.ReadAllText(statePath), Program.JsonOptions);
+            return persisted?.ScopeTickets?.FirstOrDefault(value =>
+                string.Equals(value.Id, ticketId.Trim(), StringComparison.Ordinal))?.RuntimeSlotId;
+        }
+        catch
+        {
+            return null;
+        }
     }
 }
 
@@ -93,12 +196,20 @@ internal sealed class BridgeRequest
     public string Agent { get; set; }
     public int ClientProcessId { get; set; }
     public bool Json { get; set; }
+    public string RuntimeSlotId { get; set; }
+    public string CoordinatorRoot { get; set; }
+    public string TicketId { get; set; }
+    public string GoalId { get; set; }
+    public string WakeId { get; set; }
+    public string McpRequestId { get; set; }
 }
 
 internal static class CoordinatorClient
 {
-    internal static int Run(string root, IReadOnlyList<string> command)
+    internal static int Run(string root, IReadOnlyList<string> command, string runtimeSlotId = null,
+        string ticketId = null)
     {
+        string effectiveSlot = runtimeSlotId ?? RuntimeScope.ResolveTicketSlot(root, ticketId) ?? RuntimeScope.ForRoot(root);
         bool json = command.Any(argument => string.Equals(argument, "--json", StringComparison.OrdinalIgnoreCase));
         List<string> normalizedCommand = command
             .Where(argument => !string.Equals(argument, "--json", StringComparison.OrdinalIgnoreCase))
@@ -115,7 +226,7 @@ internal static class CoordinatorClient
         {
             try
             {
-                pipe = new NamedPipeClientStream(".", PipeNames.ForRoot(root), PipeDirection.InOut,
+                pipe = new NamedPipeClientStream(".", PipeNames.ForSlot(root, effectiveSlot), PipeDirection.InOut,
                     PipeOptions.Asynchronous);
                 pipe.Connect(500);
                 break;
@@ -130,7 +241,7 @@ internal static class CoordinatorClient
 
             if (!serverStartRequested)
             {
-                StartServer(root);
+                StartServer(root, effectiveSlot, ticketId);
                 serverStartRequested = true;
             }
 
@@ -152,7 +263,14 @@ internal static class CoordinatorClient
                 Arguments = normalizedCommand.Skip(1).ToList(),
                 Agent = AgentName(),
                 ClientProcessId = Environment.ProcessId,
-                Json = json
+                Json = json,
+                RuntimeSlotId = runtimeSlotId,
+                CoordinatorRoot = root,
+                TicketId = string.IsNullOrWhiteSpace(ticketId) ?
+                    Environment.GetEnvironmentVariable("DEVBRIDGE_TICKET") : ticketId,
+                GoalId = Environment.GetEnvironmentVariable("DEVBRIDGE_GOAL"),
+                WakeId = Environment.GetEnvironmentVariable("DEVBRIDGE_WAKE"),
+                McpRequestId = Environment.GetEnvironmentVariable("DEVBRIDGE_MCP_REQUEST")
             };
             writer.WriteLine(JsonSerializer.Serialize(request, Program.JsonOptions));
 
@@ -183,7 +301,7 @@ internal static class CoordinatorClient
         return "agent-" + Environment.ProcessId.ToString("X4");
     }
 
-    private static void StartServer(string root)
+    private static void StartServer(string root, string runtimeSlotId, string ticketId)
     {
         string processPath = Environment.ProcessPath;
         if (string.IsNullOrWhiteSpace(processPath))
@@ -215,15 +333,26 @@ internal static class CoordinatorClient
         start.ArgumentList.Add("--server");
         start.ArgumentList.Add("--root");
         start.ArgumentList.Add(root);
+        if (!string.IsNullOrWhiteSpace(runtimeSlotId))
+        {
+            start.ArgumentList.Add("--runtime-slot");
+            start.ArgumentList.Add(runtimeSlotId);
+        }
+        if (!string.IsNullOrWhiteSpace(ticketId))
+        {
+            start.ArgumentList.Add("--ticket");
+            start.ArgumentList.Add(ticketId);
+        }
         Process.Start(start)?.Dispose();
     }
 }
 
 internal static class CoordinatorServer
 {
-    internal static int Run(string root)
+    internal static int Run(string root, string runtimeSlotId = null, string ticketId = null)
     {
-        using Mutex mutex = new(false, PipeNames.MutexForRoot(root));
+        string slot = runtimeSlotId ?? RuntimeScope.ResolveTicketSlot(root, ticketId) ?? RuntimeScope.ForRoot(root);
+        using Mutex mutex = new(false, PipeNames.MutexForSlot(slot));
         bool ownsMutex;
         try
         {
@@ -237,7 +366,11 @@ internal static class CoordinatorServer
         if (!ownsMutex)
             return 0;
 
-        CoordinatorState state = new(root);
+        CoordinatorState state = new(root, new CoordinatorOptions
+        {
+            CoordinatorRoot = root,
+            RuntimeSlotId = slot
+        });
         state.StartRecoveryWork();
 
         while (true)
@@ -245,7 +378,7 @@ internal static class CoordinatorServer
             NamedPipeServerStream server = null;
             try
             {
-                server = new NamedPipeServerStream(PipeNames.ForRoot(root), PipeDirection.InOut, 16,
+                server = new NamedPipeServerStream(PipeNames.ForSlot(root, slot), PipeDirection.InOut, 16,
                     PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
                 server.WaitForConnection();
                 NamedPipeServerStream connected = server;
@@ -349,9 +482,14 @@ internal sealed class ClientOutput
 
 internal static class PipeNames
 {
-    internal static string ForRoot(string root) => "DevBridge2-" + Hash(root);
+    internal static string ForRoot(string root) => ForSlot(root, RuntimeScope.ForRoot(root));
+
+    internal static string ForSlot(string root, string slot) =>
+        "DevBridge2-" + Hash(root + "|" + slot);
 
     internal static string MutexForRoot(string root) => "Local\\DevBridge2Coordinator-" + Hash(root);
+
+    internal static string MutexForSlot(string slot) => "Local\\DevBridge2CoordinatorSlot-" + Hash(slot);
 
     private static string Hash(string value)
     {
@@ -365,6 +503,7 @@ internal enum BridgePhase
 {
     READY,
     DRAINING,
+    WAITING_FOR_BRIDGE,
     RESTARTING,
     LOADING,
     ERROR,
@@ -373,6 +512,8 @@ internal enum BridgePhase
 
 internal sealed class PersistedState
 {
+    public string CoordinatorRoot { get; set; }
+    public string RuntimeSlotId { get; set; }
     public int Generation { get; set; }
     public BridgePhase Phase { get; set; } = BridgePhase.STOPPED;
     public string Error { get; set; }
@@ -387,7 +528,23 @@ internal sealed class PersistedState
     public bool MaintenanceReady { get; set; }
     public bool SessionDirty { get; set; }
     public string ErrorCode { get; set; }
+    public string LaunchOwner { get; set; }
+    public string LaunchRequestKey { get; set; }
+    public string LastLaunchOwner { get; set; }
+    public string LastLaunchRequestKey { get; set; }
+    public int LaunchAttemptCount { get; set; }
+    public int LaunchBudgetRemaining { get; set; }
+    public DateTime? WaitingForBridgeDeadlineUtc { get; set; }
+    public bool RequiresNewProcess { get; set; }
+    public List<ScopeTicket> ScopeTickets { get; set; } = new();
     public List<TestLease> Leases { get; set; } = new();
+}
+
+internal sealed class ScopeTicket
+{
+    public string Id { get; set; }
+    public string RuntimeSlotId { get; set; }
+    public string CoordinatorRoot { get; set; }
 }
 
 internal sealed class TestLease
@@ -412,6 +569,21 @@ internal sealed class JsonCommandResponse
 
     [JsonPropertyName("state")]
     public string State { get; set; }
+
+    [JsonPropertyName("coordinatorRoot")]
+    public string CoordinatorRoot { get; set; }
+
+    [JsonPropertyName("runtimeSlotId")]
+    public string RuntimeSlotId { get; set; }
+
+    [JsonPropertyName("goalId")]
+    public string GoalId { get; set; }
+
+    [JsonPropertyName("wakeId")]
+    public string WakeId { get; set; }
+
+    [JsonPropertyName("mcpRequestId")]
+    public string McpRequestId { get; set; }
 
     [JsonPropertyName("generation")]
     public int Generation { get; set; }
@@ -445,6 +617,21 @@ internal sealed class JsonCommandResponse
 
     [JsonPropertyName("targetGeneration")]
     public int TargetGeneration { get; set; }
+
+    [JsonPropertyName("launchOwner")]
+    public string LaunchOwner { get; set; }
+
+    [JsonPropertyName("launchAttemptCount")]
+    public int LaunchAttemptCount { get; set; }
+
+    [JsonPropertyName("launchBudgetRemaining")]
+    public int LaunchBudgetRemaining { get; set; }
+
+    [JsonPropertyName("waitingForBridgeDeadlineUtc")]
+    public DateTime? WaitingForBridgeDeadlineUtc { get; set; }
+
+    [JsonPropertyName("requiresNewProcess")]
+    public bool RequiresNewProcess { get; set; }
 
     [JsonPropertyName("accepted")]
     public bool? Accepted { get; set; }
@@ -585,10 +772,14 @@ internal sealed class CoordinatorOptions
 {
     internal TimeSpan ReadinessTimeout { get; init; } = TimeSpan.FromMinutes(6);
     internal TimeSpan ProcessExitTimeout { get; init; } = TimeSpan.FromSeconds(15);
+    internal TimeSpan WaitingForBridgeTimeout { get; init; } = TimeSpan.FromSeconds(30);
+    internal int MaxLaunchAttempts { get; init; } = 2;
     internal IProcessAdapter ProcessAdapter { get; init; } = new SystemProcessAdapter();
     internal ICoordinatorClock Clock { get; init; } = SystemCoordinatorClock.Instance;
     internal string RimWorldExecutablePath { get; init; }
     internal string ModsConfigPath { get; init; }
+    internal string CoordinatorRoot { get; init; }
+    internal string RuntimeSlotId { get; init; }
 
     internal static CoordinatorOptions ForProduction()
     {
@@ -819,6 +1010,8 @@ internal sealed class CoordinatorState
     private readonly string readinessPath;
     private readonly string rimWorldExe;
     private readonly string modsConfigPath;
+    private readonly string coordinatorRoot;
+    private readonly string runtimeSlotId;
     private readonly CoordinatorOptions options;
     private readonly IProcessAdapter processAdapter;
     private readonly ICoordinatorClock clock;
@@ -850,6 +1043,12 @@ internal sealed class CoordinatorState
     {
         this.root = Path.GetFullPath(root);
         this.options = options ?? CoordinatorOptions.ForProduction();
+        coordinatorRoot = Path.GetFullPath(this.options.CoordinatorRoot ?? this.root);
+        if (!RuntimeScope.PathsEqual(this.root, coordinatorRoot))
+            throw new InvalidOperationException("Coordinator root does not match the runtime root.");
+        runtimeSlotId = this.options.RuntimeSlotId ?? RuntimeScope.ForRoot(this.root);
+        if (string.IsNullOrWhiteSpace(runtimeSlotId))
+            throw new InvalidOperationException("Runtime slot identity is required.");
         processAdapter = this.options.ProcessAdapter ?? new SystemProcessAdapter();
         clock = this.options.Clock ?? SystemCoordinatorClock.Instance;
         runtimeRoot = Path.Combine(this.root, "Runtime");
@@ -873,12 +1072,19 @@ internal sealed class CoordinatorState
     {
         lock (gate)
         {
+            ExpireWaitingForBridgeLocked();
             if (state.RestartPending && state.Phase == BridgePhase.LOADING && state.ProcessId > 0)
                 StartMonitorLaunchLocked(state.TargetGeneration);
+            else if (state.RestartPending && state.Phase == BridgePhase.LOADING)
+                FailLaunch("the persisted launch has no verified process identity; no replacement launch was attempted",
+                    "LAUNCH_RECOVERY_AMBIGUOUS");
             else if (state.RestartPending)
-                StartRestartWorkerLocked(state.TargetGeneration);
+                StartRestartWorkerLocked(state.TargetGeneration, state.LaunchOwner);
             else if (state.Phase == BridgePhase.LOADING && state.ProcessId > 0)
                 StartMonitorLaunchLocked(state.TargetGeneration);
+            else if (state.Phase == BridgePhase.LOADING)
+                FailLaunch("the persisted launch has no verified process identity; no replacement launch was attempted",
+                    "LAUNCH_RECOVERY_AMBIGUOUS");
             else if (state.Phase == BridgePhase.RESTARTING && state.ProcessId <= 0)
             {
                 state.Phase = BridgePhase.ERROR;
@@ -890,6 +1096,11 @@ internal sealed class CoordinatorState
 
     internal int Execute(BridgeRequest request, Action<string> emit, Func<bool> connected)
     {
+        request ??= new BridgeRequest();
+        request.Arguments ??= new List<string>();
+        if (!TryResolveScope(request, emit))
+            return 4;
+
         string command = (request.Command ?? string.Empty).Trim().ToLowerInvariant();
         List<string> arguments = request.Arguments ?? new List<string>();
 
@@ -905,6 +1116,52 @@ internal sealed class CoordinatorState
             "help" => Help(emit),
             _ => Unknown(command, emit)
         };
+    }
+
+    private bool TryResolveScope(BridgeRequest request, Action<string> emit)
+    {
+        lock (gate)
+        {
+            if (!string.IsNullOrWhiteSpace(request.TicketId))
+            {
+                ScopeTicket ticket = state.ScopeTickets.FirstOrDefault(value =>
+                    string.Equals(value.Id, request.TicketId.Trim(), StringComparison.Ordinal));
+                if (ticket == null)
+                {
+                    emit("Scope denied: the ticket is not bound to an authoritative runtime slot.");
+                    EmitNextCommand(emit, "DevBridge.cmd doctor");
+                    return false;
+                }
+
+                if ((!string.IsNullOrWhiteSpace(request.CoordinatorRoot) &&
+                     !RuntimeScope.PathsEqual(request.CoordinatorRoot, ticket.CoordinatorRoot)) ||
+                    (!string.IsNullOrWhiteSpace(request.RuntimeSlotId) &&
+                     !string.Equals(request.RuntimeSlotId, ticket.RuntimeSlotId, StringComparison.Ordinal)))
+                {
+                    emit("Scope denied: the ticket scope conflicts with the requested runtime slot.");
+                    EmitNextCommand(emit, "DevBridge.cmd doctor");
+                    return false;
+                }
+
+                request.RuntimeSlotId = ticket.RuntimeSlotId;
+                request.CoordinatorRoot = ticket.CoordinatorRoot;
+            }
+
+            if (string.IsNullOrWhiteSpace(request.CoordinatorRoot))
+                request.CoordinatorRoot = coordinatorRoot;
+            if (string.IsNullOrWhiteSpace(request.RuntimeSlotId))
+                request.RuntimeSlotId = runtimeSlotId;
+
+            if (!RuntimeScope.PathsEqual(request.CoordinatorRoot, coordinatorRoot) ||
+                !string.Equals(request.RuntimeSlotId, runtimeSlotId, StringComparison.Ordinal))
+            {
+                emit("Scope denied: runtime slot and coordinator root do not match this coordinator.");
+                EmitNextCommand(emit, "DevBridge.cmd doctor");
+                return false;
+            }
+
+            return true;
+        }
     }
 
     private int Test(IReadOnlyList<string> arguments, BridgeRequest request, Action<string> emit, Func<bool> connected)
@@ -1157,7 +1414,7 @@ internal sealed class CoordinatorState
                 {
                     emit("No ready RimWorld generation is running.");
                     emit("DevBridge is launching RimWorld normally, then requesting built-in Dev Quicktest.");
-                    StartInitialLaunchLocked();
+                    StartInitialLaunchLocked(LaunchOwnerFor(request));
                 }
                 else if (state.Phase == BridgePhase.ERROR)
                 {
@@ -1350,6 +1607,9 @@ internal sealed class CoordinatorState
                 state.ErrorCode = null;
                 state.RestartPending = false;
                 state.TargetGeneration = 0;
+                state.LaunchOwner = null;
+                state.LaunchRequestKey = null;
+                state.WaitingForBridgeDeadlineUtc = null;
                 DeleteReadinessLocked();
                 SaveStateLocked();
                 Monitor.PulseAll(gate);
@@ -1383,6 +1643,23 @@ internal sealed class CoordinatorState
                     return 4;
                 }
 
+                string requestOwner = LaunchOwnerFor(request);
+                if (!state.MaintenanceReady &&
+                    (state.Phase == BridgePhase.RESTARTING || state.Phase == BridgePhase.LOADING ||
+                     state.Phase == BridgePhase.DRAINING || state.RestartPending))
+                {
+                    if (string.Equals(state.LaunchOwner, requestOwner, StringComparison.Ordinal))
+                    {
+                        emit("Ensure-ready is already owned by this agent/session.");
+                        EmitNextCommand(emit, "DevBridge.cmd wait-ready");
+                        return 0;
+                    }
+
+                    emit("Ensure-ready denied: another owner is already launching this runtime slot.");
+                    emit("No launch was attempted.");
+                    return 4;
+                }
+
                 if (state.MaintenanceReady)
                 {
                     MaintenanceValidation validation = RevalidateMaintenanceReadyLocked();
@@ -1396,6 +1673,12 @@ internal sealed class CoordinatorState
                     }
 
                     targetGeneration = Math.Max(1, state.Generation + 1);
+                    if (!TryAcquireLaunchOwnerLocked(requestOwner, "ensure-" + targetGeneration, resetBudget: true))
+                    {
+                        emit("Ensure-ready denied: the runtime slot launch owner is unavailable.");
+                        emit("No launch was attempted.");
+                        return 4;
+                    }
                     state.TargetGeneration = targetGeneration;
                     state.MaintenanceReady = false;
                     state.Error = null;
@@ -1445,7 +1728,7 @@ internal sealed class CoordinatorState
             if (shouldLaunch)
             {
                 emit("Maintenance window released by lease holder; launching one new RimWorld process.");
-                LaunchGenerationWorker(targetGeneration, isRestart: true);
+                LaunchGenerationWorker(targetGeneration, isRestart: true, owner: LaunchOwnerFor(request));
             }
 
             lock (gate)
@@ -1474,6 +1757,9 @@ internal sealed class CoordinatorState
         int targetGeneration;
         int currentGeneration;
         bool alreadyPending;
+        bool observedPending;
+        lock (gate)
+            observedPending = state.RestartPending;
         lock (lifecycleGate)
         {
             lock (gate)
@@ -1486,8 +1772,24 @@ internal sealed class CoordinatorState
                     EmitNextCommand(emit, "DevBridge.cmd doctor");
                     return 4;
                 }
+                string requestOwner = LaunchOwnerFor(request);
+                if (observedPending && !string.Equals(state.LaunchOwner, requestOwner, StringComparison.Ordinal) &&
+                    (!string.IsNullOrWhiteSpace(state.LaunchOwner) ||
+                     !string.Equals(state.LastLaunchOwner, requestOwner, StringComparison.Ordinal)))
+                {
+                    emit("Restart denied: another owner already controls this runtime slot launch.");
+                    emit("No launch was attempted.");
+                    return 4;
+                }
                 currentGeneration = state.Generation;
                 alreadyPending = state.RestartPending;
+                if (alreadyPending && !string.IsNullOrWhiteSpace(state.LaunchOwner) &&
+                    !string.Equals(state.LaunchOwner, requestOwner, StringComparison.Ordinal))
+                {
+                    emit("Restart denied: another owner already controls this runtime slot launch.");
+                    emit("No launch was attempted.");
+                    return 4;
+                }
                 if (state.MaintenanceReady)
                 {
                     if (request.Arguments.Count < 1 ||
@@ -1508,6 +1810,13 @@ internal sealed class CoordinatorState
                         return 4;
                     }
 
+                    if (!TryAcquireLaunchOwnerLocked(LaunchOwnerFor(request),
+                            "restart-" + Math.Max(1, state.Generation + 1), resetBudget: true))
+                    {
+                        emit("Restart denied: another owner already controls this runtime slot launch.");
+                        emit("No launch was attempted.");
+                        return 4;
+                    }
                     state.Leases.Remove(maintenanceLease);
                     state.MaintenanceReady = false;
                     state.SessionDirty = true;
@@ -1523,18 +1832,37 @@ internal sealed class CoordinatorState
                     return 4;
                 }
 
+                string completedRequestKey = "restart-" + state.Generation;
+                if (!alreadyPending && state.Phase == BridgePhase.READY &&
+                    string.Equals(state.LastLaunchOwner, LaunchOwnerFor(request), StringComparison.Ordinal) &&
+                    string.Equals(state.LastLaunchRequestKey, completedRequestKey, StringComparison.Ordinal))
+                {
+                    targetGeneration = state.Generation;
+                    emit("Restart already completed for generation " + targetGeneration + ".");
+                    return 0;
+                }
+
                 if (!alreadyPending)
                 {
                     targetGeneration = Math.Max(state.Generation + 1, state.TargetGeneration);
+                    if (!TryAcquireLaunchOwnerLocked(LaunchOwnerFor(request), "restart-" + targetGeneration,
+                            resetBudget: true))
+                    {
+                        emit("Restart denied: another owner already controls this runtime slot launch.");
+                        emit("No launch was attempted.");
+                        return 4;
+                    }
                     state.TargetGeneration = targetGeneration;
                     state.RestartPending = true;
                     state.RestartRequestedUtc = clock.UtcNow;
+                    state.WaitingForBridgeDeadlineUtc = clock.UtcNow.Add(options.WaitingForBridgeTimeout);
+                    state.RequiresNewProcess = true;
                     state.Error = null;
                     state.ErrorCode = null;
                     state.Phase = BridgePhase.DRAINING;
                     DeleteReadinessLocked();
                     SaveStateLocked();
-                    StartRestartWorkerLocked(targetGeneration);
+                    StartRestartWorkerLocked(targetGeneration, LaunchOwnerFor(request));
                     Monitor.PulseAll(gate);
                 }
                 else
@@ -1594,7 +1922,7 @@ internal sealed class CoordinatorState
                 {
                     emit("No ready RimWorld generation is running.");
                     emit("DevBridge is launching RimWorld normally, then requesting built-in Dev Quicktest.");
-                    StartInitialLaunchLocked();
+                    StartInitialLaunchLocked(LaunchOwnerFor(request));
                 }
             }
         }
@@ -1711,9 +2039,57 @@ internal sealed class CoordinatorState
         }
     }
 
-    private void StartInitialLaunchLocked()
+    private string LaunchOwnerFor(BridgeRequest request)
+    {
+        string agent = string.IsNullOrWhiteSpace(request?.Agent) ? "unknown-agent" : request.Agent.Trim();
+        return agent + "@" + (request?.ClientProcessId ?? 0).ToString();
+    }
+
+    private bool TryAcquireLaunchOwnerLocked(string owner, string requestKey, bool resetBudget)
+    {
+        bool pending = state.RestartPending || state.Phase == BridgePhase.RESTARTING ||
+            state.Phase == BridgePhase.LOADING || state.Phase == BridgePhase.DRAINING;
+        if (pending && !string.IsNullOrWhiteSpace(state.LaunchOwner))
+        {
+            if (string.Equals(state.LaunchOwner, owner, StringComparison.Ordinal) &&
+                string.Equals(state.LaunchRequestKey, requestKey, StringComparison.Ordinal))
+                return true;
+            return false;
+        }
+
+        if (resetBudget)
+        {
+            state.LaunchAttemptCount = 0;
+            state.LaunchBudgetRemaining = Math.Max(1, options.MaxLaunchAttempts);
+        }
+
+        if (state.LaunchBudgetRemaining <= 0)
+        {
+            state.Phase = BridgePhase.ERROR;
+            state.RestartPending = false;
+            state.ErrorCode = "LAUNCH_BUDGET_EXHAUSTED";
+            state.Error = "The finite RimWorld launch budget is exhausted; no further launch was attempted.";
+            state.LaunchOwner = null;
+            state.LaunchRequestKey = null;
+            state.WaitingForBridgeDeadlineUtc = null;
+            SaveStateLocked();
+            Monitor.PulseAll(gate);
+            return false;
+        }
+
+        state.LaunchOwner = owner;
+        state.LaunchRequestKey = requestKey;
+        SaveStateLocked();
+        return true;
+    }
+
+    private void StartInitialLaunchLocked(string owner = null)
     {
         if (launchTask != null && !launchTask.IsCompleted)
+            return;
+
+        owner ??= "coordinator@" + runtimeSlotId;
+        if (!TryAcquireLaunchOwnerLocked(owner, "initial", resetBudget: true))
             return;
 
         int target = Math.Max(1, state.Generation + 1);
@@ -1726,21 +2102,38 @@ internal sealed class CoordinatorState
         state.LaunchGeneration = target;
         state.ProcessId = 0;
         state.ProcessStartUtcTicks = 0;
+        state.RequiresNewProcess = true;
+        state.WaitingForBridgeDeadlineUtc = null;
         DeleteReadinessLocked();
         SaveStateLocked();
         launchTask = Task.Run(() =>
         {
             lock (lifecycleGate)
-                LaunchGenerationWorker(target, isRestart: false);
+                LaunchGenerationWorker(target, isRestart: false, owner: owner);
         });
     }
 
-    private void StartRestartWorkerLocked(int targetGeneration)
+    private void StartRestartWorkerLocked(int targetGeneration, string owner = null)
     {
         if (restartTask != null && !restartTask.IsCompleted)
             return;
 
-        restartTask = Task.Run(() => RestartWorker(targetGeneration));
+        owner ??= state.LaunchOwner;
+        if (string.IsNullOrWhiteSpace(owner))
+        {
+            FailLaunch("the accepted restart has no durable launch owner; no launch was attempted",
+                "LAUNCH_OWNER_MISSING");
+            return;
+        }
+        if (state.LaunchBudgetRemaining <= 0)
+        {
+            FailLaunch("the finite launch budget is exhausted", "LAUNCH_BUDGET_EXHAUSTED");
+            return;
+        }
+        if (!string.Equals(state.LaunchOwner, owner, StringComparison.Ordinal))
+            return;
+
+        restartTask = Task.Run(() => RestartWorker(targetGeneration, owner));
     }
 
     private void StartMonitorLaunchLocked(int targetGeneration)
@@ -1751,7 +2144,7 @@ internal sealed class CoordinatorState
         launchTask = Task.Run(() => MonitorLaunchWorker(targetGeneration));
     }
 
-    private void RestartWorker(int targetGeneration)
+    private void RestartWorker(int targetGeneration, string owner)
     {
         try
         {
@@ -1767,6 +2160,10 @@ internal sealed class CoordinatorState
                     if (!state.RestartPending || state.TargetGeneration != targetGeneration)
                         return;
 
+                    ExpireWaitingForBridgeLocked();
+                    if (!state.RestartPending)
+                        return;
+
                     if (launchTask != null && !launchTask.IsCompleted)
                     {
                         Monitor.Wait(gate, 1000);
@@ -1775,8 +2172,19 @@ internal sealed class CoordinatorState
 
                     if (state.Leases.Count > 0)
                     {
+                        if (state.Phase != BridgePhase.WAITING_FOR_BRIDGE)
+                        {
+                            state.Phase = BridgePhase.WAITING_FOR_BRIDGE;
+                            SaveStateLocked();
+                        }
                         Monitor.Wait(gate, 1000);
                         continue;
+                    }
+
+                    if (state.Phase == BridgePhase.WAITING_FOR_BRIDGE)
+                    {
+                        state.Phase = BridgePhase.DRAINING;
+                        SaveStateLocked();
                     }
 
                     state.Phase = BridgePhase.RESTARTING;
@@ -1797,7 +2205,7 @@ internal sealed class CoordinatorState
                 FailLaunch(stopError, stopErrorCode);
                 return;
             }
-            LaunchGenerationWorker(targetGeneration, isRestart: true);
+            LaunchGenerationWorker(targetGeneration, isRestart: true, owner: owner);
             }
         }
         catch (Exception exception)
@@ -1808,14 +2216,22 @@ internal sealed class CoordinatorState
         }
     }
 
-    private void LaunchGenerationWorker(int targetGeneration, bool isRestart)
+    private void LaunchGenerationWorker(int targetGeneration, bool isRestart, string owner = null)
     {
         string launchId = Guid.NewGuid().ToString("N");
         IManagedProcess process = null;
         try
         {
+            owner ??= "coordinator@" + runtimeSlotId;
             lock (gate)
             {
+                if (!string.Equals(state.LaunchOwner, owner, StringComparison.Ordinal))
+                    return;
+                if (state.LaunchBudgetRemaining <= 0)
+                {
+                    FailLaunch("the finite launch budget is exhausted", "LAUNCH_BUDGET_EXHAUSTED");
+                    return;
+                }
                 state.Phase = BridgePhase.LOADING;
                 state.TargetGeneration = targetGeneration;
                 state.LaunchId = launchId;
@@ -1833,12 +2249,21 @@ internal sealed class CoordinatorState
 
             EnsureDevBridgeModEnabled();
 
-            List<UnmanagedRimWorldProcess> unmanagedProcesses =
-                FindUnmanagedRimWorldProcesses(processIdToExclude: 0, startTicksToExclude: 0);
-            if (unmanagedProcesses.Count > 0)
-                throw new InvalidOperationException("an unmanaged RimWorld process is already running (PID " +
-                    string.Join(", ", unmanagedProcesses.Select(value => value.ProcessId.ToString())) +
-                    "); close it through Steam before retrying");
+            lock (gate)
+            {
+                // The ownership lock and lifecycleGate are held immediately before the
+                // only raw launch call. This snapshot cannot be overwritten by another owner.
+                List<UnmanagedRimWorldProcess> unmanagedProcesses =
+                    FindUnmanagedRimWorldProcesses(processIdToExclude: 0, startTicksToExclude: 0);
+                if (unmanagedProcesses.Count > 0)
+                    throw new InvalidOperationException("an unmanaged RimWorld process is already running (PID " +
+                        string.Join(", ", unmanagedProcesses.Select(value => value.ProcessId.ToString())) +
+                        "); close it through Steam before retrying");
+
+                state.LaunchAttemptCount++;
+                state.LaunchBudgetRemaining--;
+                SaveStateLocked();
+            }
 
             process = processAdapter.Launch(new ProcessLaunchRequest
             {
@@ -1962,6 +2387,9 @@ internal sealed class CoordinatorState
                 "READINESS_TIMEOUT: " + detail + ". The original process was retained; no replacement launch was attempted." :
                 "RimWorld did not report a playable quicktest map: " + detail +
                 ". Inspect Runtime/readiness.json and the RimWorld logs, then run DevBridge.cmd restart.";
+            state.LaunchOwner = null;
+            state.LaunchRequestKey = null;
+            state.WaitingForBridgeDeadlineUtc = null;
             SaveStateLocked();
             Monitor.PulseAll(gate);
         }
@@ -2008,7 +2436,7 @@ internal sealed class CoordinatorState
                 try
                 {
                     process.RequestTermination();
-                    process.WaitForExit(TimeSpan.FromSeconds(5));
+                    process.WaitForExit(options.ProcessExitTimeout);
                 }
                 catch (ProcessInspectionException)
                 {
@@ -2100,6 +2528,12 @@ internal sealed class CoordinatorState
         state.RestartPending = false;
         state.RestartRequestedUtc = null;
         state.TargetGeneration = 0;
+        state.LastLaunchOwner = state.LaunchOwner;
+        state.LastLaunchRequestKey = state.LaunchRequestKey;
+        state.LaunchOwner = null;
+        state.LaunchRequestKey = null;
+        state.WaitingForBridgeDeadlineUtc = null;
+        state.RequiresNewProcess = false;
         state.MaintenanceReady = false;
         foreach (TestLease lease in state.Leases)
             lease.Generation = targetGeneration;
@@ -2185,9 +2619,37 @@ internal sealed class CoordinatorState
         }
     }
 
+    private void ExpireWaitingForBridgeLocked()
+    {
+        if (!state.RestartPending || !state.WaitingForBridgeDeadlineUtc.HasValue ||
+            clock.UtcNow < state.WaitingForBridgeDeadlineUtc.Value.ToUniversalTime() ||
+            state.Leases.Count == 0)
+            return;
+
+        state.Phase = BridgePhase.ERROR;
+        state.RestartPending = false;
+        state.TargetGeneration = 0;
+        state.WaitingForBridgeDeadlineUtc = null;
+        state.ErrorCode = "WAITING_FOR_BRIDGE_EXPIRED";
+        state.Error = "The durable WAITING_FOR_BRIDGE deadline expired; no launch was attempted.";
+        state.LaunchOwner = null;
+        state.LaunchRequestKey = null;
+        SaveStateLocked();
+        Monitor.PulseAll(gate);
+    }
+
     private void SynchronizeLocked()
     {
         PruneStaleLeasesLocked();
+        ExpireWaitingForBridgeLocked();
+
+        if (state.Phase == BridgePhase.LOADING && state.ProcessId <= 0 &&
+            (launchTask == null || launchTask.IsCompleted))
+        {
+            FailLaunch("the persisted launch has no verified process identity; no replacement launch was attempted",
+                "LAUNCH_RECOVERY_AMBIGUOUS");
+            return;
+        }
 
         bool owned = false;
         if (state.Phase == BridgePhase.READY && state.ProcessId > 0)
@@ -2219,9 +2681,15 @@ internal sealed class CoordinatorState
         {
             if (state.TargetGeneration <= state.Generation)
                 state.TargetGeneration = state.Generation + 1;
+            if (string.IsNullOrWhiteSpace(state.LaunchOwner))
+            {
+                FailLaunch("the accepted restart has no durable launch owner; no launch was attempted",
+                    "LAUNCH_OWNER_MISSING");
+                return;
+            }
             if ((state.Phase != BridgePhase.LOADING || launchTask == null || launchTask.IsCompleted) &&
                 (restartTask == null || restartTask.IsCompleted))
-                StartRestartWorkerLocked(state.TargetGeneration);
+                StartRestartWorkerLocked(state.TargetGeneration, state.LaunchOwner);
         }
         else if (state.Phase == BridgePhase.LOADING && state.ProcessId > 0 &&
                  (launchTask == null || launchTask.IsCompleted))
@@ -2514,12 +2982,51 @@ internal sealed class CoordinatorState
 
     private void NormalizeStateLocked()
     {
+        bool changed = false;
+        if (string.IsNullOrWhiteSpace(state.CoordinatorRoot))
+        {
+            state.CoordinatorRoot = coordinatorRoot;
+            changed = true;
+        }
+        else if (!RuntimeScope.PathsEqual(state.CoordinatorRoot, coordinatorRoot))
+        {
+            throw new InvalidOperationException("Persisted coordinator root does not match this coordinator.");
+        }
+
+        if (string.IsNullOrWhiteSpace(state.RuntimeSlotId))
+        {
+            state.RuntimeSlotId = runtimeSlotId;
+            changed = true;
+        }
+        else if (!string.Equals(state.RuntimeSlotId, runtimeSlotId, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("Persisted runtime slot does not match this coordinator root.");
+        }
+
         state.Leases ??= new List<TestLease>();
+        state.ScopeTickets ??= new List<ScopeTicket>();
         state.Phase = Enum.IsDefined(state.Phase) ? state.Phase : BridgePhase.STOPPED;
         if (state.RestartPending && state.TargetGeneration <= state.Generation)
             state.TargetGeneration = state.Generation + 1;
         if (state.Phase == BridgePhase.READY && state.Generation <= 0)
             state.Phase = BridgePhase.STOPPED;
+        if (state.LaunchBudgetRemaining < 0)
+        {
+            state.LaunchBudgetRemaining = 0;
+            changed = true;
+        }
+        if (state.LaunchAttemptCount < 0)
+        {
+            state.LaunchAttemptCount = 0;
+            changed = true;
+        }
+        if (state.Generation == 0 && state.LaunchAttemptCount == 0 && state.LaunchBudgetRemaining == 0)
+        {
+            state.LaunchBudgetRemaining = Math.Max(1, options.MaxLaunchAttempts);
+            changed = true;
+        }
+        if (changed)
+            SaveStateLocked();
     }
 
     private PersistedState CloneStateLocked()
@@ -2635,6 +3142,11 @@ internal sealed class CoordinatorState
             Command = command,
             ExitCode = effectiveExitCode,
             State = snapshot.Phase.ToString(),
+            CoordinatorRoot = snapshot.CoordinatorRoot,
+            RuntimeSlotId = snapshot.RuntimeSlotId,
+            GoalId = request.GoalId,
+            WakeId = request.WakeId,
+            McpRequestId = request.McpRequestId,
             GameState = snapshot.Phase.ToString(),
             Generation = snapshot.Generation,
             RimWorldPid = snapshot.ProcessId,
@@ -2648,6 +3160,11 @@ internal sealed class CoordinatorState
             ActiveTests = snapshot.Leases.Count,
             RestartPending = snapshot.RestartPending,
             TargetGeneration = snapshot.TargetGeneration,
+            LaunchOwner = snapshot.LaunchOwner,
+            LaunchAttemptCount = snapshot.LaunchAttemptCount,
+            LaunchBudgetRemaining = snapshot.LaunchBudgetRemaining,
+            WaitingForBridgeDeadlineUtc = snapshot.WaitingForBridgeDeadlineUtc,
+            RequiresNewProcess = snapshot.RequiresNewProcess,
             Agent = request.Agent,
             Leases = snapshot.Leases
                 .OrderBy(value => value.StartedUtc)

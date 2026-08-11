@@ -1,4 +1,5 @@
 using System.Text.Json;
+using DevBridge2;
 
 namespace DevBridge.Coordinator;
 
@@ -23,6 +24,17 @@ internal static class OfflineTests
         Run("maintenance claims are freshly re-enumerated", TestMaintenanceRevalidation);
         Run("uncertain maintenance operations make no adapter calls", TestMaintenanceInspectionNoLaunch);
         Run("status uses one authoritative process snapshot", TestStatusSnapshotConsistency);
+        Run("duplicate launch requests have one slot owner", TestDuplicateLaunchOwnership);
+        Run("fifty duplicate restart requests have one launch", TestDuplicateRestartOwnership);
+        Run("competing restart owners cannot overwrite provenance", TestCompetingRestartOwners);
+        Run("recovery budget and waiting deadline are finite", TestFiniteRecovery);
+        Run("crash recovery never duplicates an ambiguous launch", TestCrashRecoveryNoDuplicateLaunch);
+        Run("root and runtime slot bindings are authoritative", TestRuntimeScopeBinding);
+        Run("ticket routing preserves its durable slot", TestTicketRouting);
+        Run("goal wake and MCP scope metadata is preserved", TestScopeMetadata);
+        Run("quicktest activation is ordered and bounded", TestQuicktestActivation);
+        Run("coordinator-root argument forms are accepted", TestCoordinatorRootArgumentForms);
+        Run("wrapper propagates native exit codes", DevBridgeWrapperTests.Run);
 
         Console.WriteLine(failures == 0 ? "OFFLINE TESTS PASS" : "OFFLINE TESTS FAIL: " + failures);
         return failures == 0 ? 0 : 1;
@@ -348,6 +360,252 @@ internal static class OfflineTests
         }
     }
 
+    private static void TestDuplicateLaunchOwnership()
+    {
+        using Fixture fixture = Fixture.MaintenanceWithLease();
+        fixture.Adapter.ReadyOnLaunch = true;
+
+        Task<int>[] requests = Enumerable.Range(0, 50)
+            .Select(_ => Task.Run(() => fixture.State.Execute(
+                Request("ensure-ready", "holder", 77, "T001"), _ => { }, () => true)))
+            .ToArray();
+        Task.WaitAll(requests);
+
+        Assert(requests.All(value => value.Result == 0), "same-owner duplicate ensure requests must be idempotent");
+        Assert(fixture.Adapter.LaunchCalls == 1, "fifty duplicate requests must have exactly one launch attempt");
+        JsonCommandResponse response = fixture.State.CreateJsonResponse(Request("status", "holder", 77), 0,
+            Array.Empty<string>());
+        Assert(response.LaunchOwner == null && response.ActiveTests == 1,
+            "completed launch ownership must not leave an orphan owner or lease");
+    }
+
+    private static void TestFiniteRecovery()
+    {
+        using Fixture expired = new(new PersistedState
+        {
+            Generation = 1,
+            Phase = BridgePhase.DRAINING,
+            TargetGeneration = 2,
+            RestartPending = true,
+            WaitingForBridgeDeadlineUtc = ClockStart.AddSeconds(-1),
+            LaunchBudgetRemaining = 2,
+            Leases = new List<TestLease> { new() { Id = "T001", Agent = "holder", ClientProcessId = 77,
+                Generation = 1, StartedUtc = ClockStart } }
+        });
+        expired.State.StartRecoveryWork();
+        JsonCommandResponse expiredResponse = expired.State.CreateJsonResponse(Request("status"), 0,
+            Array.Empty<string>());
+        Assert(expiredResponse.ErrorCode == "WAITING_FOR_BRIDGE_EXPIRED" &&
+            expired.Adapter.LaunchCalls == 0, "expired WAITING_FOR_BRIDGE must become terminal without launch");
+
+        using Fixture exhausted = new(new PersistedState
+        {
+            Generation = 1,
+            Phase = BridgePhase.DRAINING,
+            TargetGeneration = 2,
+            RestartPending = true,
+            LaunchOwner = "recovery-owner@1",
+            LaunchRequestKey = "restart-2",
+            LaunchBudgetRemaining = 0
+        });
+        exhausted.State.StartRecoveryWork();
+        JsonCommandResponse exhaustedResponse = exhausted.State.CreateJsonResponse(Request("status"), 0,
+            Array.Empty<string>());
+        Assert(exhaustedResponse.ErrorCode == "LAUNCH_BUDGET_EXHAUSTED" &&
+            exhausted.Adapter.LaunchCalls == 0, "exhausted launch budget must prevent recovery launch");
+    }
+
+    private static void TestDuplicateRestartOwnership()
+    {
+        using Fixture fixture = Fixture.ReadyWithoutLease();
+        fixture.Adapter.ReadyOnLaunch = true;
+        fixture.Adapter.BlockWaitForExit = true;
+        BridgeRequest request = Request("restart", "restart-agent", 90);
+        Task<int> first = Task.Factory.StartNew(() => fixture.State.Execute(request, _ => { }, () => true),
+            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        Assert(fixture.Adapter.TerminationRequested.Wait(TimeSpan.FromSeconds(10)),
+            "restart did not reach the identity-checked stop");
+
+        Task<int>[] duplicates = Enumerable.Range(0, 49)
+            .Select(_ => Task.Factory.StartNew(() => fixture.State.Execute(Request("restart", "restart-agent", 90), _ => { }, () => true),
+                CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default))
+            .ToArray();
+        fixture.Adapter.ReleaseWait.Set();
+        Assert(first.Wait(TimeSpan.FromSeconds(10)), "primary restart did not finish");
+        Assert(Task.WaitAll(duplicates, TimeSpan.FromSeconds(10)), "duplicate restarts did not finish");
+        Assert(first.Result == 0 && duplicates.All(value => value.Result == 0),
+            "same-owner duplicate restarts must be idempotent");
+        Assert(fixture.Adapter.LaunchCalls == 1, "fifty duplicate restarts must have exactly one launch attempt");
+    }
+
+    private static void TestCompetingRestartOwners()
+    {
+        using Fixture fixture = Fixture.ReadyWithoutLease();
+        fixture.Adapter.ReadyOnLaunch = true;
+        fixture.Adapter.BlockWaitForExit = true;
+        Task<int> primary = Task.Factory.StartNew(() => fixture.State.Execute(Request("restart", "owner-a", 90), _ => { }, () => true),
+            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        Assert(fixture.Adapter.TerminationRequested.Wait(TimeSpan.FromSeconds(10)),
+            "primary owner did not acquire the restart slot");
+        Task<int> competing = Task.Factory.StartNew(
+            () => fixture.State.Execute(Request("restart", "owner-b", 91), _ => { }, () => true),
+            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        Thread.Sleep(100);
+        PersistedState pending = JsonSerializer.Deserialize<PersistedState>(
+            File.ReadAllText(Path.Combine(fixture.Root, "Runtime", "state.json")), Program.JsonOptions);
+        Assert(pending?.LaunchOwner == "owner-a@90", "competing owner overwrote launch provenance");
+        fixture.Adapter.ReleaseWait.Set();
+        Assert(primary.Wait(TimeSpan.FromSeconds(10)) && primary.Result == 0, "primary restart did not finish");
+        Assert(competing.Wait(TimeSpan.FromSeconds(10)) && competing.Result == 4,
+            "a competing owner must be rejected while the slot is pending");
+        Assert(fixture.Adapter.LaunchCalls == 1, "competing owner must not create a second launch");
+    }
+
+    private static void TestCrashRecoveryNoDuplicateLaunch()
+    {
+        using Fixture ambiguous = new(new PersistedState
+        {
+            Generation = 1,
+            Phase = BridgePhase.LOADING,
+            TargetGeneration = 2,
+            RestartPending = true,
+            LaunchOwner = "owner-a@90",
+            LaunchRequestKey = "restart-2",
+            LaunchBudgetRemaining = 2,
+            ProcessId = 0,
+            ProcessStartUtcTicks = 0
+        });
+        ambiguous.State.StartRecoveryWork();
+        JsonCommandResponse response = ambiguous.State.CreateJsonResponse(Request("status"), 0,
+            Array.Empty<string>());
+        Assert(response.ErrorCode == "LAUNCH_RECOVERY_AMBIGUOUS" && ambiguous.Adapter.LaunchCalls == 0,
+            "reconnect without an exact process identity must fail closed without relaunching");
+
+        using Fixture monitored = Fixture.LoadingWithLease();
+        monitored.State.StartRecoveryWork();
+        Assert(monitored.Adapter.LaunchCalls == 0, "recovery monitoring must not invoke the launcher");
+    }
+
+    private static void TestScopeMetadata()
+    {
+        using Fixture fixture = Fixture.ReadyWithoutLease();
+        BridgeRequest request = Request("status", "scope-agent", 91);
+        request.GoalId = "goal-7";
+        request.WakeId = "wake-8";
+        request.McpRequestId = "mcp-9";
+        JsonCommandResponse response = fixture.State.CreateJsonResponse(request, 0, Array.Empty<string>());
+        Assert(response.GoalId == "goal-7" && response.WakeId == "wake-8" && response.McpRequestId == "mcp-9",
+            "scope metadata was not preserved through the coordinator response");
+    }
+
+    private static void TestRuntimeScopeBinding()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "DevBridge2-scope-" + Guid.NewGuid().ToString("N"));
+        string other = Path.Combine(root, "other");
+        ParsedArguments separated = ParsedArguments.Parse(new[] { "--root", root, "--coordinator-root", root, "status" });
+        ParsedArguments equals = ParsedArguments.Parse(new[] { "--coordinator-root=" + root, "status" });
+        Assert(RuntimeScope.PathsEqual(separated.Root, root) && RuntimeScope.PathsEqual(separated.CoordinatorRoot, root),
+            "separated coordinator-root form must bind to root");
+        Assert(RuntimeScope.PathsEqual(equals.Root, root) && RuntimeScope.PathsEqual(equals.CoordinatorRoot, root),
+            "equals coordinator-root form must bind to root");
+
+        bool mismatchRejected = false;
+        try { ParsedArguments.Parse(new[] { "--root", root, "--coordinator-root", other, "status" }); }
+        catch (ArgumentException) { mismatchRejected = true; }
+        Assert(mismatchRejected, "mismatched command-line roots must be rejected");
+
+        using Fixture fixture = Fixture.ReadyWithoutLease();
+        fixture.WriteState(new PersistedState
+        {
+            CoordinatorRoot = other,
+            RuntimeSlotId = "slot-other",
+            Generation = 1,
+            Phase = BridgePhase.READY
+        });
+        bool persistedMismatchRejected = false;
+        try { fixture.Reload(); }
+        catch (InvalidOperationException) { persistedMismatchRejected = true; }
+        Assert(persistedMismatchRejected, "a persisted root mismatch must be rejected even if the legacy path is absent");
+    }
+
+    private static void TestTicketRouting()
+    {
+        using Fixture fixture = Fixture.ReadyWithoutLease();
+        fixture.WriteState(new PersistedState
+        {
+            CoordinatorRoot = fixture.Root,
+            RuntimeSlotId = RuntimeScope.ForRoot(fixture.Root),
+            Generation = 1,
+            Phase = BridgePhase.READY,
+            ProcessId = 101,
+            ProcessStartUtcTicks = 1001,
+            ScopeTickets = new List<ScopeTicket>
+            {
+                new() { Id = "ticket-1", CoordinatorRoot = fixture.Root,
+                    RuntimeSlotId = RuntimeScope.ForRoot(fixture.Root) }
+            }
+        });
+        ParsedArguments ticketArguments = ParsedArguments.Parse(new[]
+            { "--root", fixture.Root, "--ticket", "ticket-1", "status" });
+        ParsedArguments ticketEqualsArguments = ParsedArguments.Parse(new[]
+            { "--root=" + fixture.Root, "--ticket=ticket-1", "status" });
+        Assert(ticketArguments.TicketId == "ticket-1" && ticketArguments.RuntimeSlotId == null &&
+            ticketEqualsArguments.TicketId == "ticket-1" && ticketEqualsArguments.RuntimeSlotId == null,
+            "ticket-only CLI requests must preserve the ticket without inventing a root-derived slot");
+        Assert(RuntimeScope.ResolveTicketSlot(fixture.Root, "ticket-1") == RuntimeScope.ForRoot(fixture.Root),
+            "ticket-only startup must resolve the persisted slot before connecting");
+        Assert(PipeNames.ForSlot(fixture.Root, "slot-a") != PipeNames.ForSlot(fixture.Root, "slot-b"),
+            "different runtime slots must have distinct coordinator pipe endpoints");
+        fixture.State = fixture.Reload();
+        BridgeRequest request = Request("status", "ticket-agent", 88);
+        request.TicketId = "ticket-1";
+        int exitCode = fixture.State.Execute(request, _ => { }, () => true);
+        Assert(exitCode == 0, "ticket-only routing must resolve its durable authoritative slot");
+        Assert(fixture.Adapter.LaunchCalls == 0 && fixture.Adapter.TerminationRequests == 0,
+            "ticket routing must not create lifecycle side effects");
+
+        BridgeRequest conflicting = Request("status", "ticket-agent", 88);
+        conflicting.TicketId = "ticket-1";
+        conflicting.CoordinatorRoot = "C:\\wrong-root";
+        conflicting.RuntimeSlotId = "slot-wrong";
+        Assert(fixture.State.Execute(conflicting, _ => { }, () => true) == 4,
+            "ticket scope conflicts must be rejected rather than silently rewritten");
+    }
+
+    private static void TestQuicktestActivation()
+    {
+        bool mainMenu = false;
+        int activationCalls = 0;
+        QuicktestActivationController failure = new(true, () => mainMenu, () =>
+        {
+            activationCalls++;
+            throw new NullReferenceException("simulated Root_Play lifecycle failure");
+        }, 3);
+        Assert(failure.Tick() == QuicktestActivationResult.WaitingForMainMenu && activationCalls == 0,
+            "Quicktest must not activate before genuine main-menu readiness");
+        mainMenu = true;
+        Assert(failure.Tick() == QuicktestActivationResult.Failed && failure.TerminalFailure && activationCalls == 1,
+            "observed built-in activation failure must be bounded and terminal");
+        Assert(failure.Tick() == QuicktestActivationResult.Failed && activationCalls == 1,
+            "terminal Quicktest failure must not retry or launch");
+
+        int successfulCalls = 0;
+        QuicktestActivationController success = new(true, () => mainMenu, () => successfulCalls++, 3);
+        Assert(success.Tick() == QuicktestActivationResult.Requested && success.MainMenuReady &&
+            success.ActivationRequested && successfulCalls == 1,
+            "built-in button activation must follow genuine main-menu readiness");
+    }
+
+    private static void TestCoordinatorRootArgumentForms()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "DevBridge2-argument-" + Guid.NewGuid().ToString("N"));
+        ParsedArguments separated = ParsedArguments.Parse(new[] { "--coordinator-root", root, "--json", "status" });
+        ParsedArguments equals = ParsedArguments.Parse(new[] { "--coordinator-root=" + root, "--json", "status" });
+        Assert(separated.Command.SequenceEqual(new[] { "--json", "status" }) &&
+            equals.Command.SequenceEqual(new[] { "--json", "status" }),
+            "both coordinator-root forms must preserve command forwarding");
+    }
+
     private static BridgeRequest Request(string command, string agent = "agent", int pid = 1, params string[] arguments)
     {
         return new BridgeRequest
@@ -373,7 +631,7 @@ internal static class OfflineTests
         internal readonly FakeProcessAdapter Adapter;
         internal CoordinatorState State;
 
-        private Fixture(PersistedState initial)
+        internal Fixture(PersistedState initial)
         {
             Root = Path.Combine(Path.GetTempPath(), "DevBridge2-offline-" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(Path.Combine(Root, "Runtime"));

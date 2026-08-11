@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Text;
+using RimWorld;
 using UnityEngine;
 using Verse;
 
@@ -13,6 +14,7 @@ namespace DevBridge2
         public DevBridge2Mod(ModContentPack content) : base(content)
         {
             DevBridgeReadiness.Configure();
+            DevBridgeQuicktestActivation.Configure();
             if (!DevBridgeReadiness.IsConfigured)
                 Log.Warning("[DevBridge2] DEVBRIDGE_ROOT or DEVBRIDGE_LAUNCH_ID is missing; readiness reporting is disabled.");
         }
@@ -32,6 +34,44 @@ namespace DevBridge2
                 return;
 
             reported = DevBridgeReadiness.TryWriteReadiness();
+        }
+    }
+
+    internal static class DevBridgeQuicktestActivation
+    {
+        private static bool requested;
+        private static bool attempted;
+
+        internal static void Configure()
+        {
+            requested = string.Equals(Environment.GetEnvironmentVariable("DEVBRIDGE_QUICKTEST_REQUESTED"), "1",
+                StringComparison.Ordinal);
+            if (requested)
+                LongEventHandler.ExecuteWhenFinished(TryActivate);
+        }
+
+        private static void TryActivate()
+        {
+            if (!requested || attempted)
+                return;
+
+            attempted = true;
+            if (!GenScene.InEntryScene)
+            {
+                Log.Warning("[DevBridge2] Built-in Dev Quicktest was requested, but RimWorld was not at the main menu.");
+                return;
+            }
+
+            try
+            {
+                PageUtility.InitGameStart();
+                Root_Play.SetupForQuickTestPlay();
+                Log.Message("[DevBridge2] quicktestRequested=true; built-in Dev Quicktest requested from the main menu.");
+            }
+            catch (Exception exception)
+            {
+                Log.Error("[DevBridge2] Built-in Dev Quicktest activation failed: " + exception);
+            }
         }
     }
 
@@ -129,7 +169,7 @@ namespace DevBridge2
                 ReplaceFile(temporaryPath, readinessPath);
                 lock (Gate)
                     signaled = true;
-                Log.Message("[DevBridge2] quicktest map ready; launch " + configuredLaunchId + ".");
+                Log.Message("[DevBridge2] quicktestReady=true; quicktest map ready; launch " + configuredLaunchId + ".");
                 return true;
             }
             catch (Exception exception)

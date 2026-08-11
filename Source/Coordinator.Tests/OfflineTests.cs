@@ -22,6 +22,7 @@ internal static class OfflineTests
         Run("process inspection uncertainty fails closed", TestInspectionFailsClosed);
         Run("maintenance claims are freshly re-enumerated", TestMaintenanceRevalidation);
         Run("uncertain maintenance operations make no adapter calls", TestMaintenanceInspectionNoLaunch);
+        Run("status uses one authoritative process snapshot", TestStatusSnapshotConsistency);
 
         Console.WriteLine(failures == 0 ? "OFFLINE TESTS PASS" : "OFFLINE TESTS FAIL: " + failures);
         return failures == 0 ? 0 : 1;
@@ -265,19 +266,52 @@ internal static class OfflineTests
             "duplicate stop must freshly enumerate the installation");
 
         int beforeStatus = fixture.Adapter.EnumerationCalls;
-        JsonCommandResponse clean = fixture.State.CreateJsonResponse(Request("status", "holder", 77), 0,
-            Array.Empty<string>());
+        List<string> cleanOutput = new();
+        BridgeRequest statusRequest = Request("status", "holder", 77);
+        int cleanExit = fixture.State.Execute(statusRequest, cleanOutput.Add, () => true);
+        JsonCommandResponse clean = fixture.State.CreateJsonResponse(statusRequest, cleanExit, cleanOutput);
         Assert(fixture.Adapter.EnumerationCalls == beforeStatus + 1,
             "status must freshly enumerate before reporting maintenanceReady=true");
-        Assert(clean.MaintenanceReady, "clean re-enumeration must preserve maintenanceReady");
+        Assert(cleanExit == 0 && clean.MaintenanceReady &&
+            !cleanOutput.Any(value => value.Contains("WARNING", StringComparison.Ordinal)),
+            "clean status must preserve maintenanceReady without a warning");
 
         fixture.Adapter.ExtraMatchingProcess = true;
-        JsonCommandResponse appeared = fixture.State.CreateJsonResponse(Request("status", "holder", 77), 0,
-            Array.Empty<string>());
+        int beforeAppeared = fixture.Adapter.EnumerationCalls;
+        List<string> appearedOutput = new();
+        int appearedExit = fixture.State.Execute(statusRequest, appearedOutput.Add, () => true);
+        JsonCommandResponse appeared = fixture.State.CreateJsonResponse(statusRequest, appearedExit, appearedOutput);
+        Assert(fixture.Adapter.EnumerationCalls == beforeAppeared + 1,
+            "status must use one authoritative enumeration");
         Assert(!appeared.MaintenanceReady && appeared.ErrorCode == "MAINTENANCE_PROCESS_PRESENT",
             "a process appearing after persistence must invalidate maintenanceReady");
+        Assert(appearedOutput.Any(value => value.Contains("unmanaged RimWorld process", StringComparison.Ordinal)) &&
+            !appearedOutput.Any(value => value.Contains("confirmed safe", StringComparison.OrdinalIgnoreCase)),
+            "status must not pair a process warning with a positive safety claim");
+
+        fixture.State = fixture.Reload();
+        JsonCommandResponse persisted = fixture.State.CreateJsonResponse(statusRequest, appearedExit, appearedOutput);
+        Assert(!persisted.MaintenanceReady,
+            "status invalidation must be persisted before the response");
         Assert(fixture.Adapter.TerminationRequests == 0 && fixture.Adapter.LaunchCalls == 0,
             "revalidation must not terminate or launch a newly discovered process");
+    }
+
+    private static void TestStatusSnapshotConsistency()
+    {
+        using Fixture fixture = Fixture.MaintenanceWithLease();
+        fixture.Adapter.AddExtraMatchingProcessOnSecondEnumeration = true;
+        BridgeRequest request = Request("status", "holder", 77);
+        List<string> output = new();
+        int exitCode = fixture.State.Execute(request, output.Add, () => true);
+        JsonCommandResponse response = fixture.State.CreateJsonResponse(request, exitCode, output);
+
+        Assert(exitCode == 0 && response.MaintenanceReady,
+            "a clean authoritative snapshot must report maintenanceReady");
+        Assert(fixture.Adapter.EnumerationCalls == 1,
+            "status must not perform a second independent enumeration");
+        Assert(fixture.Adapter.TerminationRequests == 0 && fixture.Adapter.LaunchCalls == 0,
+            "status snapshotting must make zero termination and launch calls");
     }
 
     private static void TestMaintenanceInspectionNoLaunch()
@@ -504,6 +538,7 @@ internal static class OfflineTests
         internal FakeProcess Current => processes.Values.OrderByDescending(value => value.Id).First();
         internal bool ReadyOnLaunch { get; set; }
         internal bool ExtraMatchingProcess { get; set; }
+        internal bool AddExtraMatchingProcessOnSecondEnumeration { get; set; }
         internal bool EnumerationIncomplete { get; set; }
         internal int EnumerationCalls { get; private set; }
         internal bool BlockWaitForExit
@@ -547,7 +582,7 @@ internal static class OfflineTests
             EnumerationCalls++;
             if (EnumerationIncomplete)
                 return new ProcessEnumeration { Complete = false, Error = "simulated inspection failure" };
-            if (ExtraMatchingProcess)
+            if (ExtraMatchingProcess || (AddExtraMatchingProcessOnSecondEnumeration && EnumerationCalls >= 2))
                 Add(new FakeProcess(999, 9999, executablePath));
 
             try

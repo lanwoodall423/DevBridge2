@@ -835,6 +835,13 @@ internal sealed class CoordinatorState
         internal string Error { get; init; }
     }
 
+    private sealed class ProcessStatusSnapshot
+    {
+        internal bool OwnedProcessRunning { get; init; }
+        internal int MatchingProcessCount { get; init; }
+        internal List<UnmanagedRimWorldProcess> UnmanagedProcesses { get; init; } = new();
+    }
+
     internal CoordinatorState(string root) : this(root, CoordinatorOptions.ForProduction())
     {
     }
@@ -953,34 +960,30 @@ internal sealed class CoordinatorState
     private int Status(BridgeRequest request, Action<string> emit)
     {
         PersistedState snapshot;
-        bool processRunning = false;
+        ProcessStatusSnapshot processSnapshot = new();
         bool processInspectionAmbiguous = false;
-        List<UnmanagedRimWorldProcess> unmanagedProcesses = new();
-        lock (gate)
+        lock (lifecycleGate)
         {
-            SynchronizeLocked();
-            RevalidateMaintenanceReadyLocked();
-            try
+            lock (gate)
             {
-                processRunning = IsOwnedProcess(state.ProcessId, state.ProcessStartUtcTicks);
-            }
-            catch (ProcessInspectionException)
-            {
-                processInspectionAmbiguous = true;
-                MarkProcessInspectionAmbiguousLocked();
-            }
+                SynchronizeLocked();
+                processInspectionAmbiguous = state.ErrorCode == ProcessInspection.ErrorCode;
+                try
+                {
+                    processSnapshot = EnumerateStatusProcessesLocked();
+                    if (state.MaintenanceReady && processSnapshot.MatchingProcessCount > 0)
+                        MarkMaintenanceProcessPresentLocked();
+                }
+                catch (ProcessInspectionException)
+                {
+                    processInspectionAmbiguous = true;
+                    MarkProcessInspectionAmbiguousLocked();
+                }
+                if (processInspectionAmbiguous && state.MaintenanceReady)
+                    MarkProcessInspectionAmbiguousLocked();
 
-            try
-            {
-                unmanagedProcesses = FindUnmanagedRimWorldProcesses(state.ProcessId, state.ProcessStartUtcTicks);
+                snapshot = CloneStateLocked();
             }
-            catch (ProcessInspectionException)
-            {
-                processInspectionAmbiguous = true;
-                MarkProcessInspectionAmbiguousLocked();
-            }
-
-            snapshot = CloneStateLocked();
         }
 
         emit("DevBridge2 status");
@@ -992,14 +995,14 @@ internal sealed class CoordinatorState
         emit("gameState=" + snapshot.Phase + " maintenanceReady=" + snapshot.MaintenanceReady.ToString().ToLowerInvariant() +
             " leaseState=" + (heldLease == null ? "QUEUED" : "HELD"));
         emit("Generation: " + snapshot.Generation);
-        emit("RimWorld: " + (processRunning ? "running" : "not running") +
+        emit("RimWorld: " + (processSnapshot.OwnedProcessRunning ? "running" : "not running") +
             (snapshot.ProcessId > 0 ? " (PID " + snapshot.ProcessId + ")" : string.Empty));
         if (processInspectionAmbiguous)
             emit("WARNING: RimWorld process inspection is ambiguous; no process-control or launch action was taken.");
-        if (unmanagedProcesses.Count > 0)
+        if (processSnapshot.UnmanagedProcesses.Count > 0)
         {
             emit("WARNING: unmanaged RimWorld process(es) detected: " +
-                string.Join(", ", unmanagedProcesses.Select(value => value.ProcessId.ToString())));
+                 string.Join(", ", processSnapshot.UnmanagedProcesses.Select(value => value.ProcessId.ToString())));
             emit("Close the unmanaged process through Steam before the next DevBridge restart.");
         }
         emit("Launch ID: " + (string.IsNullOrWhiteSpace(snapshot.LaunchId) ? "none" : snapshot.LaunchId));
@@ -2115,11 +2118,7 @@ internal sealed class CoordinatorState
             if (remaining.Count == 0)
                 return new MaintenanceValidation { Safe = true };
 
-            state.MaintenanceReady = false;
-            state.ErrorCode = "MAINTENANCE_PROCESS_PRESENT";
-            state.Error = "A matching RimWorld process is present; assembly replacement is not safe.";
-            SaveStateLocked();
-            Monitor.PulseAll(gate);
+            MarkMaintenanceProcessPresentLocked();
             return new MaintenanceValidation
             {
                 Safe = false,
@@ -2137,6 +2136,15 @@ internal sealed class CoordinatorState
                 Error = ProcessInspection.Message
             };
         }
+    }
+
+    private void MarkMaintenanceProcessPresentLocked()
+    {
+        state.MaintenanceReady = false;
+        state.ErrorCode = "MAINTENANCE_PROCESS_PRESENT";
+        state.Error = "A matching RimWorld process is present; assembly replacement is not safe.";
+        SaveStateLocked();
+        Monitor.PulseAll(gate);
     }
 
     private void MarkProcessInspectionAmbiguousLocked()
@@ -2300,6 +2308,79 @@ internal sealed class CoordinatorState
         {
             throw ProcessInspection.Failure();
         }
+    }
+
+    private ProcessStatusSnapshot EnumerateStatusProcessesLocked()
+    {
+        ProcessEnumeration enumeration;
+        try
+        {
+            enumeration = processAdapter.EnumerateRimWorld(rimWorldExe);
+        }
+        catch (ProcessInspectionException)
+        {
+            throw;
+        }
+        catch
+        {
+            throw ProcessInspection.Failure();
+        }
+
+        if (enumeration == null || !enumeration.Complete || enumeration.Processes == null)
+            throw ProcessInspection.Failure();
+
+        bool ownedProcessRunning = false;
+        int matchingProcessCount = 0;
+        List<UnmanagedRimWorldProcess> unmanagedProcesses = new();
+        try
+        {
+            foreach (IManagedProcess process in enumeration.Processes)
+            {
+                if (process == null)
+                    throw ProcessInspection.Failure();
+                int processId = process.Id;
+                if (process.HasExited)
+                    continue;
+                string executablePath = process.ExecutablePath;
+                if (string.IsNullOrWhiteSpace(executablePath))
+                    throw ProcessInspection.Failure();
+                if (!string.Equals(Path.GetFullPath(executablePath), rimWorldExe,
+                        StringComparison.OrdinalIgnoreCase))
+                    continue;
+                long startTicks = process.StartIdentity;
+                if (processId <= 0 || startTicks <= 0)
+                    throw ProcessInspection.Failure();
+
+                matchingProcessCount++;
+                if (processId == state.ProcessId && startTicks == state.ProcessStartUtcTicks)
+                    ownedProcessRunning = true;
+                else
+                    unmanagedProcesses.Add(new UnmanagedRimWorldProcess { ProcessId = processId });
+            }
+        }
+        catch (ProcessInspectionException)
+        {
+            throw;
+        }
+        catch
+        {
+            throw ProcessInspection.Failure();
+        }
+        finally
+        {
+            foreach (IManagedProcess process in enumeration.Processes)
+            {
+                try { process?.Dispose(); }
+                catch { }
+            }
+        }
+
+        return new ProcessStatusSnapshot
+        {
+            OwnedProcessRunning = ownedProcessRunning,
+            MatchingProcessCount = matchingProcessCount,
+            UnmanagedProcesses = unmanagedProcesses
+        };
     }
 
     private List<UnmanagedRimWorldProcess> FindUnmanagedRimWorldProcesses(int processIdToExclude,
@@ -2524,10 +2605,14 @@ internal sealed class CoordinatorState
         IReadOnlyList<string> messages)
     {
         PersistedState snapshot;
+        bool statusCommand = string.Equals(request.Command, "status", StringComparison.OrdinalIgnoreCase);
         lock (gate)
         {
-            SynchronizeLocked();
-            RevalidateMaintenanceReadyLocked();
+            if (!statusCommand)
+            {
+                SynchronizeLocked();
+                RevalidateMaintenanceReadyLocked();
+            }
             snapshot = CloneStateLocked();
         }
 

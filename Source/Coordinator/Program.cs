@@ -544,6 +544,21 @@ internal sealed class ProcessEnumeration
     internal IReadOnlyList<IManagedProcess> Processes { get; init; } = Array.Empty<IManagedProcess>();
 }
 
+internal sealed class ProcessInspectionException : Exception
+{
+    internal ProcessInspectionException() : base(ProcessInspection.Message)
+    {
+    }
+}
+
+internal static class ProcessInspection
+{
+    internal const string ErrorCode = "PROCESS_INSPECTION_AMBIGUOUS";
+    internal const string Message = "RimWorld process inspection was incomplete; process state is ambiguous.";
+
+    internal static ProcessInspectionException Failure() => new();
+}
+
 internal interface IProcessAdapter
 {
     IManagedProcess Open(int processId);
@@ -595,15 +610,36 @@ internal sealed class SystemManagedProcess : IManagedProcess
         this.process = process;
     }
 
-    public int Id => process.Id;
+    public int Id
+    {
+        get
+        {
+            try { return process.Id; }
+            catch { throw ProcessInspection.Failure(); }
+        }
+    }
+
     public long StartIdentity => TryGetStartIdentity(process);
 
     public string ExecutablePath
     {
         get
         {
-            try { return process.MainModule?.FileName; }
-            catch { return null; }
+            try
+            {
+                string path = process.MainModule?.FileName;
+                if (string.IsNullOrWhiteSpace(path))
+                    throw ProcessInspection.Failure();
+                return path;
+            }
+            catch (ProcessInspectionException)
+            {
+                throw;
+            }
+            catch
+            {
+                throw ProcessInspection.Failure();
+            }
         }
     }
 
@@ -612,7 +648,7 @@ internal sealed class SystemManagedProcess : IManagedProcess
         get
         {
             try { return process.HasExited; }
-            catch { return true; }
+            catch { throw ProcessInspection.Failure(); }
         }
     }
 
@@ -624,9 +660,13 @@ internal sealed class SystemManagedProcess : IManagedProcess
                 return true;
             return process.CloseMainWindow();
         }
+        catch (ProcessInspectionException)
+        {
+            throw;
+        }
         catch
         {
-            return false;
+            throw ProcessInspection.Failure();
         }
     }
 
@@ -638,9 +678,13 @@ internal sealed class SystemManagedProcess : IManagedProcess
             process.WaitForExit(milliseconds);
             return process.HasExited;
         }
+        catch (ProcessInspectionException)
+        {
+            throw;
+        }
         catch
         {
-            return false;
+            throw ProcessInspection.Failure();
         }
     }
 
@@ -653,9 +697,13 @@ internal sealed class SystemManagedProcess : IManagedProcess
             process.WaitForExit(15000);
             return process.HasExited;
         }
+        catch (ProcessInspectionException)
+        {
+            throw;
+        }
         catch
         {
-            return false;
+            throw ProcessInspection.Failure();
         }
     }
 
@@ -663,8 +711,21 @@ internal sealed class SystemManagedProcess : IManagedProcess
 
     private static long TryGetStartIdentity(Process process)
     {
-        try { return process.StartTime.ToUniversalTime().Ticks; }
-        catch { return 0; }
+        try
+        {
+            long ticks = process.StartTime.ToUniversalTime().Ticks;
+            if (ticks <= 0)
+                throw ProcessInspection.Failure();
+            return ticks;
+        }
+        catch (ProcessInspectionException)
+        {
+            throw;
+        }
+        catch
+        {
+            throw ProcessInspection.Failure();
+        }
     }
 }
 
@@ -673,7 +734,8 @@ internal sealed class SystemProcessAdapter : IProcessAdapter
     public IManagedProcess Open(int processId)
     {
         try { return new SystemManagedProcess(Process.GetProcessById(processId)); }
-        catch { return null; }
+        catch (ArgumentException) { return null; }
+        catch { throw ProcessInspection.Failure(); }
     }
 
     public ProcessEnumeration EnumerateRimWorld(string executablePath)
@@ -686,27 +748,39 @@ internal sealed class SystemProcessAdapter : IProcessAdapter
         {
             processes = Process.GetProcessesByName("RimWorldWin64");
         }
-        catch (Exception exception)
+        catch
         {
-            return new ProcessEnumeration { Complete = false, Error = exception.Message };
+            return new ProcessEnumeration { Complete = false, Error = ProcessInspection.Message };
         }
 
         foreach (Process process in processes)
         {
+            SystemManagedProcess managed = null;
             try
             {
-                SystemManagedProcess managed = new(process);
-                if (!managed.HasExited && string.Equals(Path.GetFullPath(managed.ExecutablePath ?? string.Empty),
-                        Path.GetFullPath(executablePath), StringComparison.OrdinalIgnoreCase))
-                    matches.Add(managed);
-                else
+                managed = new SystemManagedProcess(process);
+                if (managed.HasExited)
+                {
                     managed.Dispose();
+                    continue;
+                }
+
+                if (!string.Equals(Path.GetFullPath(managed.ExecutablePath),
+                        Path.GetFullPath(executablePath), StringComparison.OrdinalIgnoreCase))
+                {
+                    managed.Dispose();
+                    continue;
+                }
+
+                if (managed.StartIdentity <= 0)
+                    throw ProcessInspection.Failure();
+                matches.Add(managed);
             }
-            catch (Exception exception)
+            catch
             {
                 complete = false;
-                error ??= exception.Message;
-                process.Dispose();
+                error ??= ProcessInspection.Message;
+                managed?.Dispose();
             }
         }
 
@@ -753,6 +827,13 @@ internal sealed class CoordinatorState
     private PersistedState state;
     private Task restartTask;
     private Task launchTask;
+
+    private sealed class MaintenanceValidation
+    {
+        internal bool Safe { get; init; }
+        internal string ErrorCode { get; init; }
+        internal string Error { get; init; }
+    }
 
     internal CoordinatorState(string root) : this(root, CoordinatorOptions.ForProduction())
     {
@@ -872,14 +953,34 @@ internal sealed class CoordinatorState
     private int Status(BridgeRequest request, Action<string> emit)
     {
         PersistedState snapshot;
-        bool processRunning;
-        List<UnmanagedRimWorldProcess> unmanagedProcesses;
+        bool processRunning = false;
+        bool processInspectionAmbiguous = false;
+        List<UnmanagedRimWorldProcess> unmanagedProcesses = new();
         lock (gate)
         {
             SynchronizeLocked();
+            RevalidateMaintenanceReadyLocked();
+            try
+            {
+                processRunning = IsOwnedProcess(state.ProcessId, state.ProcessStartUtcTicks);
+            }
+            catch (ProcessInspectionException)
+            {
+                processInspectionAmbiguous = true;
+                MarkProcessInspectionAmbiguousLocked();
+            }
+
+            try
+            {
+                unmanagedProcesses = FindUnmanagedRimWorldProcesses(state.ProcessId, state.ProcessStartUtcTicks);
+            }
+            catch (ProcessInspectionException)
+            {
+                processInspectionAmbiguous = true;
+                MarkProcessInspectionAmbiguousLocked();
+            }
+
             snapshot = CloneStateLocked();
-            processRunning = IsOwnedProcess(snapshot.ProcessId, snapshot.ProcessStartUtcTicks);
-            unmanagedProcesses = FindUnmanagedRimWorldProcesses(snapshot.ProcessId, snapshot.ProcessStartUtcTicks);
         }
 
         emit("DevBridge2 status");
@@ -893,6 +994,8 @@ internal sealed class CoordinatorState
         emit("Generation: " + snapshot.Generation);
         emit("RimWorld: " + (processRunning ? "running" : "not running") +
             (snapshot.ProcessId > 0 ? " (PID " + snapshot.ProcessId + ")" : string.Empty));
+        if (processInspectionAmbiguous)
+            emit("WARNING: RimWorld process inspection is ambiguous; no process-control or launch action was taken.");
         if (unmanagedProcesses.Count > 0)
         {
             emit("WARNING: unmanaged RimWorld process(es) detected: " +
@@ -933,7 +1036,9 @@ internal sealed class CoordinatorState
             emit("Test leases are shared; multiple agents may test this generation concurrently.");
             EmitNextCommand(emit, "DevBridge.cmd test begin");
         }
-        else if (snapshot.Phase == BridgePhase.ERROR)
+        else if (snapshot.Phase == BridgePhase.ERROR ||
+                 snapshot.ErrorCode == ProcessInspection.ErrorCode ||
+                 snapshot.ErrorCode == "MAINTENANCE_PROCESS_PRESENT")
             EmitNextCommand(emit, "DevBridge.cmd doctor");
         else if (snapshot.Phase == BridgePhase.STOPPED && snapshot.Generation > 0 && !snapshot.RestartPending)
             EmitNextCommand(emit, "DevBridge.cmd restart");
@@ -955,14 +1060,34 @@ internal sealed class CoordinatorState
         bool aboutExists = File.Exists(about);
         bool modEnabled = IsDevBridgeModEnabled();
         PersistedState snapshot;
-        bool processRunning;
-        List<UnmanagedRimWorldProcess> unmanagedProcesses;
+        bool processRunning = false;
+        bool processInspectionAmbiguous = false;
+        List<UnmanagedRimWorldProcess> unmanagedProcesses = new();
         lock (gate)
         {
             SynchronizeLocked();
+            RevalidateMaintenanceReadyLocked();
+            try
+            {
+                processRunning = IsOwnedProcess(state.ProcessId, state.ProcessStartUtcTicks);
+            }
+            catch (ProcessInspectionException)
+            {
+                processInspectionAmbiguous = true;
+                MarkProcessInspectionAmbiguousLocked();
+            }
+
+            try
+            {
+                unmanagedProcesses = FindUnmanagedRimWorldProcesses(state.ProcessId, state.ProcessStartUtcTicks);
+            }
+            catch (ProcessInspectionException)
+            {
+                processInspectionAmbiguous = true;
+                MarkProcessInspectionAmbiguousLocked();
+            }
+
             snapshot = CloneStateLocked();
-            processRunning = IsOwnedProcess(snapshot.ProcessId, snapshot.ProcessStartUtcTicks);
-            unmanagedProcesses = FindUnmanagedRimWorldProcesses(snapshot.ProcessId, snapshot.ProcessStartUtcTicks);
         }
 
         emit("DevBridge2 doctor");
@@ -976,6 +1101,8 @@ internal sealed class CoordinatorState
             : "WARN DevBridge2 is not active in the current ModsConfig.xml; the coordinator will enable it before launch.");
         emit("Coordinator state: " + snapshot.Phase + ", generation " + snapshot.Generation);
         emit("Coordinator-owned RimWorld process: " + (processRunning ? "yes (PID " + snapshot.ProcessId + ")" : "no"));
+        if (processInspectionAmbiguous)
+            emit("WARN RimWorld process inspection is ambiguous; no process-control or launch action was taken.");
         if (unmanagedProcesses.Count > 0)
             emit("WARN Unmanaged RimWorld process(es): " + string.Join(", ", unmanagedProcesses.Select(value => value.ProcessId.ToString())) +
                 ". Close them through Steam before restarting.");
@@ -1165,6 +1292,16 @@ internal sealed class CoordinatorState
 
                 if (state.MaintenanceReady)
                 {
+                    MaintenanceValidation validation = RevalidateMaintenanceReadyLocked();
+                    if (!validation.Safe)
+                    {
+                        emit("Stop failed: " + validation.Error);
+                        emit("Error code: " + validation.ErrorCode);
+                        emit("maintenanceReady=false");
+                        EmitNextCommand(emit, "DevBridge.cmd doctor");
+                        return 4;
+                    }
+
                     emit("RimWorld is already stopped for maintenance.");
                     emit("gameState=STOPPED maintenanceReady=true leaseState=HELD");
                     EmitNextCommand(emit, "DevBridge.cmd ensure-ready " + lease.Id);
@@ -1185,13 +1322,13 @@ internal sealed class CoordinatorState
                 processStartIdentity = state.ProcessStartUtcTicks;
             }
 
-            (bool success, string error) result = StopForMaintenance(processId, processStartIdentity);
+            (bool success, string errorCode, string error) result = StopForMaintenance(processId, processStartIdentity);
             lock (gate)
             {
                 if (!result.success)
                 {
                     state.MaintenanceReady = false;
-                    state.ErrorCode = "STOP_FAILED";
+                    state.ErrorCode = result.errorCode;
                     state.Error = "RimWorld was not stopped safely: " + result.error;
                     SaveStateLocked();
                     Monitor.PulseAll(gate);
@@ -1245,6 +1382,16 @@ internal sealed class CoordinatorState
 
                 if (state.MaintenanceReady)
                 {
+                    MaintenanceValidation validation = RevalidateMaintenanceReadyLocked();
+                    if (!validation.Safe)
+                    {
+                        emit("Ensure-ready denied: " + validation.Error);
+                        emit("Error code: " + validation.ErrorCode);
+                        emit("No launch was attempted.");
+                        EmitNextCommand(emit, "DevBridge.cmd doctor");
+                        return 4;
+                    }
+
                     targetGeneration = Math.Max(1, state.Generation + 1);
                     state.TargetGeneration = targetGeneration;
                     state.MaintenanceReady = false;
@@ -1269,6 +1416,14 @@ internal sealed class CoordinatorState
                         emit("RimWorld is ready.");
                         EmitNextCommand(emit, "DevBridge.cmd test end " + lease.Id);
                         return 0;
+                    }
+
+                    if (state.ErrorCode == ProcessInspection.ErrorCode)
+                    {
+                        emit(ProcessInspection.Message);
+                        emit("No launch was attempted.");
+                        EmitNextCommand(emit, "DevBridge.cmd doctor");
+                        return 4;
                     }
 
                     emit("READINESS_TIMEOUT: the original RimWorld process is still not ready.");
@@ -1321,6 +1476,13 @@ internal sealed class CoordinatorState
             lock (gate)
             {
                 SynchronizeLocked();
+                if (state.ErrorCode == ProcessInspection.ErrorCode)
+                {
+                    emit(ProcessInspection.Message);
+                    emit("No launch was attempted.");
+                    EmitNextCommand(emit, "DevBridge.cmd doctor");
+                    return 4;
+                }
                 currentGeneration = state.Generation;
                 alreadyPending = state.RestartPending;
                 if (state.MaintenanceReady)
@@ -1333,10 +1495,29 @@ internal sealed class CoordinatorState
                         return 4;
                     }
 
+                    MaintenanceValidation validation = RevalidateMaintenanceReadyLocked();
+                    if (!validation.Safe)
+                    {
+                        emit("Restart denied: " + validation.Error);
+                        emit("Error code: " + validation.ErrorCode);
+                        emit("No launch was attempted.");
+                        EmitNextCommand(emit, "DevBridge.cmd doctor");
+                        return 4;
+                    }
+
                     state.Leases.Remove(maintenanceLease);
                     state.MaintenanceReady = false;
                     state.SessionDirty = true;
                     alreadyPending = false;
+                }
+                else if (state.Phase == BridgePhase.STOPPED && state.SessionDirty &&
+                         (state.ErrorCode == ProcessInspection.ErrorCode ||
+                          state.ErrorCode == "MAINTENANCE_PROCESS_PRESENT"))
+                {
+                    emit("Restart denied: the maintenance window is not safe to leave without a fresh process check.");
+                    emit("No launch was attempted.");
+                    EmitNextCommand(emit, "DevBridge.cmd doctor");
+                    return 4;
                 }
 
                 if (!alreadyPending)
@@ -1607,13 +1788,20 @@ internal sealed class CoordinatorState
                 }
             }
 
-            StopOwnedProcess(oldProcessId, oldStartTicks);
+            (bool stopped, string stopErrorCode, string stopError) = StopOwnedProcess(oldProcessId, oldStartTicks);
+            if (!stopped)
+            {
+                FailLaunch(stopError, stopErrorCode);
+                return;
+            }
             LaunchGenerationWorker(targetGeneration, isRestart: true);
             }
         }
         catch (Exception exception)
         {
-            FailLaunch("restart coordinator failure: " + exception.Message);
+            FailLaunch(exception is ProcessInspectionException ? ProcessInspection.Message :
+                "restart coordinator failure: " + exception.Message,
+                exception is ProcessInspectionException ? ProcessInspection.ErrorCode : "LAUNCH_FAILED");
         }
     }
 
@@ -1643,7 +1831,7 @@ internal sealed class CoordinatorState
             EnsureDevBridgeModEnabled();
 
             List<UnmanagedRimWorldProcess> unmanagedProcesses =
-                FindUnmanagedRimWorldProcesses(processIdToExclude: 0, startTicksToExclude: 0, failClosed: true);
+                FindUnmanagedRimWorldProcesses(processIdToExclude: 0, startTicksToExclude: 0);
             if (unmanagedProcesses.Count > 0)
                 throw new InvalidOperationException("an unmanaged RimWorld process is already running (PID " +
                     string.Join(", ", unmanagedProcesses.Select(value => value.ProcessId.ToString())) +
@@ -1682,7 +1870,8 @@ internal sealed class CoordinatorState
         catch (Exception exception)
         {
             FailLaunch(DescribeLaunchFailure(exception, process), exception is TimeoutException ?
-                "READINESS_TIMEOUT" : "LAUNCH_FAILED");
+                "READINESS_TIMEOUT" : exception is ProcessInspectionException ?
+                    ProcessInspection.ErrorCode : "LAUNCH_FAILED");
         }
         finally
         {
@@ -1714,7 +1903,9 @@ internal sealed class CoordinatorState
         }
         catch (Exception exception)
         {
-            FailLaunch("RimWorld did not report readiness after coordinator recovery: " + exception.Message);
+            FailLaunch(exception is ProcessInspectionException ? ProcessInspection.Message :
+                "RimWorld did not report readiness after coordinator recovery: " + exception.Message,
+                exception is ProcessInspectionException ? ProcessInspection.ErrorCode : "LAUNCH_FAILED");
         }
     }
 
@@ -1763,7 +1954,8 @@ internal sealed class CoordinatorState
             state.Phase = BridgePhase.ERROR;
             state.RestartPending = false;
             state.ErrorCode = errorCode;
-            state.Error = errorCode == "READINESS_TIMEOUT" ?
+            state.Error = errorCode == ProcessInspection.ErrorCode ? ProcessInspection.Message :
+                errorCode == "READINESS_TIMEOUT" ?
                 "READINESS_TIMEOUT: " + detail + ". The original process was retained; no replacement launch was attempted." :
                 "RimWorld did not report a playable quicktest map: " + detail +
                 ". Inspect Runtime/readiness.json and the RimWorld logs, then run DevBridge.cmd restart.";
@@ -1774,6 +1966,8 @@ internal sealed class CoordinatorState
 
     private static string DescribeLaunchFailure(Exception exception, IManagedProcess process)
     {
+        if (exception is ProcessInspectionException)
+            return ProcessInspection.Message;
         if (exception is FileNotFoundException)
             return exception.Message;
         if (process != null)
@@ -1792,19 +1986,19 @@ internal sealed class CoordinatorState
         return exception.GetType().Name + ": " + exception.Message;
     }
 
-    private void StopOwnedProcess(int processId, long startTicks)
+    private (bool success, string errorCode, string error) StopOwnedProcess(int processId, long startTicks)
     {
         if (processId <= 0)
-            return;
+            return (true, null, null);
 
         IManagedProcess process = null;
         try
         {
             process = processAdapter.Open(processId);
             if (process == null)
-                return;
+                return (true, null, null);
             if (!IsOwnedProcess(process, startTicks))
-                return;
+                return (false, "PROCESS_IDENTITY_CHANGED", "the persisted RimWorld process identity no longer matches");
 
             if (!process.HasExited)
             {
@@ -1813,20 +2007,31 @@ internal sealed class CoordinatorState
                     process.RequestTermination();
                     process.WaitForExit(TimeSpan.FromSeconds(5));
                 }
+                catch (ProcessInspectionException)
+                {
+                    return (false, ProcessInspection.ErrorCode, ProcessInspection.Message);
+                }
                 catch
                 {
                     // Fall through to the bounded kill below.
                 }
+
+                if (!process.HasExited)
+                {
+                    if (!process.ForceTerminate() || !process.HasExited)
+                        return (false, "STOP_FAILED", "process exit was not confirmed");
+                }
             }
 
-            if (!process.HasExited)
-            {
-                process.ForceTerminate();
-            }
+            return (true, null, null);
+        }
+        catch (ProcessInspectionException)
+        {
+            return (false, ProcessInspection.ErrorCode, ProcessInspection.Message);
         }
         catch
         {
-            // The process already exited or cannot be controlled.
+            return (false, "STOP_FAILED", "the verified process could not be stopped safely");
         }
         finally
         {
@@ -1834,40 +2039,39 @@ internal sealed class CoordinatorState
         }
     }
 
-    private (bool success, string error) StopForMaintenance(int processId, long startTicks)
+    private (bool success, string errorCode, string error) StopForMaintenance(int processId, long startTicks)
     {
         if (processId <= 0 || startTicks <= 0)
-            return (false, "the persisted process PID/start identity is incomplete");
-
-        using IManagedProcess process = processAdapter.Open(processId);
-        if (process == null)
-            return (false, "the persisted RimWorld process no longer exists");
-        if (!IsOwnedProcess(process, startTicks))
-            return (false, "the persisted process identity no longer matches");
-        if (process.HasExited)
-            return (false, "the verified process was already exited before termination was requested");
-        if (!process.RequestTermination())
-            return (false, "the verified process rejected the termination request");
-        if (!process.WaitForExit(options.ProcessExitTimeout) || !process.HasExited)
-            return (false, "process exit was not confirmed within the configured timeout");
-
-        ProcessEnumeration enumeration = processAdapter.EnumerateRimWorld(rimWorldExe);
-        if (!enumeration.Complete)
-            return (false, "post-stop process enumeration was incomplete: " + enumeration.Error);
+            return (false, "STOP_FAILED", "the persisted process PID/start identity is incomplete");
 
         try
         {
-            if ((enumeration.Processes?.Count ?? 0) != 0)
-                return (false, "a matching RimWorld installation process remains: " +
-                    string.Join(", ", enumeration.Processes.Select(value => value.Id)));
-        }
-        finally
-        {
-            foreach (IManagedProcess remaining in enumeration.Processes ?? Array.Empty<IManagedProcess>())
-                remaining.Dispose();
-        }
+            using IManagedProcess process = processAdapter.Open(processId);
+            if (process == null)
+                return (false, "STOP_FAILED", "the persisted RimWorld process no longer exists");
+            if (!IsOwnedProcess(process, startTicks))
+                return (false, "PROCESS_IDENTITY_CHANGED", "the persisted process identity no longer matches");
+            if (process.HasExited)
+                return (false, "STOP_FAILED", "the verified process was already exited before termination was requested");
+            if (!process.RequestTermination())
+                return (false, "STOP_FAILED", "the verified process rejected the termination request");
+            if (!process.WaitForExit(options.ProcessExitTimeout) || !process.HasExited)
+                return (false, "STOP_FAILED", "process exit was not confirmed within the configured timeout");
 
-        return (true, null);
+            List<UnmanagedRimWorldProcess> remaining = FindUnmanagedRimWorldProcesses(0, 0);
+            if (remaining.Count != 0)
+                return (false, "MAINTENANCE_PROCESS_PRESENT", "a matching RimWorld installation process remains");
+
+            return (true, null, null);
+        }
+        catch (ProcessInspectionException)
+        {
+            return (false, ProcessInspection.ErrorCode, ProcessInspection.Message);
+        }
+        catch
+        {
+            return (false, "STOP_FAILED", "RimWorld could not be stopped safely");
+        }
     }
 
     private bool TryGetLeaseHolderLocked(string leaseId, BridgeRequest request, out TestLease lease)
@@ -1900,27 +2104,98 @@ internal sealed class CoordinatorState
         Monitor.PulseAll(gate);
     }
 
+    private MaintenanceValidation RevalidateMaintenanceReadyLocked()
+    {
+        if (!state.MaintenanceReady)
+            return new MaintenanceValidation { Safe = false, ErrorCode = state.ErrorCode, Error = state.Error };
+
+        try
+        {
+            List<UnmanagedRimWorldProcess> remaining = FindUnmanagedRimWorldProcesses(0, 0);
+            if (remaining.Count == 0)
+                return new MaintenanceValidation { Safe = true };
+
+            state.MaintenanceReady = false;
+            state.ErrorCode = "MAINTENANCE_PROCESS_PRESENT";
+            state.Error = "A matching RimWorld process is present; assembly replacement is not safe.";
+            SaveStateLocked();
+            Monitor.PulseAll(gate);
+            return new MaintenanceValidation
+            {
+                Safe = false,
+                ErrorCode = state.ErrorCode,
+                Error = state.Error
+            };
+        }
+        catch (ProcessInspectionException)
+        {
+            MarkProcessInspectionAmbiguousLocked();
+            return new MaintenanceValidation
+            {
+                Safe = false,
+                ErrorCode = ProcessInspection.ErrorCode,
+                Error = ProcessInspection.Message
+            };
+        }
+    }
+
+    private void MarkProcessInspectionAmbiguousLocked()
+    {
+        state.MaintenanceReady = false;
+        state.ErrorCode = ProcessInspection.ErrorCode;
+        state.Error = ProcessInspection.Message;
+        if (state.Phase == BridgePhase.READY || state.Phase == BridgePhase.LOADING ||
+            state.Phase == BridgePhase.RESTARTING || state.Phase == BridgePhase.DRAINING)
+        {
+            state.Phase = BridgePhase.ERROR;
+            state.RestartPending = false;
+        }
+        SaveStateLocked();
+        Monitor.PulseAll(gate);
+    }
+
     private bool TryAcceptLateReadinessLocked()
     {
-        if (state.ErrorCode != "READINESS_TIMEOUT" || state.ProcessId <= 0 ||
-            state.ProcessStartUtcTicks <= 0 || state.LaunchGeneration <= 0 ||
-            !IsOwnedProcess(state.ProcessId, state.ProcessStartUtcTicks))
-            return false;
+        try
+        {
+            if (state.ErrorCode != "READINESS_TIMEOUT" || state.ProcessId <= 0 ||
+                state.ProcessStartUtcTicks <= 0 || state.LaunchGeneration <= 0 ||
+                !IsOwnedProcess(state.ProcessId, state.ProcessStartUtcTicks))
+                return false;
 
-        DateTime launchStarted = state.LaunchStartedUtc.ToUniversalTime();
-        if (!IsReadinessMatch(state.LaunchId, state.ProcessId, state.LaunchGeneration, launchStarted))
-            return false;
+            DateTime launchStarted = state.LaunchStartedUtc.ToUniversalTime();
+            if (!IsReadinessMatch(state.LaunchId, state.ProcessId, state.LaunchGeneration, launchStarted))
+                return false;
 
-        MarkReadyLocked(state.LaunchId, state.LaunchGeneration, state.ProcessId, state.ProcessStartUtcTicks);
-        return state.Phase == BridgePhase.READY;
+            MarkReadyLocked(state.LaunchId, state.LaunchGeneration, state.ProcessId, state.ProcessStartUtcTicks);
+            return state.Phase == BridgePhase.READY;
+        }
+        catch (ProcessInspectionException)
+        {
+            MarkProcessInspectionAmbiguousLocked();
+            return false;
+        }
     }
 
     private void SynchronizeLocked()
     {
         PruneStaleLeasesLocked();
 
-        if (state.Phase == BridgePhase.READY &&
-            (state.ProcessId <= 0 || !IsOwnedProcess(state.ProcessId, state.ProcessStartUtcTicks)))
+        bool owned = false;
+        if (state.Phase == BridgePhase.READY && state.ProcessId > 0)
+        {
+            try
+            {
+                owned = IsOwnedProcess(state.ProcessId, state.ProcessStartUtcTicks);
+            }
+            catch (ProcessInspectionException)
+            {
+                MarkProcessInspectionAmbiguousLocked();
+                return;
+            }
+        }
+
+        if (state.Phase == BridgePhase.READY && (state.ProcessId <= 0 || !owned))
         {
             state.Phase = BridgePhase.STOPPED;
             state.Error = "The coordinator-owned RimWorld process is no longer running.";
@@ -1989,9 +2264,13 @@ internal sealed class CoordinatorState
             using IManagedProcess process = processAdapter.Open(processId);
             return IsOwnedProcess(process, startTicks);
         }
+        catch (ProcessInspectionException)
+        {
+            throw;
+        }
         catch
         {
-            return false;
+            throw ProcessInspection.Failure();
         }
     }
 
@@ -2002,40 +2281,85 @@ internal sealed class CoordinatorState
             if (process == null || process.HasExited)
                 return false;
             string executablePath = process.ExecutablePath;
-            if (string.IsNullOrWhiteSpace(executablePath) ||
-                !string.Equals(Path.GetFullPath(executablePath), rimWorldExe, StringComparison.OrdinalIgnoreCase))
+            if (string.IsNullOrWhiteSpace(executablePath))
+                throw ProcessInspection.Failure();
+            if (!string.Equals(Path.GetFullPath(executablePath), rimWorldExe, StringComparison.OrdinalIgnoreCase))
                 return false;
-            return startTicks > 0 && process.StartIdentity == startTicks;
+            if (startTicks <= 0)
+                return false;
+            long actualStartTicks = process.StartIdentity;
+            if (actualStartTicks <= 0)
+                throw ProcessInspection.Failure();
+            return actualStartTicks == startTicks;
+        }
+        catch (ProcessInspectionException)
+        {
+            throw;
         }
         catch
         {
-            return false;
+            throw ProcessInspection.Failure();
         }
     }
 
     private List<UnmanagedRimWorldProcess> FindUnmanagedRimWorldProcesses(int processIdToExclude,
-        long startTicksToExclude, bool failClosed = false)
+        long startTicksToExclude)
     {
-        ProcessEnumeration enumeration = processAdapter.EnumerateRimWorld(rimWorldExe);
-        if (!enumeration.Complete)
+        ProcessEnumeration enumeration;
+        try
         {
-            if (failClosed)
-                throw new InvalidOperationException("RimWorld process enumeration was incomplete: " + enumeration.Error);
-            return new List<UnmanagedRimWorldProcess>();
+            enumeration = processAdapter.EnumerateRimWorld(rimWorldExe);
+        }
+        catch (ProcessInspectionException)
+        {
+            throw;
+        }
+        catch
+        {
+            throw ProcessInspection.Failure();
         }
 
+        if (enumeration == null || !enumeration.Complete || enumeration.Processes == null)
+            throw ProcessInspection.Failure();
+
         List<UnmanagedRimWorldProcess> result = new();
-        foreach (IManagedProcess process in enumeration.Processes ?? Array.Empty<IManagedProcess>())
+        try
         {
-            try
+            foreach (IManagedProcess process in enumeration.Processes)
             {
-                if (process.Id == processIdToExclude && process.StartIdentity == startTicksToExclude)
+                if (process == null)
+                    throw ProcessInspection.Failure();
+                int processId = process.Id;
+                if (process.HasExited)
                     continue;
-                result.Add(new UnmanagedRimWorldProcess { ProcessId = process.Id });
+                string executablePath = process.ExecutablePath;
+                if (string.IsNullOrWhiteSpace(executablePath))
+                    throw ProcessInspection.Failure();
+                if (!string.Equals(Path.GetFullPath(executablePath), rimWorldExe,
+                        StringComparison.OrdinalIgnoreCase))
+                    continue;
+                long startTicks = process.StartIdentity;
+                if (processId <= 0 || startTicks <= 0)
+                    throw ProcessInspection.Failure();
+                if (processId == processIdToExclude && startTicks == startTicksToExclude)
+                    continue;
+                result.Add(new UnmanagedRimWorldProcess { ProcessId = processId });
             }
-            finally
+        }
+        catch (ProcessInspectionException)
+        {
+            throw;
+        }
+        catch
+        {
+            throw ProcessInspection.Failure();
+        }
+        finally
+        {
+            foreach (IManagedProcess process in enumeration.Processes)
             {
-                process.Dispose();
+                try { process?.Dispose(); }
+                catch { }
             }
         }
 
@@ -2203,18 +2527,28 @@ internal sealed class CoordinatorState
         lock (gate)
         {
             SynchronizeLocked();
+            RevalidateMaintenanceReadyLocked();
             snapshot = CloneStateLocked();
         }
 
-        string command = request.Command;
+        string commandName = request.Command ?? string.Empty;
+        string command = commandName;
         if (request.Arguments.Count > 0)
             command += " " + string.Join(" ", request.Arguments);
 
+        bool maintenanceSafetyLost = exitCode == 0 && !snapshot.MaintenanceReady &&
+            (string.Equals(commandName, "stop", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(commandName, "ensure-ready", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(commandName, "restart", StringComparison.OrdinalIgnoreCase)) &&
+            (snapshot.ErrorCode == ProcessInspection.ErrorCode ||
+             snapshot.ErrorCode == "MAINTENANCE_PROCESS_PRESENT");
+        int effectiveExitCode = maintenanceSafetyLost ? 4 : exitCode;
+
         JsonCommandResponse response = new()
         {
-            Success = exitCode == 0,
+            Success = effectiveExitCode == 0,
             Command = command,
-            ExitCode = exitCode,
+            ExitCode = effectiveExitCode,
             State = snapshot.Phase.ToString(),
             GameState = snapshot.Phase.ToString(),
             Generation = snapshot.Generation,
@@ -2243,18 +2577,18 @@ internal sealed class CoordinatorState
 
         if (string.Equals(request.Command, "restart", StringComparison.OrdinalIgnoreCase))
         {
-            response.Accepted = messages.Any(value =>
+            response.Accepted = effectiveExitCode == 0 && messages.Any(value =>
                 value.StartsWith("Restart accepted", StringComparison.OrdinalIgnoreCase) ||
                 value.StartsWith("Restart already accepted", StringComparison.OrdinalIgnoreCase));
         }
 
         if ((string.Equals(request.Command, "stop", StringComparison.OrdinalIgnoreCase) ||
-             string.Equals(request.Command, "ensure-ready", StringComparison.OrdinalIgnoreCase)) && exitCode == 0)
+             string.Equals(request.Command, "ensure-ready", StringComparison.OrdinalIgnoreCase)) && effectiveExitCode == 0)
             response.Accepted = true;
 
         string subcommand = request.Arguments.Count > 0 ? request.Arguments[0] : string.Empty;
         if (string.Equals(request.Command, "test", StringComparison.OrdinalIgnoreCase) &&
-            string.Equals(subcommand, "begin", StringComparison.OrdinalIgnoreCase) && exitCode == 0)
+            string.Equals(subcommand, "begin", StringComparison.OrdinalIgnoreCase) && effectiveExitCode == 0)
         {
             TestLease lease = snapshot.Leases
                 .Where(value => string.Equals(value.Agent, request.Agent, StringComparison.Ordinal) &&
@@ -2278,11 +2612,11 @@ internal sealed class CoordinatorState
 
         response.Error = !string.IsNullOrWhiteSpace(snapshot.Error)
             ? snapshot.Error
-            : exitCode == 0
+            : effectiveExitCode == 0
                 ? null
                 : messages.LastOrDefault(value => !value.StartsWith("Next action:", StringComparison.Ordinal));
         response.ErrorCode = snapshot.ErrorCode;
-        response.NextAction = JsonNextAction(request, snapshot, exitCode, response.LeaseId);
+        response.NextAction = JsonNextAction(request, snapshot, effectiveExitCode, response.LeaseId);
         return response;
     }
 
@@ -2291,6 +2625,10 @@ internal sealed class CoordinatorState
     {
         string command = request.Command ?? string.Empty;
         string subcommand = request.Arguments.Count > 0 ? request.Arguments[0] : string.Empty;
+
+        if (snapshot.ErrorCode == ProcessInspection.ErrorCode ||
+            snapshot.ErrorCode == "MAINTENANCE_PROCESS_PRESENT")
+            return "Run: DevBridge.cmd doctor";
 
         if (string.Equals(command, "test", StringComparison.OrdinalIgnoreCase) &&
             string.Equals(subcommand, "begin", StringComparison.OrdinalIgnoreCase) && exitCode == 0)

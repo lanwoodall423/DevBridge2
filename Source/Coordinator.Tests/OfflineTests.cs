@@ -19,6 +19,9 @@ internal static class OfflineTests
         Run("ensure-ready launches exactly once after maintenance", TestEnsureReadyLaunch);
         Run("restart retains immediate launch behavior", TestImmediateRestart);
         Run("duplicate stop is idempotent", TestDuplicateStop);
+        Run("process inspection uncertainty fails closed", TestInspectionFailsClosed);
+        Run("maintenance claims are freshly re-enumerated", TestMaintenanceRevalidation);
+        Run("uncertain maintenance operations make no adapter calls", TestMaintenanceInspectionNoLaunch);
 
         Console.WriteLine(failures == 0 ? "OFFLINE TESTS PASS" : "OFFLINE TESTS FAIL: " + failures);
         return failures == 0 ? 0 : 1;
@@ -227,6 +230,90 @@ internal static class OfflineTests
             "duplicate stop must not terminate or launch again");
     }
 
+    private static void TestInspectionFailsClosed()
+    {
+        foreach (Action<FakeProcess> configure in new Action<FakeProcess>[]
+        {
+            process => process.ThrowOnExecutablePath = true,
+            process => process.ThrowOnHasExited = true,
+            process => process.ThrowOnStartIdentity = true
+        })
+        {
+            using Fixture fixture = Fixture.MaintenanceWithLease();
+            FakeProcess candidate = new(501, 5001, fixture.RimWorldPath);
+            fixture.Adapter.Add(candidate);
+            configure(candidate);
+
+            int exitCode = fixture.State.Execute(Request("stop", "holder", 77, "T001"), _ => { }, () => true);
+            JsonCommandResponse response = fixture.State.CreateJsonResponse(Request("status", "holder", 77), exitCode,
+                Array.Empty<string>());
+            Assert(exitCode != 0 && response.ErrorCode == ProcessInspection.ErrorCode,
+                "inspection uncertainty must be structured as ambiguous process state");
+            Assert(!response.MaintenanceReady, "inspection uncertainty must not be copy-safe");
+            Assert(fixture.Adapter.TerminationRequests == 0 && fixture.Adapter.LaunchCalls == 0,
+                "inspection uncertainty must make zero termination and launch calls");
+        }
+    }
+
+    private static void TestMaintenanceRevalidation()
+    {
+        using Fixture fixture = Fixture.MaintenanceWithLease();
+        int beforeStop = fixture.Adapter.EnumerationCalls;
+        Assert(fixture.State.Execute(Request("stop", "holder", 77, "T001"), _ => { }, () => true) == 0,
+            "clean duplicate stop must remain idempotent");
+        Assert(fixture.Adapter.EnumerationCalls == beforeStop + 1,
+            "duplicate stop must freshly enumerate the installation");
+
+        int beforeStatus = fixture.Adapter.EnumerationCalls;
+        JsonCommandResponse clean = fixture.State.CreateJsonResponse(Request("status", "holder", 77), 0,
+            Array.Empty<string>());
+        Assert(fixture.Adapter.EnumerationCalls == beforeStatus + 1,
+            "status must freshly enumerate before reporting maintenanceReady=true");
+        Assert(clean.MaintenanceReady, "clean re-enumeration must preserve maintenanceReady");
+
+        fixture.Adapter.ExtraMatchingProcess = true;
+        JsonCommandResponse appeared = fixture.State.CreateJsonResponse(Request("status", "holder", 77), 0,
+            Array.Empty<string>());
+        Assert(!appeared.MaintenanceReady && appeared.ErrorCode == "MAINTENANCE_PROCESS_PRESENT",
+            "a process appearing after persistence must invalidate maintenanceReady");
+        Assert(fixture.Adapter.TerminationRequests == 0 && fixture.Adapter.LaunchCalls == 0,
+            "revalidation must not terminate or launch a newly discovered process");
+    }
+
+    private static void TestMaintenanceInspectionNoLaunch()
+    {
+        using (Fixture statusFixture = Fixture.MaintenanceWithLease())
+        {
+            statusFixture.Adapter.EnumerationIncomplete = true;
+            int statusExit = statusFixture.State.Execute(Request("status", "holder", 77), _ => { }, () => true);
+            JsonCommandResponse status = statusFixture.State.CreateJsonResponse(Request("status", "holder", 77), statusExit,
+                Array.Empty<string>());
+            Assert(statusExit == 0 && !status.MaintenanceReady &&
+                status.ErrorCode == ProcessInspection.ErrorCode,
+                "status must report persisted maintenance state as non-copy-safe when re-enumeration is uncertain");
+            Assert(statusFixture.Adapter.TerminationRequests == 0 && statusFixture.Adapter.LaunchCalls == 0,
+                "uncertain status reconciliation must make zero termination and launch calls");
+        }
+
+        using (Fixture ensureFixture = Fixture.MaintenanceWithLease())
+        {
+            ensureFixture.Adapter.EnumerationIncomplete = true;
+            int ensure = ensureFixture.State.Execute(Request("ensure-ready", "holder", 77, "T001"), _ => { }, () => true);
+            Assert(ensure != 0 && ensureFixture.Adapter.TerminationRequests == 0 &&
+                ensureFixture.Adapter.LaunchCalls == 0,
+                "uncertain ensure-ready must make zero termination and launch calls");
+        }
+
+        using (Fixture restartFixture = Fixture.MaintenanceWithLease())
+        {
+            restartFixture.Adapter.EnumerationIncomplete = true;
+            int restart = restartFixture.State.Execute(Request("restart", "holder", 77, "T001"), _ => { }, () => true);
+            Assert(restart != 0 && restartFixture.Adapter.TerminationRequests == 0 &&
+                restartFixture.Adapter.LaunchCalls == 0,
+                "uncertain restart must make zero termination and launch calls");
+        }
+    }
+
     private static BridgeRequest Request(string command, string agent = "agent", int pid = 1, params string[] arguments)
     {
         return new BridgeRequest
@@ -324,6 +411,20 @@ internal static class OfflineTests
             return fixture;
         }
 
+        internal static Fixture MaintenanceWithLease()
+        {
+            return new Fixture(new PersistedState
+            {
+                Generation = 1,
+                Phase = BridgePhase.STOPPED,
+                MaintenanceReady = true,
+                SessionDirty = true,
+                ProcessId = 0,
+                ProcessStartUtcTicks = 0,
+                Leases = new List<TestLease> { new() { Id = "T001", Agent = "holder", ClientProcessId = 77, Generation = 1, StartedUtc = ClockStart } }
+            });
+        }
+
         internal CoordinatorState ReloadWithLease(DateTime started)
         {
             WriteState(new PersistedState
@@ -403,6 +504,8 @@ internal static class OfflineTests
         internal FakeProcess Current => processes.Values.OrderByDescending(value => value.Id).First();
         internal bool ReadyOnLaunch { get; set; }
         internal bool ExtraMatchingProcess { get; set; }
+        internal bool EnumerationIncomplete { get; set; }
+        internal int EnumerationCalls { get; private set; }
         internal bool BlockWaitForExit
         {
             get => Current.BlockWait;
@@ -441,14 +544,26 @@ internal static class OfflineTests
 
         public ProcessEnumeration EnumerateRimWorld(string configuredPath)
         {
+            EnumerationCalls++;
+            if (EnumerationIncomplete)
+                return new ProcessEnumeration { Complete = false, Error = "simulated inspection failure" };
             if (ExtraMatchingProcess)
                 Add(new FakeProcess(999, 9999, executablePath));
-            return new ProcessEnumeration
+
+            try
             {
-                Complete = true,
-                Processes = processes.Values.Where(value => !value.HasExited &&
-                    string.Equals(value.ExecutablePath, configuredPath, StringComparison.OrdinalIgnoreCase)).Cast<IManagedProcess>().ToList()
-            };
+                return new ProcessEnumeration
+                {
+                    Complete = true,
+                    Processes = processes.Values.Where(value => !value.HasExited &&
+                        string.Equals(value.ExecutablePath, configuredPath, StringComparison.OrdinalIgnoreCase) &&
+                        value.StartIdentity > 0).Cast<IManagedProcess>().ToList()
+                };
+            }
+            catch
+            {
+                return new ProcessEnumeration { Complete = false, Error = "simulated inspection failure" };
+            }
         }
 
         public IManagedProcess Launch(ProcessLaunchRequest request)
@@ -489,14 +604,20 @@ internal static class OfflineTests
         internal FakeProcess(int id, long startIdentity, string executablePath)
         {
             Id = id;
-            StartIdentity = startIdentity;
-            ExecutablePath = executablePath;
+            this.startIdentity = startIdentity;
+            this.executablePath = executablePath;
         }
 
         public int Id { get; }
-        public long StartIdentity { get; }
-        public string ExecutablePath { get; }
-        public bool HasExited => exited;
+        internal bool ThrowOnStartIdentity { get; set; }
+        internal bool ThrowOnExecutablePath { get; set; }
+        internal bool ThrowOnHasExited { get; set; }
+        public long StartIdentity => ThrowOnStartIdentity ? throw new InvalidOperationException("start identity unavailable") : startIdentity;
+        public string ExecutablePath => ThrowOnExecutablePath ? throw new InvalidOperationException("path unavailable") : executablePath;
+        public bool HasExited => ThrowOnHasExited ? throw new InvalidOperationException("exit state unavailable") : exited;
+
+        private readonly long startIdentity;
+        private readonly string executablePath;
 
         public bool RequestTermination()
         {

@@ -48,7 +48,8 @@ internal static class Program
 
     private static void PrintUsage()
     {
-        Console.WriteLine("DevBridge commands: status | test begin | test end <lease-id> | restart | wait-ready | doctor");
+        Console.WriteLine("DevBridge commands: status | test begin | test end <lease-id> | stop <lease-id> | ensure-ready <lease-id> | restart | wait-ready | doctor");
+        Console.WriteLine("Append --json for machine-readable output.");
     }
 }
 
@@ -91,12 +92,20 @@ internal sealed class BridgeRequest
     public List<string> Arguments { get; set; } = new();
     public string Agent { get; set; }
     public int ClientProcessId { get; set; }
+    public bool Json { get; set; }
 }
 
 internal static class CoordinatorClient
 {
     internal static int Run(string root, IReadOnlyList<string> command)
     {
+        bool json = command.Any(argument => string.Equals(argument, "--json", StringComparison.OrdinalIgnoreCase));
+        List<string> normalizedCommand = command
+            .Where(argument => !string.Equals(argument, "--json", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        if (normalizedCommand.Count == 0)
+            throw new ArgumentException("a command is required before --json");
+
         NamedPipeClientStream pipe = null;
         DateTime deadline = DateTime.UtcNow.AddSeconds(15);
         bool serverStartRequested = false;
@@ -139,10 +148,11 @@ internal static class CoordinatorClient
             writer.AutoFlush = true;
             BridgeRequest request = new()
             {
-                Command = command[0],
-                Arguments = command.Skip(1).ToList(),
+                Command = normalizedCommand[0],
+                Arguments = normalizedCommand.Skip(1).ToList(),
                 Agent = AgentName(),
-                ClientProcessId = Environment.ProcessId
+                ClientProcessId = Environment.ProcessId,
+                Json = json
             };
             writer.WriteLine(JsonSerializer.Serialize(request, Program.JsonOptions));
 
@@ -168,7 +178,9 @@ internal static class CoordinatorClient
         if (!string.IsNullOrWhiteSpace(configured))
             return configured.Trim();
 
-        return Environment.UserName + "@" + Environment.MachineName;
+        // CLI clients are short-lived. Their OS process ID distinguishes concurrent
+        // sessions without adding persistent profiles or registration state.
+        return "agent-" + Environment.ProcessId.ToString("X4");
     }
 
     private static void StartServer(string root)
@@ -260,6 +272,7 @@ internal static class CoordinatorServer
         {
             writer.AutoFlush = true;
             ClientOutput output = new(writer);
+            BridgeRequest request = null;
             try
             {
                 string requestLine = reader.ReadLine();
@@ -270,20 +283,33 @@ internal static class CoordinatorServer
                     return;
                 }
 
-                BridgeRequest request = JsonSerializer.Deserialize<BridgeRequest>(requestLine, Program.JsonOptions);
+                request = JsonSerializer.Deserialize<BridgeRequest>(requestLine, Program.JsonOptions);
                 if (request == null || string.IsNullOrWhiteSpace(request.Command))
                 {
                     output.Write("Invalid coordinator request.");
                     output.Write("__DEVBRIDGE_END__|2");
                     return;
                 }
+                request.Arguments ??= new List<string>();
+                request.Agent = string.IsNullOrWhiteSpace(request.Agent) ? "unknown-agent" : request.Agent.Trim();
 
-                int exitCode = state.Execute(request, output.Write, () => output.Connected);
+                List<string> buffered = request.Json ? new List<string>() : null;
+                Action<string> emit = request.Json ? buffered.Add : output.Write;
+                int exitCode = state.Execute(request, emit, () => output.Connected && pipe.IsConnected);
+                if (request.Json)
+                    output.Write(JsonSerializer.Serialize(state.CreateJsonResponse(request, exitCode, buffered),
+                        Program.JsonOptions));
                 output.Write("__DEVBRIDGE_END__|" + exitCode);
             }
             catch (Exception exception)
             {
-                output.Write("DevBridge coordinator error: " + exception.Message);
+                if (request?.Json == true)
+                {
+                    output.Write(JsonSerializer.Serialize(JsonCommandResponse.Failure(
+                        request.Command, exception.Message, "Run: DevBridge.cmd doctor"), Program.JsonOptions));
+                }
+                else
+                    output.Write("DevBridge coordinator error: " + exception.Message);
                 output.Write("__DEVBRIDGE_END__|2");
             }
         }
@@ -351,12 +377,16 @@ internal sealed class PersistedState
     public BridgePhase Phase { get; set; } = BridgePhase.STOPPED;
     public string Error { get; set; }
     public string LaunchId { get; set; }
+    public int LaunchGeneration { get; set; }
     public int ProcessId { get; set; }
     public long ProcessStartUtcTicks { get; set; }
     public DateTime LaunchStartedUtc { get; set; }
     public int TargetGeneration { get; set; }
     public bool RestartPending { get; set; }
     public DateTime? RestartRequestedUtc { get; set; }
+    public bool MaintenanceReady { get; set; }
+    public bool SessionDirty { get; set; }
+    public string ErrorCode { get; set; }
     public List<TestLease> Leases { get; set; } = new();
 }
 
@@ -367,6 +397,112 @@ internal sealed class TestLease
     public int ClientProcessId { get; set; }
     public int Generation { get; set; }
     public DateTime StartedUtc { get; set; }
+}
+
+internal sealed class JsonCommandResponse
+{
+    [JsonPropertyName("success")]
+    public bool Success { get; set; }
+
+    [JsonPropertyName("command")]
+    public string Command { get; set; }
+
+    [JsonPropertyName("exitCode")]
+    public int ExitCode { get; set; }
+
+    [JsonPropertyName("state")]
+    public string State { get; set; }
+
+    [JsonPropertyName("generation")]
+    public int Generation { get; set; }
+
+    [JsonPropertyName("rimworldPid")]
+    public int RimWorldPid { get; set; }
+
+    [JsonPropertyName("rimworldProcessStartIdentity")]
+    public long RimWorldProcessStartIdentity { get; set; }
+
+    [JsonPropertyName("gameState")]
+    public string GameState { get; set; }
+
+    [JsonPropertyName("maintenanceReady")]
+    public bool MaintenanceReady { get; set; }
+
+    [JsonPropertyName("leaseState")]
+    public string LeaseState { get; set; }
+
+    [JsonPropertyName("sessionDirty")]
+    public bool SessionDirty { get; set; }
+
+    [JsonPropertyName("launchGeneration")]
+    public int LaunchGeneration { get; set; }
+
+    [JsonPropertyName("activeTests")]
+    public int ActiveTests { get; set; }
+
+    [JsonPropertyName("restartPending")]
+    public bool RestartPending { get; set; }
+
+    [JsonPropertyName("targetGeneration")]
+    public int TargetGeneration { get; set; }
+
+    [JsonPropertyName("accepted")]
+    public bool? Accepted { get; set; }
+
+    [JsonPropertyName("leaseId")]
+    public string LeaseId { get; set; }
+
+    [JsonPropertyName("agent")]
+    public string Agent { get; set; }
+
+    [JsonPropertyName("leases")]
+    public List<JsonLeaseInfo> Leases { get; set; } = new();
+
+    [JsonPropertyName("checks")]
+    public List<string> Checks { get; set; } = new();
+
+    [JsonPropertyName("error")]
+    public string Error { get; set; }
+
+    [JsonPropertyName("errorCode")]
+    public string ErrorCode { get; set; }
+
+    [JsonPropertyName("nextAction")]
+    public string NextAction { get; set; }
+
+    internal static JsonCommandResponse Failure(string command, string error, string nextAction)
+    {
+        return new JsonCommandResponse
+        {
+            Success = false,
+            Command = command,
+            ExitCode = 2,
+            State = BridgePhase.ERROR.ToString(),
+            Error = error,
+            NextAction = nextAction
+        };
+    }
+}
+
+internal sealed class JsonLeaseInfo
+{
+    [JsonPropertyName("id")]
+    public string Id { get; set; }
+
+    [JsonPropertyName("agent")]
+    public string Agent { get; set; }
+
+    [JsonPropertyName("generation")]
+    public int Generation { get; set; }
+
+    [JsonPropertyName("startedUtc")]
+    public DateTime StartedUtc { get; set; }
+
+    [JsonPropertyName("age")]
+    public string Age { get; set; }
+
+    [JsonPropertyName("staleIn")]
+    public string StaleIn { get; set; }
 }
 
 internal sealed class ReadinessRecord
@@ -382,11 +518,225 @@ internal sealed class UnmanagedRimWorldProcess
     public int ProcessId { get; set; }
 }
 
+internal sealed class ProcessLaunchRequest
+{
+    internal string FileName { get; init; }
+    internal string WorkingDirectory { get; init; }
+    internal IReadOnlyList<string> Arguments { get; init; }
+    internal IReadOnlyDictionary<string, string> Environment { get; init; }
+}
+
+internal interface IManagedProcess : IDisposable
+{
+    int Id { get; }
+    long StartIdentity { get; }
+    string ExecutablePath { get; }
+    bool HasExited { get; }
+    bool RequestTermination();
+    bool WaitForExit(TimeSpan timeout);
+    bool ForceTerminate();
+}
+
+internal sealed class ProcessEnumeration
+{
+    internal bool Complete { get; init; }
+    internal string Error { get; init; }
+    internal IReadOnlyList<IManagedProcess> Processes { get; init; } = Array.Empty<IManagedProcess>();
+}
+
+internal interface IProcessAdapter
+{
+    IManagedProcess Open(int processId);
+    ProcessEnumeration EnumerateRimWorld(string executablePath);
+    IManagedProcess Launch(ProcessLaunchRequest request);
+}
+
+internal interface ICoordinatorClock
+{
+    DateTime UtcNow { get; }
+    void Sleep(TimeSpan duration);
+}
+
+internal sealed class SystemCoordinatorClock : ICoordinatorClock
+{
+    internal static readonly SystemCoordinatorClock Instance = new();
+
+    public DateTime UtcNow => DateTime.UtcNow;
+
+    public void Sleep(TimeSpan duration) => Thread.Sleep(duration);
+}
+
+internal sealed class CoordinatorOptions
+{
+    internal TimeSpan ReadinessTimeout { get; init; } = TimeSpan.FromMinutes(6);
+    internal TimeSpan ProcessExitTimeout { get; init; } = TimeSpan.FromSeconds(15);
+    internal IProcessAdapter ProcessAdapter { get; init; } = new SystemProcessAdapter();
+    internal ICoordinatorClock Clock { get; init; } = SystemCoordinatorClock.Instance;
+    internal string RimWorldExecutablePath { get; init; }
+    internal string ModsConfigPath { get; init; }
+
+    internal static CoordinatorOptions ForProduction()
+    {
+        TimeSpan timeout = TimeSpan.FromMinutes(6);
+        string configured = Environment.GetEnvironmentVariable("DEVBRIDGE_READINESS_TIMEOUT_SECONDS");
+        if (int.TryParse(configured, out int seconds) && seconds >= 30 && seconds <= 3600)
+            timeout = TimeSpan.FromSeconds(seconds);
+
+        return new CoordinatorOptions { ReadinessTimeout = timeout };
+    }
+}
+
+internal sealed class SystemManagedProcess : IManagedProcess
+{
+    private readonly Process process;
+
+    internal SystemManagedProcess(Process process)
+    {
+        this.process = process;
+    }
+
+    public int Id => process.Id;
+    public long StartIdentity => TryGetStartIdentity(process);
+
+    public string ExecutablePath
+    {
+        get
+        {
+            try { return process.MainModule?.FileName; }
+            catch { return null; }
+        }
+    }
+
+    public bool HasExited
+    {
+        get
+        {
+            try { return process.HasExited; }
+            catch { return true; }
+        }
+    }
+
+    public bool RequestTermination()
+    {
+        try
+        {
+            if (process.HasExited)
+                return true;
+            return process.CloseMainWindow();
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public bool WaitForExit(TimeSpan timeout)
+    {
+        try
+        {
+            int milliseconds = (int)Math.Clamp(timeout.TotalMilliseconds, 0, int.MaxValue);
+            process.WaitForExit(milliseconds);
+            return process.HasExited;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public bool ForceTerminate()
+    {
+        try
+        {
+            if (!process.HasExited)
+                process.Kill(entireProcessTree: true);
+            process.WaitForExit(15000);
+            return process.HasExited;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public void Dispose() => process.Dispose();
+
+    private static long TryGetStartIdentity(Process process)
+    {
+        try { return process.StartTime.ToUniversalTime().Ticks; }
+        catch { return 0; }
+    }
+}
+
+internal sealed class SystemProcessAdapter : IProcessAdapter
+{
+    public IManagedProcess Open(int processId)
+    {
+        try { return new SystemManagedProcess(Process.GetProcessById(processId)); }
+        catch { return null; }
+    }
+
+    public ProcessEnumeration EnumerateRimWorld(string executablePath)
+    {
+        List<IManagedProcess> matches = new();
+        bool complete = true;
+        string error = null;
+        Process[] processes;
+        try
+        {
+            processes = Process.GetProcessesByName("RimWorldWin64");
+        }
+        catch (Exception exception)
+        {
+            return new ProcessEnumeration { Complete = false, Error = exception.Message };
+        }
+
+        foreach (Process process in processes)
+        {
+            try
+            {
+                SystemManagedProcess managed = new(process);
+                if (!managed.HasExited && string.Equals(Path.GetFullPath(managed.ExecutablePath ?? string.Empty),
+                        Path.GetFullPath(executablePath), StringComparison.OrdinalIgnoreCase))
+                    matches.Add(managed);
+                else
+                    managed.Dispose();
+            }
+            catch (Exception exception)
+            {
+                complete = false;
+                error ??= exception.Message;
+                process.Dispose();
+            }
+        }
+
+        return new ProcessEnumeration { Complete = complete, Error = error, Processes = matches };
+    }
+
+    public IManagedProcess Launch(ProcessLaunchRequest request)
+    {
+        ProcessStartInfo start = new()
+        {
+            FileName = request.FileName,
+            WorkingDirectory = request.WorkingDirectory,
+            UseShellExecute = false,
+            CreateNoWindow = false
+        };
+        foreach (string argument in request.Arguments ?? Array.Empty<string>())
+            start.ArgumentList.Add(argument);
+        foreach (KeyValuePair<string, string> pair in request.Environment ??
+                 new Dictionary<string, string>())
+            start.Environment[pair.Key] = pair.Value;
+
+        Process process = Process.Start(start);
+        return process == null ? null : new SystemManagedProcess(process);
+    }
+}
+
 internal sealed class CoordinatorState
 {
     private const string DevBridgePackageId = "lan.devbridge2";
     private static readonly TimeSpan LeaseStaleAfter = TimeSpan.FromHours(1);
-    private static readonly TimeSpan ReadinessTimeout = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan ProgressInterval = TimeSpan.FromSeconds(5);
 
     private readonly string root;
@@ -395,19 +745,32 @@ internal sealed class CoordinatorState
     private readonly string readinessPath;
     private readonly string rimWorldExe;
     private readonly string modsConfigPath;
+    private readonly CoordinatorOptions options;
+    private readonly IProcessAdapter processAdapter;
+    private readonly ICoordinatorClock clock;
     private readonly object gate = new();
+    private readonly object lifecycleGate = new();
     private PersistedState state;
     private Task restartTask;
     private Task launchTask;
 
-    internal CoordinatorState(string root)
+    internal CoordinatorState(string root) : this(root, CoordinatorOptions.ForProduction())
+    {
+    }
+
+    internal CoordinatorState(string root, CoordinatorOptions options)
     {
         this.root = Path.GetFullPath(root);
+        this.options = options ?? CoordinatorOptions.ForProduction();
+        processAdapter = this.options.ProcessAdapter ?? new SystemProcessAdapter();
+        clock = this.options.Clock ?? SystemCoordinatorClock.Instance;
         runtimeRoot = Path.Combine(this.root, "Runtime");
         statePath = Path.Combine(runtimeRoot, "state.json");
         readinessPath = Path.Combine(runtimeRoot, "readiness.json");
-        rimWorldExe = Path.GetFullPath(Path.Combine(this.root, "..", "..", "RimWorldWin64.exe"));
-        modsConfigPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        rimWorldExe = Path.GetFullPath(this.options.RimWorldExecutablePath ??
+            Path.Combine(this.root, "..", "..", "RimWorldWin64.exe"));
+        modsConfigPath = this.options.ModsConfigPath ?? Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
             "AppData", "LocalLow", "Ludeon Studios", "RimWorld by Ludeon Studios", "Config", "ModsConfig.xml");
         Directory.CreateDirectory(runtimeRoot);
 
@@ -444,10 +807,12 @@ internal sealed class CoordinatorState
 
         return command switch
         {
-            "status" => Status(emit),
-            "doctor" => Doctor(emit),
-            "wait-ready" => WaitReady(emit),
-            "restart" => Restart(emit),
+            "status" => Status(request, emit),
+            "doctor" => Doctor(request, emit),
+            "wait-ready" => WaitReady(request, emit),
+            "restart" => Restart(request, emit),
+            "stop" => Stop(request, emit),
+            "ensure-ready" => EnsureReady(request, emit),
             "test" => Test(arguments, request, emit, connected),
             "help" => Help(emit),
             _ => Unknown(command, emit)
@@ -476,20 +841,35 @@ internal sealed class CoordinatorState
         emit("  DevBridge.cmd status");
         emit("  DevBridge.cmd test begin");
         emit("  DevBridge.cmd test end <lease-id>");
+        emit("  DevBridge.cmd stop <lease-id>");
+        emit("  DevBridge.cmd ensure-ready <lease-id>");
         emit("  DevBridge.cmd restart");
         emit("  DevBridge.cmd wait-ready");
         emit("  DevBridge.cmd doctor");
+        emit("Append --json to a command for one machine-readable result.");
         return 0;
     }
 
     private static int Unknown(string command, Action<string> emit)
     {
         emit("Unknown DevBridge command: " + command);
-        emit("Use: status, test begin, test end <lease-id>, restart, wait-ready, doctor");
+        emit("Use: status, test begin, test end <lease-id>, stop <lease-id>, ensure-ready <lease-id>, restart, wait-ready, doctor");
+        EmitNextCommand(emit, "DevBridge.cmd help");
         return 2;
     }
 
-    private int Status(Action<string> emit)
+    private static void EmitNextCommand(Action<string> emit, string command)
+    {
+        emit("Next action: Run:");
+        emit(command);
+    }
+
+    private static void EmitKeepWaiting(Action<string> emit)
+    {
+        emit("Next action: Keep waiting. Do not launch, kill, or restart RimWorld yourself.");
+    }
+
+    private int Status(BridgeRequest request, Action<string> emit)
     {
         PersistedState snapshot;
         bool processRunning;
@@ -503,7 +883,13 @@ internal sealed class CoordinatorState
         }
 
         emit("DevBridge2 status");
+        emit("Agent/session: " + request.Agent);
         emit("State: " + snapshot.Phase);
+        string heldLease = snapshot.Leases.FirstOrDefault(value =>
+            string.Equals(value.Agent, request.Agent, StringComparison.Ordinal) &&
+            value.ClientProcessId == request.ClientProcessId)?.Id;
+        emit("gameState=" + snapshot.Phase + " maintenanceReady=" + snapshot.MaintenanceReady.ToString().ToLowerInvariant() +
+            " leaseState=" + (heldLease == null ? "QUEUED" : "HELD"));
         emit("Generation: " + snapshot.Generation);
         emit("RimWorld: " + (processRunning ? "running" : "not running") +
             (snapshot.ProcessId > 0 ? " (PID " + snapshot.ProcessId + ")" : string.Empty));
@@ -515,11 +901,14 @@ internal sealed class CoordinatorState
         }
         emit("Launch ID: " + (string.IsNullOrWhiteSpace(snapshot.LaunchId) ? "none" : snapshot.LaunchId));
         emit("Active tests: " + snapshot.Leases.Count);
+        emit("Session dirty: " + snapshot.SessionDirty);
         foreach (TestLease lease in snapshot.Leases.OrderBy(value => value.StartedUtc))
-            emit("  " + lease.Id + " - " + FormatAge(lease.StartedUtc) + " - " + lease.Agent);
+            emit("  " + lease.Id + " - " + lease.Agent + " - age " + FormatAge(lease.StartedUtc) +
+                " - stale in " + FormatStaleIn(lease.StartedUtc));
 
         if (snapshot.RestartPending)
         {
+            emit("Restart is in progress.");
             emit("Restart: pending for generation " + snapshot.TargetGeneration +
                 (snapshot.RestartRequestedUtc.HasValue ? " (requested " + FormatAge(snapshot.RestartRequestedUtc.Value) + " ago)" : string.Empty));
             emit("New test requests are waiting for the new generation.");
@@ -527,21 +916,37 @@ internal sealed class CoordinatorState
 
         if (!string.IsNullOrWhiteSpace(snapshot.Error))
             emit("Error: " + snapshot.Error);
+        if (!string.IsNullOrWhiteSpace(snapshot.ErrorCode))
+            emit("Error code: " + snapshot.ErrorCode);
 
-        if (snapshot.Phase == BridgePhase.READY && !snapshot.RestartPending)
+        if (snapshot.MaintenanceReady)
+        {
+            TestLease holder = snapshot.Leases.FirstOrDefault();
+            emit("Maintenance window is confirmed safe for assembly replacement.");
+            if (holder != null)
+                EmitNextCommand(emit, "DevBridge.cmd ensure-ready " + holder.Id);
+            else
+                EmitKeepWaiting(emit);
+        }
+        else if (snapshot.Phase == BridgePhase.READY && !snapshot.RestartPending)
         {
             emit("Test leases are shared; multiple agents may test this generation concurrently.");
-            emit("Next: run DevBridge.cmd test begin before interacting with RimWorld.");
+            EmitNextCommand(emit, "DevBridge.cmd test begin");
         }
         else if (snapshot.Phase == BridgePhase.ERROR)
-            emit("Next: inspect Runtime and RimWorld logs, then run DevBridge.cmd restart.");
+            EmitNextCommand(emit, "DevBridge.cmd doctor");
+        else if (snapshot.Phase == BridgePhase.STOPPED && snapshot.Generation > 0 && !snapshot.RestartPending)
+            EmitNextCommand(emit, "DevBridge.cmd restart");
+        else if (snapshot.RestartPending || snapshot.Phase == BridgePhase.DRAINING ||
+                 snapshot.Phase == BridgePhase.RESTARTING || snapshot.Phase == BridgePhase.LOADING)
+            EmitKeepWaiting(emit);
         else
-            emit("DevBridge is waiting; use wait-ready to follow this operation.");
+            EmitNextCommand(emit, "DevBridge.cmd wait-ready");
 
         return 0;
     }
 
-    private int Doctor(Action<string> emit)
+    private int Doctor(BridgeRequest request, Action<string> emit)
     {
         string modAssembly = Path.Combine(root, "1.6", "Assemblies", "DevBridge2.dll");
         string about = Path.Combine(root, "About", "About.xml");
@@ -561,6 +966,7 @@ internal sealed class CoordinatorState
         }
 
         emit("DevBridge2 doctor");
+        emit("Agent/session: " + request.Agent);
         emit(Check(exeExists, "RimWorld executable: " + rimWorldExe));
         emit(Check(aboutExists, "Mod metadata: " + about));
         emit(Check(modExists, "Built mod assembly: " + modAssembly));
@@ -592,31 +998,47 @@ internal sealed class CoordinatorState
             emit("Readiness file: not present (normal before a map is loaded)");
         }
 
-        return exeExists && aboutExists && modExists ? 0 : 1;
+        int exitCode = exeExists && aboutExists && modExists ? 0 : 1;
+        if (exitCode != 0)
+            emit("Next action: Fix the failing check, then run:");
+        else if (snapshot.Phase == BridgePhase.READY && !snapshot.RestartPending)
+            EmitNextCommand(emit, "DevBridge.cmd test begin");
+        else if (snapshot.RestartPending || snapshot.Phase == BridgePhase.DRAINING ||
+                 snapshot.Phase == BridgePhase.RESTARTING || snapshot.Phase == BridgePhase.LOADING)
+            EmitKeepWaiting(emit);
+        else
+            EmitNextCommand(emit, "DevBridge.cmd wait-ready");
+        if (exitCode != 0)
+            emit("DevBridge.cmd restart");
+        return exitCode;
     }
 
     private static string Check(bool passed, string text) => (passed ? "PASS " : "FAIL ") + text;
 
     private int BeginLease(BridgeRequest request, Action<string> emit, Func<bool> connected)
     {
-        lock (gate)
+        emit("Agent/session: " + request.Agent);
+        lock (lifecycleGate)
         {
-            SynchronizeLocked();
-            if (state.Phase == BridgePhase.STOPPED && state.Generation == 0 && !state.RestartPending)
+            lock (gate)
             {
-                emit("No ready RimWorld generation is running.");
-                emit("DevBridge is launching RimWorld with -quicktest and waiting for a map.");
-                StartInitialLaunchLocked();
-            }
-            else if (state.Phase == BridgePhase.ERROR)
-            {
-                emit("RimWorld is in ERROR state: " + state.Error);
-                emit("Inspect the logs, then run DevBridge.cmd restart to retry.");
-                return 4;
+                SynchronizeLocked();
+                if (state.Phase == BridgePhase.STOPPED && state.Generation == 0 && !state.RestartPending)
+                {
+                    emit("No ready RimWorld generation is running.");
+                    emit("DevBridge is launching RimWorld normally, then requesting built-in Dev Quicktest.");
+                    StartInitialLaunchLocked();
+                }
+                else if (state.Phase == BridgePhase.ERROR)
+                {
+                    emit("RimWorld is in ERROR state: " + state.Error);
+                    EmitNextCommand(emit, "DevBridge.cmd doctor");
+                    return 4;
+                }
             }
         }
 
-        if (!WaitForReady(emit, requireNoRestart: true, connected: connected))
+        if (!WaitForReady(emit, requireNoRestart: true, connected: connected, waitForMaintenance: true))
             return 4;
 
         if (!connected())
@@ -631,7 +1053,7 @@ internal sealed class CoordinatorState
                 if (state.Phase == BridgePhase.ERROR)
                 {
                     emit("RimWorld is in ERROR state: " + state.Error);
-                    emit("Run DevBridge.cmd restart after inspecting the logs.");
+                    EmitNextCommand(emit, "DevBridge.cmd doctor");
                     return 4;
                 }
 
@@ -645,7 +1067,7 @@ internal sealed class CoordinatorState
                         Agent = string.IsNullOrWhiteSpace(request.Agent) ? "unknown-agent" : request.Agent,
                         ClientProcessId = request.ClientProcessId,
                         Generation = state.Generation,
-                        StartedUtc = DateTime.UtcNow
+                        StartedUtc = clock.UtcNow
                     };
                     state.Leases.Add(lease);
                     SaveStateLocked();
@@ -654,8 +1076,8 @@ internal sealed class CoordinatorState
                 }
             }
 
-            emit("A restart is pending. Waiting for generation " + CurrentTargetGeneration() + "...");
-            emit("Do not launch or restart RimWorld yourself. DevBridge will continue automatically.");
+            emit("Restart is in progress. Waiting for generation " + CurrentTargetGeneration() + "...");
+            EmitKeepWaiting(emit);
             WaitForStateChange();
         }
 
@@ -673,7 +1095,7 @@ internal sealed class CoordinatorState
         }
         emit("Generation: " + lease.Generation);
         emit(string.Empty);
-        emit("When finished testing, run:");
+        emit("Next action: Test your mod, then run:");
         emit("DevBridge.cmd test end " + lease.Id);
         if (!connected())
         {
@@ -708,42 +1130,244 @@ internal sealed class CoordinatorState
             Monitor.PulseAll(gate);
             emit("Test lease released: " + leaseId);
             if (state.RestartPending && state.Leases.Count == 0)
+            {
                 emit("No active tests remain. DevBridge will continue the pending restart automatically.");
+                EmitKeepWaiting(emit);
+            }
+            else
+                emit("Next action: Continue your workflow; run DevBridge.cmd restart only after a change requiring a fresh process.");
             return 0;
         }
     }
 
-    private int Restart(Action<string> emit)
+    private int Stop(BridgeRequest request, Action<string> emit)
     {
-        int targetGeneration;
-        bool alreadyPending;
-        lock (gate)
+        if (request.Arguments.Count < 1 || string.IsNullOrWhiteSpace(request.Arguments[0]))
         {
-            SynchronizeLocked();
-            alreadyPending = state.RestartPending;
-            if (!alreadyPending)
+            emit("Usage: DevBridge.cmd stop <lease-id>");
+            return 2;
+        }
+
+        string leaseId = request.Arguments[0].Trim().ToUpperInvariant();
+        lock (lifecycleGate)
+        {
+            int processId;
+            long processStartIdentity;
+            lock (gate)
             {
-                targetGeneration = Math.Max(state.Generation + 1, state.TargetGeneration);
-                state.TargetGeneration = targetGeneration;
-                state.RestartPending = true;
-                state.RestartRequestedUtc = DateTime.UtcNow;
+                SynchronizeLocked();
+                if (!TryGetLeaseHolderLocked(leaseId, request, out TestLease lease))
+                {
+                    emit("Stop denied: lease " + leaseId + " is not held by this agent/session.");
+                    EmitNextCommand(emit, "DevBridge.cmd test begin");
+                    return 4;
+                }
+
+                if (state.MaintenanceReady)
+                {
+                    emit("RimWorld is already stopped for maintenance.");
+                    emit("gameState=STOPPED maintenanceReady=true leaseState=HELD");
+                    EmitNextCommand(emit, "DevBridge.cmd ensure-ready " + lease.Id);
+                    return 0;
+                }
+
+                if (state.RestartPending || state.Phase == BridgePhase.DRAINING ||
+                    state.Phase == BridgePhase.RESTARTING || state.Phase == BridgePhase.LOADING ||
+                    (state.Phase != BridgePhase.READY && state.ErrorCode != "READINESS_TIMEOUT"))
+                {
+                    emit("Stop denied: RimWorld is not in a stoppable ready or timed-out state.");
+                    emit("No launch was attempted.");
+                    EmitKeepWaiting(emit);
+                    return 4;
+                }
+
+                processId = state.ProcessId;
+                processStartIdentity = state.ProcessStartUtcTicks;
+            }
+
+            (bool success, string error) result = StopForMaintenance(processId, processStartIdentity);
+            lock (gate)
+            {
+                if (!result.success)
+                {
+                    state.MaintenanceReady = false;
+                    state.ErrorCode = "STOP_FAILED";
+                    state.Error = "RimWorld was not stopped safely: " + result.error;
+                    SaveStateLocked();
+                    Monitor.PulseAll(gate);
+                    emit("Stop failed: " + result.error);
+                    emit("maintenanceReady=false");
+                    EmitNextCommand(emit, "DevBridge.cmd doctor");
+                    return 4;
+                }
+
+                state.Phase = BridgePhase.STOPPED;
+                state.ProcessId = 0;
+                state.ProcessStartUtcTicks = 0;
+                state.MaintenanceReady = true;
+                state.SessionDirty = true;
                 state.Error = null;
-                state.Phase = BridgePhase.DRAINING;
+                state.ErrorCode = null;
+                state.RestartPending = false;
+                state.TargetGeneration = 0;
                 DeleteReadinessLocked();
                 SaveStateLocked();
-                StartRestartWorkerLocked(targetGeneration);
                 Monitor.PulseAll(gate);
+                emit("RimWorld stopped and confirmed absent from the configured installation.");
+                emit("gameState=STOPPED maintenanceReady=true leaseState=HELD");
+                EmitNextCommand(emit, "DevBridge.cmd ensure-ready " + leaseId);
+                return 0;
             }
-            else
+        }
+    }
+
+    private int EnsureReady(BridgeRequest request, Action<string> emit)
+    {
+        if (request.Arguments.Count < 1 || string.IsNullOrWhiteSpace(request.Arguments[0]))
+        {
+            emit("Usage: DevBridge.cmd ensure-ready <lease-id>");
+            return 2;
+        }
+
+        string leaseId = request.Arguments[0].Trim().ToUpperInvariant();
+        lock (lifecycleGate)
+        {
+            int targetGeneration = 0;
+            bool shouldLaunch = false;
+            lock (gate)
             {
-                targetGeneration = state.TargetGeneration;
+                SynchronizeLocked();
+                if (!TryGetLeaseHolderLocked(leaseId, request, out TestLease lease))
+                {
+                    emit("Ensure-ready denied: lease " + leaseId + " is not held by this agent/session.");
+                    return 4;
+                }
+
+                if (state.MaintenanceReady)
+                {
+                    targetGeneration = Math.Max(1, state.Generation + 1);
+                    state.TargetGeneration = targetGeneration;
+                    state.MaintenanceReady = false;
+                    state.Error = null;
+                    state.ErrorCode = null;
+                    state.Phase = BridgePhase.RESTARTING;
+                    DeleteReadinessLocked();
+                    SaveStateLocked();
+                    shouldLaunch = true;
+                }
+                else if (state.Phase == BridgePhase.READY && !state.RestartPending)
+                {
+                    emit("RimWorld is already ready.");
+                    EmitNextCommand(emit, "DevBridge.cmd test end " + lease.Id);
+                    return 0;
+                }
+                else if (state.ErrorCode == "READINESS_TIMEOUT")
+                {
+                    if (TryAcceptLateReadinessLocked())
+                    {
+                        emit("Late quicktest readiness accepted from the original process.");
+                        emit("RimWorld is ready.");
+                        EmitNextCommand(emit, "DevBridge.cmd test end " + lease.Id);
+                        return 0;
+                    }
+
+                    emit("READINESS_TIMEOUT: the original RimWorld process is still not ready.");
+                    emit("No launch was attempted.");
+                    EmitNextCommand(emit, "DevBridge.cmd stop " + lease.Id);
+                    return 4;
+                }
+                else
+                {
+                    emit("Ensure-ready denied: no confirmed maintenance window or reusable timed-out process exists.");
+                    EmitNextCommand(emit, "DevBridge.cmd doctor");
+                    return 4;
+                }
+            }
+
+            if (shouldLaunch)
+            {
+                emit("Maintenance window released by lease holder; launching one new RimWorld process.");
+                LaunchGenerationWorker(targetGeneration, isRestart: true);
+            }
+
+            lock (gate)
+            {
+                if (state.Generation >= targetGeneration && state.Phase == BridgePhase.READY &&
+                    !state.RestartPending)
+                {
+                    emit("RimWorld is ready.");
+                    emit("Generation: " + state.Generation);
+                    EmitNextCommand(emit, "DevBridge.cmd test end " + leaseId);
+                    return 0;
+                }
+
+                emit(string.IsNullOrWhiteSpace(state.Error) ?
+                    "Ensure-ready did not reach quicktest readiness." : state.Error);
+                if (state.ErrorCode == "READINESS_TIMEOUT")
+                    emit("READINESS_TIMEOUT");
+                EmitNextCommand(emit, "DevBridge.cmd doctor");
+                return 4;
+            }
+        }
+    }
+
+    private int Restart(BridgeRequest request, Action<string> emit)
+    {
+        int targetGeneration;
+        int currentGeneration;
+        bool alreadyPending;
+        lock (lifecycleGate)
+        {
+            lock (gate)
+            {
+                SynchronizeLocked();
+                currentGeneration = state.Generation;
+                alreadyPending = state.RestartPending;
+                if (state.MaintenanceReady)
+                {
+                    if (request.Arguments.Count < 1 ||
+                        !TryGetLeaseHolderLocked(request.Arguments[0], request, out TestLease maintenanceLease))
+                    {
+                        emit("Restart denied: a lease-holder token is required while maintenanceReady=true.");
+                        emit("No launch was attempted.");
+                        return 4;
+                    }
+
+                    state.Leases.Remove(maintenanceLease);
+                    state.MaintenanceReady = false;
+                    state.SessionDirty = true;
+                    alreadyPending = false;
+                }
+
+                if (!alreadyPending)
+                {
+                    targetGeneration = Math.Max(state.Generation + 1, state.TargetGeneration);
+                    state.TargetGeneration = targetGeneration;
+                    state.RestartPending = true;
+                    state.RestartRequestedUtc = clock.UtcNow;
+                    state.Error = null;
+                    state.ErrorCode = null;
+                    state.Phase = BridgePhase.DRAINING;
+                    DeleteReadinessLocked();
+                    SaveStateLocked();
+                    StartRestartWorkerLocked(targetGeneration);
+                    Monitor.PulseAll(gate);
+                }
+                else
+                {
+                    targetGeneration = state.TargetGeneration;
+                }
             }
         }
 
         if (alreadyPending)
-            emit("Restart is already pending for generation " + targetGeneration + ".");
+            emit("Restart already accepted for generation " + currentGeneration + " -> " + targetGeneration + ".");
         else
-            emit("Restart requested for generation " + Math.Max(0, targetGeneration - 1) + ".");
+            emit("Restart accepted for generation " + currentGeneration + " -> " + targetGeneration + ".");
+        emit("Agent/session: " + request.Agent);
+        emit("DevBridge now owns this restart.");
+        emit("If this command is interrupted or times out, do not request another restart.");
+        EmitNextCommand(emit, "DevBridge.cmd wait-ready");
 
         EmitRestartWait(emit);
         while (true)
@@ -757,13 +1381,14 @@ internal sealed class CoordinatorState
                     emit("RimWorld restarted successfully.");
                     emit("Generation: " + state.Generation);
                     emit("Quicktest map is ready.");
+                    EmitNextCommand(emit, "DevBridge.cmd test begin");
                     return 0;
                 }
 
                 if (state.Phase == BridgePhase.ERROR && !state.RestartPending)
                 {
                     emit("Restart failed: " + state.Error);
-                    emit("Inspect Runtime and the RimWorld logs, then retry with DevBridge.cmd restart.");
+                    EmitNextCommand(emit, "DevBridge.cmd doctor");
                     return 4;
                 }
             }
@@ -773,16 +1398,20 @@ internal sealed class CoordinatorState
         }
     }
 
-    private int WaitReady(Action<string> emit)
+    private int WaitReady(BridgeRequest request, Action<string> emit)
     {
-        lock (gate)
+        emit("Agent/session: " + request.Agent);
+        lock (lifecycleGate)
         {
-            SynchronizeLocked();
-            if (state.Phase == BridgePhase.STOPPED && state.Generation == 0 && !state.RestartPending)
+            lock (gate)
             {
-                emit("No ready RimWorld generation is running.");
-                emit("DevBridge is launching RimWorld with -quicktest and waiting for a map.");
-                StartInitialLaunchLocked();
+                SynchronizeLocked();
+                if (state.Phase == BridgePhase.STOPPED && state.Generation == 0 && !state.RestartPending)
+                {
+                    emit("No ready RimWorld generation is running.");
+                    emit("DevBridge is launching RimWorld normally, then requesting built-in Dev Quicktest.");
+                    StartInitialLaunchLocked();
+                }
             }
         }
 
@@ -794,13 +1423,15 @@ internal sealed class CoordinatorState
             emit("RimWorld is ready.");
             emit("Generation: " + state.Generation);
             emit("Quicktest map is ready.");
+            EmitNextCommand(emit, "DevBridge.cmd test begin");
         }
         return 0;
     }
 
-    private bool WaitForReady(Action<string> emit, bool requireNoRestart, Func<bool> connected = null)
+    private bool WaitForReady(Action<string> emit, bool requireNoRestart, Func<bool> connected = null,
+        bool waitForMaintenance = false)
     {
-        DateTime nextProgress = DateTime.UtcNow;
+        DateTime nextProgress = clock.UtcNow;
         bool first = true;
         while (true)
         {
@@ -818,22 +1449,36 @@ internal sealed class CoordinatorState
                 if (state.Phase == BridgePhase.ERROR && !state.RestartPending)
                 {
                     emit("RimWorld is in ERROR state: " + state.Error);
+                    EmitNextCommand(emit, "DevBridge.cmd doctor");
                     return false;
                 }
 
                 if (state.Phase == BridgePhase.STOPPED && state.Generation > 0 && !state.RestartPending)
                 {
-                    emit("RimWorld is stopped. Run DevBridge.cmd restart to launch a new generation.");
+                    if (state.MaintenanceReady && waitForMaintenance)
+                    {
+                        emit("RimWorld is stopped for a lease-held maintenance window.");
+                        emit("Waiting for the lease holder to run ensure-ready or restart.");
+                        EmitKeepWaiting(emit);
+                        first = false;
+                        nextProgress = clock.UtcNow.Add(ProgressInterval);
+                        Monitor.Wait(gate, 1000);
+                        continue;
+                    }
+
+                    emit("RimWorld is stopped.");
+                    EmitNextCommand(emit, "DevBridge.cmd restart");
                     return false;
                 }
 
-                if (first || DateTime.UtcNow >= nextProgress)
+                if (first || clock.UtcNow >= nextProgress)
                 {
                     int target = CurrentTargetGenerationLocked();
                     emit("Waiting for RimWorld generation " + target + "...");
                     emit("State: " + state.Phase + ". Waiting for the quicktest map readiness signal.");
+                    EmitKeepWaiting(emit);
                     first = false;
-                    nextProgress = DateTime.UtcNow.Add(ProgressInterval);
+                    nextProgress = clock.UtcNow.Add(ProgressInterval);
                 }
 
                 Monitor.Wait(gate, 1000);
@@ -852,17 +1497,20 @@ internal sealed class CoordinatorState
 
         if (snapshot.Leases.Count == 0)
         {
+            emit("Restart is in progress.");
             emit("No active tests remain.");
             emit("State: " + snapshot.Phase + ". Waiting for generation " + snapshot.TargetGeneration +
                 " quicktest map readiness.");
+            EmitKeepWaiting(emit);
             return;
         }
 
+        emit("Restart is in progress.");
         emit("Waiting for " + snapshot.Leases.Count + " active test" + (snapshot.Leases.Count == 1 ? "" : "s") + ":");
         foreach (TestLease lease in snapshot.Leases.OrderBy(value => value.StartedUtc))
-            emit("  " + lease.Id + " - active " + FormatAge(lease.StartedUtc));
-        emit("Do not terminate RimWorld.");
-        emit("DevBridge will restart it automatically when these tests finish.");
+            emit("  " + lease.Id + " - " + lease.Agent + " - active " + FormatAge(lease.StartedUtc) +
+                " - stale in " + FormatStaleIn(lease.StartedUtc));
+        EmitKeepWaiting(emit);
     }
 
     private void ReleaseLeaseSilently(string leaseId)
@@ -888,12 +1536,19 @@ internal sealed class CoordinatorState
         state.TargetGeneration = target;
         state.Phase = BridgePhase.RESTARTING;
         state.Error = null;
+        state.ErrorCode = null;
+        state.MaintenanceReady = false;
         state.LaunchId = null;
+        state.LaunchGeneration = target;
         state.ProcessId = 0;
         state.ProcessStartUtcTicks = 0;
         DeleteReadinessLocked();
         SaveStateLocked();
-        launchTask = Task.Run(() => LaunchGenerationWorker(target, isRestart: false));
+        launchTask = Task.Run(() =>
+        {
+            lock (lifecycleGate)
+                LaunchGenerationWorker(target, isRestart: false);
+        });
     }
 
     private void StartRestartWorkerLocked(int targetGeneration)
@@ -916,6 +1571,8 @@ internal sealed class CoordinatorState
     {
         try
         {
+            lock (lifecycleGate)
+            {
             int oldProcessId;
             long oldStartTicks;
             while (true)
@@ -940,10 +1597,10 @@ internal sealed class CoordinatorState
 
                     state.Phase = BridgePhase.RESTARTING;
                     state.Error = null;
+                    state.ErrorCode = null;
+                    state.MaintenanceReady = false;
                     oldProcessId = state.ProcessId;
                     oldStartTicks = state.ProcessStartUtcTicks;
-                    state.ProcessId = 0;
-                    state.ProcessStartUtcTicks = 0;
                     DeleteReadinessLocked();
                     SaveStateLocked();
                     break;
@@ -952,6 +1609,7 @@ internal sealed class CoordinatorState
 
             StopOwnedProcess(oldProcessId, oldStartTicks);
             LaunchGenerationWorker(targetGeneration, isRestart: true);
+            }
         }
         catch (Exception exception)
         {
@@ -962,7 +1620,7 @@ internal sealed class CoordinatorState
     private void LaunchGenerationWorker(int targetGeneration, bool isRestart)
     {
         string launchId = Guid.NewGuid().ToString("N");
-        Process process = null;
+        IManagedProcess process = null;
         try
         {
             lock (gate)
@@ -970,8 +1628,11 @@ internal sealed class CoordinatorState
                 state.Phase = BridgePhase.LOADING;
                 state.TargetGeneration = targetGeneration;
                 state.LaunchId = launchId;
-                state.LaunchStartedUtc = DateTime.UtcNow;
+                state.LaunchGeneration = targetGeneration;
+                state.LaunchStartedUtc = clock.UtcNow;
                 state.Error = null;
+                state.ErrorCode = null;
+                state.MaintenanceReady = false;
                 DeleteReadinessLocked();
                 SaveStateLocked();
             }
@@ -982,30 +1643,32 @@ internal sealed class CoordinatorState
             EnsureDevBridgeModEnabled();
 
             List<UnmanagedRimWorldProcess> unmanagedProcesses =
-                FindUnmanagedRimWorldProcesses(processIdToExclude: 0, startTicksToExclude: 0);
+                FindUnmanagedRimWorldProcesses(processIdToExclude: 0, startTicksToExclude: 0, failClosed: true);
             if (unmanagedProcesses.Count > 0)
                 throw new InvalidOperationException("an unmanaged RimWorld process is already running (PID " +
                     string.Join(", ", unmanagedProcesses.Select(value => value.ProcessId.ToString())) +
                     "); close it through Steam before retrying");
 
-            ProcessStartInfo start = new()
+            process = processAdapter.Launch(new ProcessLaunchRequest
             {
                 FileName = rimWorldExe,
                 WorkingDirectory = Path.GetDirectoryName(rimWorldExe) ?? root,
-                UseShellExecute = false,
-                CreateNoWindow = false
-            };
-            start.ArgumentList.Add("-quicktest");
-            start.Environment["DEVBRIDGE_ROOT"] = root;
-            start.Environment["DEVBRIDGE_LAUNCH_ID"] = launchId;
-            start.Environment["DEVBRIDGE_GENERATION"] = targetGeneration.ToString();
-
-            process = Process.Start(start);
+                Arguments = Array.Empty<string>(),
+                Environment = new Dictionary<string, string>
+                {
+                    ["DEVBRIDGE_ROOT"] = root,
+                    ["DEVBRIDGE_LAUNCH_ID"] = launchId,
+                    ["DEVBRIDGE_GENERATION"] = targetGeneration.ToString(),
+                    ["DEVBRIDGE_QUICKTEST_REQUESTED"] = "1"
+                }
+            });
             if (process == null)
-                throw new InvalidOperationException("Process.Start returned no RimWorld process");
+                throw new InvalidOperationException("launch adapter returned no RimWorld process");
 
             int processId = process.Id;
-            long processStartTicks = TryGetStartTicks(process);
+            long processStartTicks = process.StartIdentity;
+            if (processStartTicks <= 0)
+                throw new InvalidOperationException("launch adapter did not provide a process-start identity");
             lock (gate)
             {
                 state.ProcessId = processId;
@@ -1018,7 +1681,8 @@ internal sealed class CoordinatorState
         }
         catch (Exception exception)
         {
-            FailLaunch(DescribeLaunchFailure(exception, process));
+            FailLaunch(DescribeLaunchFailure(exception, process), exception is TimeoutException ?
+                "READINESS_TIMEOUT" : "LAUNCH_FAILED");
         }
         finally
         {
@@ -1043,7 +1707,9 @@ internal sealed class CoordinatorState
             if (processId <= 0 || string.IsNullOrWhiteSpace(launchId))
                 throw new InvalidOperationException("persisted launch information is incomplete");
 
-            using Process process = Process.GetProcessById(processId);
+            using IManagedProcess process = processAdapter.Open(processId);
+            if (process == null)
+                throw new InvalidOperationException("the persisted RimWorld process no longer exists");
             MonitorLaunchUntilReady(process, processId, startTicks, launchId, targetGeneration);
         }
         catch (Exception exception)
@@ -1052,70 +1718,61 @@ internal sealed class CoordinatorState
         }
     }
 
-    private void MonitorLaunchUntilReady(Process process, int processId, long processStartTicks,
+    private void MonitorLaunchUntilReady(IManagedProcess process, int processId, long processStartTicks,
         string launchId, int targetGeneration)
     {
         DateTime deadline;
         lock (gate)
-            deadline = state.LaunchStartedUtc.ToUniversalTime().Add(ReadinessTimeout);
+            deadline = state.LaunchStartedUtc.ToUniversalTime().Add(options.ReadinessTimeout);
 
-        while (DateTime.UtcNow < deadline)
+        while (clock.UtcNow < deadline)
         {
-            try
+            if (process == null || process.HasExited)
             {
-                process.Refresh();
-                if (process.HasExited)
-                {
-                    throw new InvalidOperationException("RimWorld exited before the quicktest map became ready (exit code " +
-                        process.ExitCode + ")");
-                }
-            }
-            catch (InvalidOperationException exception) when (exception.Message.StartsWith("No process",
-                StringComparison.OrdinalIgnoreCase))
-            {
-                throw new InvalidOperationException("RimWorld exited before the quicktest map became ready");
+                FailLaunch("RimWorld exited before the quicktest map became ready", "PROCESS_EXITED");
+                return;
             }
 
-            if (IsReadinessMatch(launchId, processId, targetGeneration, deadline - ReadinessTimeout))
+            if (!IsOwnedProcess(process, processStartTicks))
+            {
+                FailLaunch("the RimWorld process identity changed before readiness", "PROCESS_IDENTITY_CHANGED");
+                return;
+            }
+
+            DateTime launchStarted = deadline - options.ReadinessTimeout;
+            if (IsReadinessMatch(launchId, processId, targetGeneration, launchStarted))
             {
                 lock (gate)
                 {
-                    if (state.LaunchId == launchId && state.TargetGeneration == targetGeneration)
-                    {
-                        state.Generation = targetGeneration;
-                        state.Phase = BridgePhase.READY;
-                        state.Error = null;
-                        state.RestartPending = false;
-                        state.RestartRequestedUtc = null;
-                        state.TargetGeneration = 0;
-                        SaveStateLocked();
-                        Monitor.PulseAll(gate);
-                    }
+                    MarkReadyLocked(launchId, targetGeneration, processId, processStartTicks);
                 }
                 return;
             }
 
-            Thread.Sleep(1000);
+            clock.Sleep(TimeSpan.FromSeconds(1));
         }
 
-        throw new TimeoutException("no matching readiness signal was written within " +
-            ReadinessTimeout.TotalMinutes.ToString("0") + " minutes");
+        FailLaunch("no matching readiness signal was written within " +
+            options.ReadinessTimeout.TotalSeconds.ToString("0") + " seconds", "READINESS_TIMEOUT");
     }
 
-    private void FailLaunch(string detail)
+    private void FailLaunch(string detail, string errorCode = "LAUNCH_FAILED")
     {
         lock (gate)
         {
             state.Phase = BridgePhase.ERROR;
             state.RestartPending = false;
-            state.Error = "RimWorld did not report a playable quicktest map: " + detail +
+            state.ErrorCode = errorCode;
+            state.Error = errorCode == "READINESS_TIMEOUT" ?
+                "READINESS_TIMEOUT: " + detail + ". The original process was retained; no replacement launch was attempted." :
+                "RimWorld did not report a playable quicktest map: " + detail +
                 ". Inspect Runtime/readiness.json and the RimWorld logs, then run DevBridge.cmd restart.";
             SaveStateLocked();
             Monitor.PulseAll(gate);
         }
     }
 
-    private static string DescribeLaunchFailure(Exception exception, Process process)
+    private static string DescribeLaunchFailure(Exception exception, IManagedProcess process)
     {
         if (exception is FileNotFoundException)
             return exception.Message;
@@ -1124,7 +1781,7 @@ internal sealed class CoordinatorState
             try
             {
                 if (process.HasExited)
-                    return "RimWorld exited before readiness (exit code " + process.ExitCode + ")";
+                    return "RimWorld exited before readiness";
             }
             catch
             {
@@ -1140,10 +1797,12 @@ internal sealed class CoordinatorState
         if (processId <= 0)
             return;
 
-        Process process = null;
+        IManagedProcess process = null;
         try
         {
-            process = Process.GetProcessById(processId);
+            process = processAdapter.Open(processId);
+            if (process == null)
+                return;
             if (!IsOwnedProcess(process, startTicks))
                 return;
 
@@ -1151,8 +1810,8 @@ internal sealed class CoordinatorState
             {
                 try
                 {
-                    process.CloseMainWindow();
-                    process.WaitForExit(5000);
+                    process.RequestTermination();
+                    process.WaitForExit(TimeSpan.FromSeconds(5));
                 }
                 catch
                 {
@@ -1162,15 +1821,10 @@ internal sealed class CoordinatorState
 
             if (!process.HasExited)
             {
-                process.Kill(entireProcessTree: true);
-                process.WaitForExit(15000);
+                process.ForceTerminate();
             }
         }
-        catch (ArgumentException)
-        {
-            // The process already exited.
-        }
-        catch (InvalidOperationException)
+        catch
         {
             // The process already exited or cannot be controlled.
         }
@@ -1178,6 +1832,87 @@ internal sealed class CoordinatorState
         {
             process?.Dispose();
         }
+    }
+
+    private (bool success, string error) StopForMaintenance(int processId, long startTicks)
+    {
+        if (processId <= 0 || startTicks <= 0)
+            return (false, "the persisted process PID/start identity is incomplete");
+
+        using IManagedProcess process = processAdapter.Open(processId);
+        if (process == null)
+            return (false, "the persisted RimWorld process no longer exists");
+        if (!IsOwnedProcess(process, startTicks))
+            return (false, "the persisted process identity no longer matches");
+        if (process.HasExited)
+            return (false, "the verified process was already exited before termination was requested");
+        if (!process.RequestTermination())
+            return (false, "the verified process rejected the termination request");
+        if (!process.WaitForExit(options.ProcessExitTimeout) || !process.HasExited)
+            return (false, "process exit was not confirmed within the configured timeout");
+
+        ProcessEnumeration enumeration = processAdapter.EnumerateRimWorld(rimWorldExe);
+        if (!enumeration.Complete)
+            return (false, "post-stop process enumeration was incomplete: " + enumeration.Error);
+
+        try
+        {
+            if ((enumeration.Processes?.Count ?? 0) != 0)
+                return (false, "a matching RimWorld installation process remains: " +
+                    string.Join(", ", enumeration.Processes.Select(value => value.Id)));
+        }
+        finally
+        {
+            foreach (IManagedProcess remaining in enumeration.Processes ?? Array.Empty<IManagedProcess>())
+                remaining.Dispose();
+        }
+
+        return (true, null);
+    }
+
+    private bool TryGetLeaseHolderLocked(string leaseId, BridgeRequest request, out TestLease lease)
+    {
+        lease = state.Leases.FirstOrDefault(value =>
+            string.Equals(value.Id, leaseId, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(value.Agent, request.Agent, StringComparison.Ordinal) &&
+            value.ClientProcessId == request.ClientProcessId);
+        return lease != null;
+    }
+
+    private void MarkReadyLocked(string launchId, int targetGeneration, int processId, long processStartIdentity)
+    {
+        if (!string.Equals(state.LaunchId, launchId, StringComparison.Ordinal) ||
+            state.LaunchGeneration != targetGeneration || state.ProcessId != processId ||
+            state.ProcessStartUtcTicks != processStartIdentity || !IsOwnedProcess(processId, processStartIdentity))
+            return;
+
+        state.Generation = targetGeneration;
+        state.Phase = BridgePhase.READY;
+        state.Error = null;
+        state.ErrorCode = null;
+        state.RestartPending = false;
+        state.RestartRequestedUtc = null;
+        state.TargetGeneration = 0;
+        state.MaintenanceReady = false;
+        foreach (TestLease lease in state.Leases)
+            lease.Generation = targetGeneration;
+        SaveStateLocked();
+        Monitor.PulseAll(gate);
+    }
+
+    private bool TryAcceptLateReadinessLocked()
+    {
+        if (state.ErrorCode != "READINESS_TIMEOUT" || state.ProcessId <= 0 ||
+            state.ProcessStartUtcTicks <= 0 || state.LaunchGeneration <= 0 ||
+            !IsOwnedProcess(state.ProcessId, state.ProcessStartUtcTicks))
+            return false;
+
+        DateTime launchStarted = state.LaunchStartedUtc.ToUniversalTime();
+        if (!IsReadinessMatch(state.LaunchId, state.ProcessId, state.LaunchGeneration, launchStarted))
+            return false;
+
+        MarkReadyLocked(state.LaunchId, state.LaunchGeneration, state.ProcessId, state.ProcessStartUtcTicks);
+        return state.Phase == BridgePhase.READY;
     }
 
     private void SynchronizeLocked()
@@ -1189,6 +1924,8 @@ internal sealed class CoordinatorState
         {
             state.Phase = BridgePhase.STOPPED;
             state.Error = "The coordinator-owned RimWorld process is no longer running.";
+            state.ErrorCode = "PROCESS_EXITED";
+            state.MaintenanceReady = false;
             state.ProcessId = 0;
             state.ProcessStartUtcTicks = 0;
             SaveStateLocked();
@@ -1212,7 +1949,7 @@ internal sealed class CoordinatorState
 
     private void PruneStaleLeasesLocked()
     {
-        DateTime cutoff = DateTime.UtcNow - LeaseStaleAfter;
+        DateTime cutoff = clock.UtcNow - LeaseStaleAfter;
         int before = state.Leases.Count;
         state.Leases.RemoveAll(lease => lease == null || lease.StartedUtc.ToUniversalTime() < cutoff);
         if (state.Leases.Count != before)
@@ -1249,7 +1986,7 @@ internal sealed class CoordinatorState
 
         try
         {
-            using Process process = Process.GetProcessById(processId);
+            using IManagedProcess process = processAdapter.Open(processId);
             return IsOwnedProcess(process, startTicks);
         }
         catch
@@ -1258,20 +1995,17 @@ internal sealed class CoordinatorState
         }
     }
 
-    private bool IsOwnedProcess(Process process, long startTicks)
+    private bool IsOwnedProcess(IManagedProcess process, long startTicks)
     {
         try
         {
-            if (process.HasExited)
+            if (process == null || process.HasExited)
                 return false;
-            string executablePath = process.MainModule?.FileName;
+            string executablePath = process.ExecutablePath;
             if (string.IsNullOrWhiteSpace(executablePath) ||
                 !string.Equals(Path.GetFullPath(executablePath), rimWorldExe, StringComparison.OrdinalIgnoreCase))
                 return false;
-            if (startTicks <= 0)
-                return true;
-            long actual = process.StartTime.ToUniversalTime().Ticks;
-            return Math.Abs(actual - startTicks) < TimeSpan.FromSeconds(3).Ticks;
+            return startTicks > 0 && process.StartIdentity == startTicks;
         }
         catch
         {
@@ -1280,39 +2014,24 @@ internal sealed class CoordinatorState
     }
 
     private List<UnmanagedRimWorldProcess> FindUnmanagedRimWorldProcesses(int processIdToExclude,
-        long startTicksToExclude)
+        long startTicksToExclude, bool failClosed = false)
     {
-        List<UnmanagedRimWorldProcess> result = new();
-        Process[] processes;
-        try
+        ProcessEnumeration enumeration = processAdapter.EnumerateRimWorld(rimWorldExe);
+        if (!enumeration.Complete)
         {
-            processes = Process.GetProcessesByName("RimWorldWin64");
-        }
-        catch
-        {
-            return result;
+            if (failClosed)
+                throw new InvalidOperationException("RimWorld process enumeration was incomplete: " + enumeration.Error);
+            return new List<UnmanagedRimWorldProcess>();
         }
 
-        foreach (Process process in processes)
+        List<UnmanagedRimWorldProcess> result = new();
+        foreach (IManagedProcess process in enumeration.Processes ?? Array.Empty<IManagedProcess>())
         {
             try
             {
-                if (process.HasExited)
+                if (process.Id == processIdToExclude && process.StartIdentity == startTicksToExclude)
                     continue;
-                if (process.Id == processIdToExclude &&
-                    (startTicksToExclude <= 0 || TryGetStartTicks(process) == startTicksToExclude))
-                    continue;
-
-                string executablePath = process.MainModule?.FileName;
-                if (string.IsNullOrWhiteSpace(executablePath) ||
-                    !string.Equals(Path.GetFullPath(executablePath), rimWorldExe, StringComparison.OrdinalIgnoreCase))
-                    continue;
-
                 result.Add(new UnmanagedRimWorldProcess { ProcessId = process.Id });
-            }
-            catch
-            {
-                // Ignore processes that exit or cannot be inspected during enumeration.
             }
             finally
             {
@@ -1321,18 +2040,6 @@ internal sealed class CoordinatorState
         }
 
         return result;
-    }
-
-    private static long TryGetStartTicks(Process process)
-    {
-        try
-        {
-            return process.StartTime.ToUniversalTime().Ticks;
-        }
-        catch
-        {
-            return 0;
-        }
     }
 
     private void DeleteReadinessLocked()
@@ -1489,13 +2196,180 @@ internal sealed class CoordinatorState
         }
     }
 
+    internal JsonCommandResponse CreateJsonResponse(BridgeRequest request, int exitCode,
+        IReadOnlyList<string> messages)
+    {
+        PersistedState snapshot;
+        lock (gate)
+        {
+            SynchronizeLocked();
+            snapshot = CloneStateLocked();
+        }
+
+        string command = request.Command;
+        if (request.Arguments.Count > 0)
+            command += " " + string.Join(" ", request.Arguments);
+
+        JsonCommandResponse response = new()
+        {
+            Success = exitCode == 0,
+            Command = command,
+            ExitCode = exitCode,
+            State = snapshot.Phase.ToString(),
+            GameState = snapshot.Phase.ToString(),
+            Generation = snapshot.Generation,
+            RimWorldPid = snapshot.ProcessId,
+            RimWorldProcessStartIdentity = snapshot.ProcessStartUtcTicks,
+            LaunchGeneration = snapshot.LaunchGeneration,
+            MaintenanceReady = snapshot.MaintenanceReady,
+            LeaseState = snapshot.Leases.Any(value =>
+                string.Equals(value.Agent, request.Agent, StringComparison.Ordinal) &&
+                value.ClientProcessId == request.ClientProcessId) ? "HELD" : "QUEUED",
+            SessionDirty = snapshot.SessionDirty,
+            ActiveTests = snapshot.Leases.Count,
+            RestartPending = snapshot.RestartPending,
+            TargetGeneration = snapshot.TargetGeneration,
+            Agent = request.Agent,
+            Leases = snapshot.Leases
+                .OrderBy(value => value.StartedUtc)
+                .Select(ToJsonLease)
+                .ToList(),
+            Checks = messages
+                .Where(value => value.StartsWith("PASS ", StringComparison.Ordinal) ||
+                                value.StartsWith("FAIL ", StringComparison.Ordinal) ||
+                                value.StartsWith("WARN ", StringComparison.Ordinal))
+                .ToList()
+        };
+
+        if (string.Equals(request.Command, "restart", StringComparison.OrdinalIgnoreCase))
+        {
+            response.Accepted = messages.Any(value =>
+                value.StartsWith("Restart accepted", StringComparison.OrdinalIgnoreCase) ||
+                value.StartsWith("Restart already accepted", StringComparison.OrdinalIgnoreCase));
+        }
+
+        if ((string.Equals(request.Command, "stop", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(request.Command, "ensure-ready", StringComparison.OrdinalIgnoreCase)) && exitCode == 0)
+            response.Accepted = true;
+
+        string subcommand = request.Arguments.Count > 0 ? request.Arguments[0] : string.Empty;
+        if (string.Equals(request.Command, "test", StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(subcommand, "begin", StringComparison.OrdinalIgnoreCase) && exitCode == 0)
+        {
+            TestLease lease = snapshot.Leases
+                .Where(value => string.Equals(value.Agent, request.Agent, StringComparison.Ordinal) &&
+                                value.ClientProcessId == request.ClientProcessId)
+                .OrderByDescending(value => value.StartedUtc)
+                .FirstOrDefault();
+            response.LeaseId = lease?.Id;
+        }
+        else if (string.Equals(request.Command, "test", StringComparison.OrdinalIgnoreCase) &&
+                 string.Equals(subcommand, "end", StringComparison.OrdinalIgnoreCase) &&
+                 request.Arguments.Count > 1)
+        {
+            response.LeaseId = request.Arguments[1];
+        }
+        else if ((string.Equals(request.Command, "stop", StringComparison.OrdinalIgnoreCase) ||
+                  string.Equals(request.Command, "ensure-ready", StringComparison.OrdinalIgnoreCase)) &&
+                 request.Arguments.Count > 0)
+        {
+            response.LeaseId = request.Arguments[0];
+        }
+
+        response.Error = !string.IsNullOrWhiteSpace(snapshot.Error)
+            ? snapshot.Error
+            : exitCode == 0
+                ? null
+                : messages.LastOrDefault(value => !value.StartsWith("Next action:", StringComparison.Ordinal));
+        response.ErrorCode = snapshot.ErrorCode;
+        response.NextAction = JsonNextAction(request, snapshot, exitCode, response.LeaseId);
+        return response;
+    }
+
+    private static string JsonNextAction(BridgeRequest request, PersistedState snapshot,
+        int exitCode, string leaseId)
+    {
+        string command = request.Command ?? string.Empty;
+        string subcommand = request.Arguments.Count > 0 ? request.Arguments[0] : string.Empty;
+
+        if (string.Equals(command, "test", StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(subcommand, "begin", StringComparison.OrdinalIgnoreCase) && exitCode == 0)
+            return "Test your mod, then run: DevBridge.cmd test end " + leaseId;
+
+        if (string.Equals(command, "test", StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(subcommand, "end", StringComparison.OrdinalIgnoreCase) && exitCode == 0)
+        {
+            return snapshot.RestartPending
+                ? "Keep waiting. Do not launch, kill, or restart RimWorld yourself."
+                : "Continue your workflow; run DevBridge.cmd restart only after a change requiring a fresh process.";
+        }
+
+        if (string.Equals(command, "stop", StringComparison.OrdinalIgnoreCase) && exitCode == 0)
+            return "Replace the assembly, verify its hash, then run: DevBridge.cmd ensure-ready " + leaseId;
+
+        if (string.Equals(command, "ensure-ready", StringComparison.OrdinalIgnoreCase) && exitCode == 0)
+            return "Run: DevBridge.cmd test end " + leaseId;
+
+        if (exitCode != 0)
+        {
+            if (string.Equals(command, "doctor", StringComparison.OrdinalIgnoreCase))
+                return "Fix the failing doctor check, then run: DevBridge.cmd restart";
+            return "Run: DevBridge.cmd doctor";
+        }
+
+        if (snapshot.Phase == BridgePhase.ERROR)
+            return "Run: DevBridge.cmd doctor";
+        if (snapshot.MaintenanceReady)
+            return "Replace the assembly, verify its hash, then run: DevBridge.cmd ensure-ready " + leaseId;
+        if (snapshot.Phase == BridgePhase.READY && !snapshot.RestartPending)
+            return "Run: DevBridge.cmd test begin";
+        if (snapshot.RestartPending || snapshot.Phase == BridgePhase.DRAINING ||
+            snapshot.Phase == BridgePhase.RESTARTING || snapshot.Phase == BridgePhase.LOADING)
+            return "Keep waiting. Do not launch, kill, or restart RimWorld yourself.";
+        if (snapshot.Phase == BridgePhase.STOPPED && snapshot.Generation > 0)
+            return "Run: DevBridge.cmd restart";
+        return "Run: DevBridge.cmd wait-ready";
+    }
+
+    private static JsonLeaseInfo ToJsonLease(TestLease lease)
+    {
+        return new JsonLeaseInfo
+        {
+            Id = lease.Id,
+            Agent = lease.Agent,
+            Generation = lease.Generation,
+            StartedUtc = lease.StartedUtc,
+            Age = FormatAge(lease.StartedUtc),
+            StaleIn = FormatStaleIn(lease.StartedUtc)
+        };
+    }
+
+    private static string FormatStaleIn(DateTime startedUtc)
+    {
+        TimeSpan age = DateTime.UtcNow - startedUtc.ToUniversalTime();
+        if (age < TimeSpan.Zero)
+            age = TimeSpan.Zero;
+        TimeSpan remaining = LeaseStaleAfter - age;
+        if (remaining < TimeSpan.Zero)
+            remaining = TimeSpan.Zero;
+        return FormatDuration(remaining);
+    }
+
+    private static string FormatDuration(TimeSpan duration)
+    {
+        if (duration < TimeSpan.Zero)
+            duration = TimeSpan.Zero;
+        if (duration.TotalHours >= 1)
+            return ((int)duration.TotalHours).ToString("00") + ":" + duration.Minutes.ToString("00") +
+                ":" + duration.Seconds.ToString("00");
+        return duration.Minutes.ToString("00") + ":" + duration.Seconds.ToString("00");
+    }
+
     private static string FormatAge(DateTime startedUtc)
     {
         TimeSpan age = DateTime.UtcNow - startedUtc.ToUniversalTime();
         if (age < TimeSpan.Zero)
             age = TimeSpan.Zero;
-        if (age.TotalHours >= 1)
-            return ((int)age.TotalHours).ToString("00") + ":" + age.Minutes.ToString("00") + ":" + age.Seconds.ToString("00");
-        return age.Minutes.ToString("00") + ":" + age.Seconds.ToString("00");
+        return FormatDuration(age);
     }
 }

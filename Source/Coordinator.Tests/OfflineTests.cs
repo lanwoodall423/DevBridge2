@@ -21,6 +21,8 @@ internal static class OfflineTests
         Run("restart retains immediate launch behavior", TestImmediateRestart);
         Run("duplicate stop is idempotent", TestDuplicateStop);
         Run("process inspection uncertainty fails closed", TestInspectionFailsClosed);
+        Run("doctor clears a stale inspection quarantine after a zero-process census", TestDoctorRecoversInspectionQuarantine);
+        Run("doctor keeps inspection quarantine when the census is not conclusively empty", TestDoctorRecoveryFailsClosed);
         Run("maintenance claims are freshly re-enumerated", TestMaintenanceRevalidation);
         Run("uncertain maintenance operations make no adapter calls", TestMaintenanceInspectionNoLaunch);
         Run("status uses one authoritative process snapshot", TestStatusSnapshotConsistency);
@@ -813,6 +815,99 @@ internal static class OfflineTests
         }
     }
 
+    private static void TestDoctorRecoversInspectionQuarantine()
+    {
+        using Fixture fixture = new(new PersistedState
+        {
+            Generation = 193,
+            Phase = BridgePhase.ERROR,
+            Error = ProcessInspection.Message,
+            ErrorCode = ProcessInspection.ErrorCode,
+            LaunchId = "stale-launch",
+            LaunchGeneration = 194,
+            TargetGeneration = 194,
+            ProcessId = 26844,
+            ProcessStartUtcTicks = 639221499641606101,
+            LaunchStartedUtc = ClockStart,
+            RequiresNewProcess = true
+        });
+
+        BridgeRequest doctorRequest = Request("doctor");
+        List<string> output = new();
+        int doctorExit = fixture.State.Execute(doctorRequest, output.Add, () => true);
+        JsonCommandResponse recovered = fixture.State.CreateJsonResponse(doctorRequest, doctorExit, output);
+
+        Assert(doctorExit == 0 && recovered.State == "STOPPED" && recovered.ErrorCode == null,
+            "a complete zero-process census must recover the stale inspection quarantine to STOPPED");
+        Assert(recovered.RimWorldPid == 0 && recovered.RimWorldProcessStartIdentity == 0 &&
+            recovered.RequiresNewProcess && !recovered.RestartPending,
+            "recovery must clear the stale process identity and require a new explicit launch");
+        Assert(fixture.Adapter.EnumerationCalls == 1 && fixture.Adapter.TerminationRequests == 0 &&
+            fixture.Adapter.LaunchCalls == 0,
+            "doctor recovery must use one census and make zero termination or launch calls");
+        Assert(output.Any(value => value.Contains("zero-process census", StringComparison.Ordinal)) &&
+            output.Any(value => value.Contains("DevBridge.cmd restart", StringComparison.Ordinal)),
+            "doctor must report the recovery and direct the operator to an explicit restart");
+
+        fixture.State = fixture.Reload();
+        JsonCommandResponse persisted = fixture.State.CreateJsonResponse(Request("status"), 0, Array.Empty<string>());
+        Assert(persisted.State == "STOPPED" && persisted.RimWorldPid == 0 && persisted.ErrorCode == null,
+            "the recovered stopped state must be durable");
+
+        fixture.Adapter.ReadyOnLaunch = true;
+        List<string> restartOutput = new();
+        int restartExit = fixture.State.Execute(Request("restart"), restartOutput.Add, () => true);
+        Assert(restartExit == 0 && fixture.Adapter.LaunchCalls == 1,
+            "only the later explicit restart may launch the replacement generation (exit " + restartExit +
+            ", launches " + fixture.Adapter.LaunchCalls + ", output: " + string.Join(" | ", restartOutput) + ")");
+    }
+
+    private static void TestDoctorRecoveryFailsClosed()
+    {
+        using (Fixture incomplete = new(new PersistedState
+        {
+            Generation = 1,
+            Phase = BridgePhase.ERROR,
+            Error = ProcessInspection.Message,
+            ErrorCode = ProcessInspection.ErrorCode,
+            ProcessId = 101,
+            ProcessStartUtcTicks = 1001,
+            RequiresNewProcess = true
+        }))
+        {
+            incomplete.Adapter.EnumerationIncomplete = true;
+            int exitCode = incomplete.State.Execute(Request("doctor"), _ => { }, () => true);
+            JsonCommandResponse response = incomplete.State.CreateJsonResponse(Request("status"), exitCode,
+                Array.Empty<string>());
+            Assert(response.State == "ERROR" && response.ErrorCode == ProcessInspection.ErrorCode &&
+                response.RimWorldPid == 101,
+                "an incomplete census must preserve the quarantine and stale identity for diagnosis");
+            Assert(incomplete.Adapter.TerminationRequests == 0 && incomplete.Adapter.LaunchCalls == 0,
+                "an incomplete census must make zero process-control calls");
+        }
+
+        using (Fixture present = new(new PersistedState
+        {
+            Generation = 1,
+            Phase = BridgePhase.ERROR,
+            Error = ProcessInspection.Message,
+            ErrorCode = ProcessInspection.ErrorCode,
+            ProcessId = 101,
+            ProcessStartUtcTicks = 1001,
+            RequiresNewProcess = true
+        }))
+        {
+            present.Adapter.Add(new FakeProcess(999, 9999, present.RimWorldPath));
+            int exitCode = present.State.Execute(Request("doctor"), _ => { }, () => true);
+            JsonCommandResponse response = present.State.CreateJsonResponse(Request("status"), exitCode,
+                Array.Empty<string>());
+            Assert(response.State == "ERROR" && response.ErrorCode == ProcessInspection.ErrorCode,
+                "a matching RimWorld process must preserve the inspection quarantine");
+            Assert(present.Adapter.TerminationRequests == 0 && present.Adapter.LaunchCalls == 0,
+                "doctor must never control or launch a process while deciding recovery");
+        }
+    }
+
     private static string ReadWorkspaceFile(string relativePath)
     {
         DirectoryInfo directory = new(Environment.CurrentDirectory);
@@ -880,8 +975,12 @@ internal static class OfflineTests
         {
             Root = Path.Combine(Path.GetTempPath(), "DevBridge2-offline-" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(Path.Combine(Root, "Runtime"));
+            Directory.CreateDirectory(Path.Combine(Root, "About"));
+            Directory.CreateDirectory(Path.Combine(Root, "1.6", "Assemblies"));
             RimWorldPath = Path.Combine(Root, "RimWorldWin64.exe");
             File.WriteAllText(RimWorldPath, "offline-test-executable");
+            File.WriteAllText(Path.Combine(Root, "About", "About.xml"), "<ModMetaData />");
+            File.WriteAllText(Path.Combine(Root, "1.6", "Assemblies", "DevBridge2.dll"), "offline-test-assembly");
             File.WriteAllText(Path.Combine(Root, "ModsConfig.xml"), "<activeMods><li>lan.devbridge2</li></activeMods>");
             Clock = new FakeClock(ClockStart);
             Adapter = new FakeProcessAdapter(RimWorldPath, Root, Clock);

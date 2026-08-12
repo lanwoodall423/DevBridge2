@@ -54,3 +54,9 @@ both the native process exit code and the JSON `exitCode`: native `0` is success
 native `2` is usage/request failure, native `4` is an operational refusal or bounded terminal
 failure, and `doctor` returns native `1` when its checks fail. A successful status query can still
 describe an `ERROR` runtime state.
+
+`PROCESS_INSPECTION_AMBIGUOUS` remains fail-closed until `doctor` completes an authoritative census.
+When that census proves that no matching RimWorld process exists and no lease or restart is active,
+`doctor` clears the stale process identity and persists `STOPPED` without launching or terminating
+anything. The operator must then issue a separate `DevBridge.cmd restart`. An incomplete census or any
+matching process preserves the quarantine.

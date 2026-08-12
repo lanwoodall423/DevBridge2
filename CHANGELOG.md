@@ -1,5 +1,15 @@
 # Dev Bridge release notes
 
+## 1.2.1
+
+- Fixes a recovery deadlock where a persisted `PROCESS_INSPECTION_AMBIGUOUS` quarantine survived after
+  RimWorld had closed and caused every later restart to be refused.
+- `doctor` now clears that quarantine only after one complete authoritative census proves that zero
+  matching RimWorld processes exist, no lease is held, and no restart is active.
+- Recovery persists `STOPPED`, clears the stale PID/start identity, and performs no termination or
+  launch. A separate explicit `restart` remains required.
+- Incomplete inspection or any matching process continues to fail closed.
+
 ## 1.2.0
 
 The headline feature is an explicit maintenance-session workflow for safe, coordinated mod work.

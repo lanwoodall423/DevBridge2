@@ -1322,32 +1322,35 @@ internal sealed class CoordinatorState
         PersistedState snapshot;
         bool processRunning = false;
         bool processInspectionAmbiguous = false;
+        bool processInspectionRecovered = false;
         List<UnmanagedRimWorldProcess> unmanagedProcesses = new();
-        lock (gate)
+        lock (lifecycleGate)
         {
-            SynchronizeLocked();
-            RevalidateMaintenanceReadyLocked();
-            try
+            lock (gate)
             {
-                processRunning = IsOwnedProcess(state.ProcessId, state.ProcessStartUtcTicks);
-            }
-            catch (ProcessInspectionException)
-            {
-                processInspectionAmbiguous = true;
-                MarkProcessInspectionAmbiguousLocked();
-            }
+                SynchronizeLocked();
+                RevalidateMaintenanceReadyLocked();
+                try
+                {
+                    ProcessStatusSnapshot processSnapshot = EnumerateStatusProcessesLocked();
+                    processRunning = processSnapshot.OwnedProcessRunning;
+                    unmanagedProcesses = processSnapshot.UnmanagedProcesses;
+                    if (state.ErrorCode == ProcessInspection.ErrorCode &&
+                        state.Phase == BridgePhase.ERROR && !state.RestartPending &&
+                        state.Leases.Count == 0 && processSnapshot.MatchingProcessCount == 0)
+                    {
+                        RecoverProcessInspectionQuarantineLocked();
+                        processInspectionRecovered = true;
+                    }
+                }
+                catch (ProcessInspectionException)
+                {
+                    processInspectionAmbiguous = true;
+                    MarkProcessInspectionAmbiguousLocked();
+                }
 
-            try
-            {
-                unmanagedProcesses = FindUnmanagedRimWorldProcesses(state.ProcessId, state.ProcessStartUtcTicks);
+                snapshot = CloneStateLocked();
             }
-            catch (ProcessInspectionException)
-            {
-                processInspectionAmbiguous = true;
-                MarkProcessInspectionAmbiguousLocked();
-            }
-
-            snapshot = CloneStateLocked();
         }
 
         emit("DevBridge2 doctor");
@@ -1363,6 +1366,8 @@ internal sealed class CoordinatorState
         emit("Coordinator-owned RimWorld process: " + (processRunning ? "yes (PID " + snapshot.ProcessId + ")" : "no"));
         if (processInspectionAmbiguous)
             emit("WARN RimWorld process inspection is ambiguous; no process-control or launch action was taken.");
+        if (processInspectionRecovered)
+            emit("PASS Cleared the stale process-inspection quarantine after a complete zero-process census; no launch was attempted.");
         if (unmanagedProcesses.Count > 0)
             emit("WARN Unmanaged RimWorld process(es): " + string.Join(", ", unmanagedProcesses.Select(value => value.ProcessId.ToString())) +
                 ". Close them through Steam before restarting.");
@@ -1393,6 +1398,8 @@ internal sealed class CoordinatorState
         else if (snapshot.RestartPending || snapshot.Phase == BridgePhase.DRAINING ||
                  snapshot.Phase == BridgePhase.RESTARTING || snapshot.Phase == BridgePhase.LOADING)
             EmitKeepWaiting(emit);
+        else if (snapshot.Phase == BridgePhase.STOPPED && snapshot.Generation > 0)
+            EmitNextCommand(emit, "DevBridge.cmd restart");
         else
             EmitNextCommand(emit, "DevBridge.cmd wait-ready");
         if (exitCode != 0)
@@ -2634,6 +2641,27 @@ internal sealed class CoordinatorState
         state.Error = "The durable WAITING_FOR_BRIDGE deadline expired; no launch was attempted.";
         state.LaunchOwner = null;
         state.LaunchRequestKey = null;
+        SaveStateLocked();
+        Monitor.PulseAll(gate);
+    }
+
+    private void RecoverProcessInspectionQuarantineLocked()
+    {
+        state.Phase = BridgePhase.STOPPED;
+        state.Error = null;
+        state.ErrorCode = null;
+        state.ProcessId = 0;
+        state.ProcessStartUtcTicks = 0;
+        state.LaunchId = null;
+        state.LaunchStartedUtc = default;
+        state.RestartPending = false;
+        state.RestartRequestedUtc = null;
+        state.MaintenanceReady = false;
+        state.LaunchOwner = null;
+        state.LaunchRequestKey = null;
+        state.WaitingForBridgeDeadlineUtc = null;
+        state.RequiresNewProcess = true;
+        DeleteReadinessLocked();
         SaveStateLocked();
         Monitor.PulseAll(gate);
     }

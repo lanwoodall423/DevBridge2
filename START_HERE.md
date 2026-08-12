@@ -27,6 +27,9 @@ Use `DevBridge.cmd` from the installed mod root.
   process if it subsequently reports matching readiness.
 - Use `DevBridge.cmd status` to understand what is happening.
 - Use `DevBridge.cmd wait-ready` after an external command timeout or interruption.
+- If `status` reports `PROCESS_INSPECTION_AMBIGUOUS`, close RimWorld through Steam and run
+  `DevBridge.cmd doctor`. A complete census proving zero matching processes clears the stale quarantine
+  to `STOPPED` without launching anything; then run the separately printed `DevBridge.cmd restart`.
 - Diagnostics show the agent/session identity beside leases. Set `DEVBRIDGE_AGENT` to choose an explicit identity; otherwise each CLI session gets a short automatic ID.
 - Append `--json` to `status`, `test begin`, `test end <lease-id>`, `restart`, `wait-ready`, or `doctor` for one machine-readable JSON result.
 

@@ -47,18 +47,20 @@ namespace DevBridge2
                 StringComparison.Ordinal);
             if (requested)
             {
-                controller = new QuicktestActivationController(requested, IsGenuineMainMenuReady,
-                    ActivateBuiltInDevQuicktestButton, maxWaits: 60);
+                controller = new QuicktestActivationController(requested,
+                    DevBridgeQuicktestMenuAdapter.IsGenuineMainMenuReady,
+                    () => DevBridgeQuicktestMenuAdapter.QueueBuiltInDevQuicktest(
+                        controller.ReportActivationFailure), maxWaits: 60);
                 LongEventHandler.ExecuteWhenFinished(TryActivate);
             }
         }
 
         private static void TryActivate()
         {
-            if (controller == null || controller.ActivationRequested || controller.TerminalFailure)
+            if (controller == null || !controller.Pending || controller.ActivationRequested || controller.TerminalFailure)
                 return;
 
-            QuicktestActivationResult result = controller.Tick();
+            QuicktestActivationResult result = controller.Tick(UnityData.IsInMainThread);
             if (result == QuicktestActivationResult.WaitingForMainMenu)
             {
                 LongEventHandler.ExecuteWhenFinished(TryActivate);
@@ -68,7 +70,7 @@ namespace DevBridge2
             if (result == QuicktestActivationResult.Requested)
             {
                 Log.Message("[DevBridge2] quicktestMainMenu=true; genuine main-menu UI is ready.");
-                Log.Message("[DevBridge2] quicktestRequested=true; built-in Dev Quicktest button activated.");
+                Log.Message("[DevBridge2] quicktestRequested=true; built-in Dev Quicktest button activation queued.");
             }
             else
             {
@@ -77,26 +79,6 @@ namespace DevBridge2
             }
         }
 
-        private static bool IsGenuineMainMenuReady()
-        {
-            try
-            {
-                return GenScene.InEntryScene && Current.ProgramState == ProgramState.Entry &&
-                    Find.WindowStack != null && !LongEventHandler.AnyEventNowOrWaiting;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        private static void ActivateBuiltInDevQuicktestButton()
-        {
-            // This is the action wired by RimWorld's built-in main-menu Dev Quicktest
-            // control. It is called only after IsGenuineMainMenuReady succeeds.
-            PageUtility.InitGameStart();
-            Root_Play.SetupForQuickTestPlay();
-        }
     }
 
     internal static class DevBridgeReadiness

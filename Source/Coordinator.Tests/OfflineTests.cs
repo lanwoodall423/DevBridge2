@@ -33,6 +33,16 @@ internal static class OfflineTests
         Run("ticket routing preserves its durable slot", TestTicketRouting);
         Run("goal wake and MCP scope metadata is preserved", TestScopeMetadata);
         Run("quicktest activation is ordered and bounded", TestQuicktestActivation);
+        Run("quicktest request only records pending intent", TestQuicktestRequestRegistration);
+        Run("quicktest pre-menu readiness cannot activate", TestQuicktestPreMainMenu);
+        Run("quicktest activation uses one UI-thread boundary", TestQuicktestUiThreadBoundary);
+        Run("quicktest duplicate ticks produce one activation", TestQuicktestSingleActivation);
+        Run("quicktest callback preserves built-in order", TestQuicktestCallbackOrder);
+        Run("quicktest old lifecycle failure is prevented", TestQuicktestLifecycleGuard);
+        Run("quicktest activation failure clears pending state", TestQuicktestActivationFailure);
+        Run("quicktest readiness expiry is terminal", TestQuicktestReadinessExpiry);
+        Run("quicktest source boundary and lifecycle predicates are structural", TestQuicktestStructuralBoundary);
+        Run("quicktest path has no fallback activation mechanism", TestQuicktestNoFallback);
         Run("coordinator-root argument forms are accepted", TestCoordinatorRootArgumentForms);
         Run("wrapper propagates native exit codes", DevBridgeWrapperTests.Run);
 
@@ -581,19 +591,219 @@ internal static class OfflineTests
             activationCalls++;
             throw new NullReferenceException("simulated Root_Play lifecycle failure");
         }, 3);
-        Assert(failure.Tick() == QuicktestActivationResult.WaitingForMainMenu && activationCalls == 0,
+        Assert(failure.Tick(true) == QuicktestActivationResult.WaitingForMainMenu && activationCalls == 0 &&
+            failure.Pending,
             "Quicktest must not activate before genuine main-menu readiness");
         mainMenu = true;
-        Assert(failure.Tick() == QuicktestActivationResult.Failed && failure.TerminalFailure && activationCalls == 1,
+        Assert(failure.Tick(true) == QuicktestActivationResult.Failed && failure.TerminalFailure &&
+            !failure.Pending && activationCalls == 1,
             "observed built-in activation failure must be bounded and terminal");
-        Assert(failure.Tick() == QuicktestActivationResult.Failed && activationCalls == 1,
+        Assert(failure.Tick(true) == QuicktestActivationResult.Failed && activationCalls == 1,
             "terminal Quicktest failure must not retry or launch");
 
         int successfulCalls = 0;
         QuicktestActivationController success = new(true, () => mainMenu, () => successfulCalls++, 3);
-        Assert(success.Tick() == QuicktestActivationResult.Requested && success.MainMenuReady &&
-            success.ActivationRequested && successfulCalls == 1,
+        Assert(success.Tick(true) == QuicktestActivationResult.Requested && success.MainMenuReady &&
+            success.ActivationRequested && !success.Pending && successfulCalls == 1,
             "built-in button activation must follow genuine main-menu readiness");
+    }
+
+    private static void TestQuicktestRequestRegistration()
+    {
+        int readinessCalls = 0;
+        int activationCalls = 0;
+        QuicktestActivationController controller = new(true, () =>
+        {
+            readinessCalls++;
+            return true;
+        }, () => activationCalls++, 3);
+
+        Assert(controller.Pending && !controller.MainMenuReady && activationCalls == 0,
+            "registration must only leave a pending activation intent");
+        Assert(controller.Tick(false) == QuicktestActivationResult.WaitingForMainMenu &&
+            readinessCalls == 0 && activationCalls == 0,
+            "the request handler must not inspect or activate from outside the UI boundary");
+    }
+
+    private static void TestQuicktestPreMainMenu()
+    {
+        int activationCalls = 0;
+        QuicktestActivationController controller = new(true, () => false, () => activationCalls++, 3);
+
+        Assert(controller.Tick(true) == QuicktestActivationResult.WaitingForMainMenu &&
+            controller.Pending && activationCalls == 0,
+            "pre-main-menu readiness must defer activation");
+    }
+
+    private static void TestQuicktestUiThreadBoundary()
+    {
+        bool ready = true;
+        int activationCalls = 0;
+        QuicktestActivationController controller = new(true, () => ready, () => activationCalls++, 3);
+
+        Assert(controller.Tick(false) == QuicktestActivationResult.WaitingForMainMenu && activationCalls == 0,
+            "a ready-looking request must not activate off the modeled game/UI thread");
+        Assert(controller.Tick(true) == QuicktestActivationResult.Requested && activationCalls == 1,
+            "the same request must activate once it reaches the game/UI-thread boundary");
+    }
+
+    private static void TestQuicktestSingleActivation()
+    {
+        int activationCalls = 0;
+        QuicktestActivationController controller = new(true, () => true, () => activationCalls++, 3);
+
+        Assert(controller.Tick(true) == QuicktestActivationResult.Requested, "first UI tick must queue activation");
+        Assert(controller.Tick(true) == QuicktestActivationResult.Requested, "duplicate UI tick must be harmless");
+        Assert(controller.Tick(true) == QuicktestActivationResult.Requested && activationCalls == 1,
+            "duplicate ticks or callbacks must not activate twice");
+    }
+
+    private static void TestQuicktestCallbackOrder()
+    {
+        List<string> operations = new();
+        QuicktestActivationController controller = new(true, () => true, () =>
+        {
+            operations.Add("QueueLongEvent:GeneratingMap");
+            operations.Add("Root_Play.SetupForQuickTestPlay");
+            operations.Add("PageUtility.InitGameStart");
+        }, 3);
+
+        Assert(controller.Tick(true) == QuicktestActivationResult.Requested,
+            "verified adapter model must queue successfully");
+        Assert(operations.SequenceEqual(new[]
+        {
+            "QueueLongEvent:GeneratingMap",
+            "Root_Play.SetupForQuickTestPlay",
+            "PageUtility.InitGameStart"
+        }), "verified built-in callback order must be preserved");
+    }
+
+    private static void TestQuicktestLifecycleGuard()
+    {
+        bool initialized = false;
+        AssertThrows<NullReferenceException>(() =>
+        {
+            if (!initialized)
+                throw new NullReferenceException("simulated Root_Play lifecycle failure");
+        }, "the former direct path must reproduce the invalid lifecycle failure");
+
+        int fakeLaunches = 0;
+        QuicktestActivationController corrected = new(true, () => initialized, () => fakeLaunches++, 3);
+        Assert(corrected.Tick(true) == QuicktestActivationResult.WaitingForMainMenu && fakeLaunches == 0,
+            "the corrected path must not enter the invalid lifecycle");
+        initialized = true;
+        Assert(corrected.Tick(true) == QuicktestActivationResult.Requested && fakeLaunches == 1,
+            "the corrected path may activate only after lifecycle readiness");
+    }
+
+    private static void TestQuicktestActivationFailure()
+    {
+        int fakeLaunches = 0;
+        int restartRequests = 0;
+        QuicktestActivationController controller = new(true, () => true, () =>
+        {
+            throw new InvalidOperationException("simulated queued activation failure");
+        }, 3);
+
+        Assert(controller.Tick(true) == QuicktestActivationResult.Failed && controller.TerminalFailure &&
+            !controller.Pending && fakeLaunches == 0 && restartRequests == 0,
+            "activation failure must be terminal, clear pending state, and launch nothing");
+        Assert(controller.Tick(true) == QuicktestActivationResult.Failed && fakeLaunches == 0 &&
+            restartRequests == 0, "terminal activation failure must not retry or request restart");
+
+        QuicktestActivationController queued = new(true, () => true, () => { }, 3);
+        Assert(queued.Tick(true) == QuicktestActivationResult.Requested && queued.ActivationRequested,
+            "a queued adapter request must be marked consumed");
+        queued.ReportActivationFailure(new InvalidOperationException("simulated deferred callback failure"));
+        Assert(queued.TerminalFailure && !queued.Pending && !queued.ActivationRequested,
+            "deferred queue failure must become terminal and clear the consumed request");
+    }
+
+    private static void TestQuicktestReadinessExpiry()
+    {
+        int fakeLaunches = 0;
+        int restartRequests = 0;
+        QuicktestActivationController controller = new(true, () => false, () => fakeLaunches++, 2);
+
+        Assert(controller.Tick(true) == QuicktestActivationResult.WaitingForMainMenu,
+            "first invalid-readiness tick must remain bounded and pending");
+        Assert(controller.Tick(true) == QuicktestActivationResult.Failed && controller.TerminalFailure &&
+            !controller.Pending && fakeLaunches == 0 && restartRequests == 0,
+            "readiness expiry must become terminal with zero launches and restart requests");
+    }
+
+    private static void TestQuicktestStructuralBoundary()
+    {
+        string mod = ReadWorkspaceFile(Path.Combine("Source", "Mod", "DevBridge2Mod.cs"));
+        string adapter = ReadWorkspaceFile(Path.Combine("Source", "Mod", "DevBridgeQuicktestMenuAdapter.cs"));
+
+        Assert(!mod.Contains("Root_Play.SetupForQuickTestPlay", StringComparison.Ordinal) &&
+            !mod.Contains("PageUtility.InitGameStart", StringComparison.Ordinal),
+            "DevBridge2Mod request handler must not directly reference the leaf or setup method");
+        Assert(adapter.Contains("LongEventHandler.QueueLongEvent", StringComparison.Ordinal) &&
+            adapter.Contains("\"GeneratingMap\"", StringComparison.Ordinal) &&
+            adapter.Contains("GameAndMapInitExceptionHandlers.ErrorWhileGeneratingMap", StringComparison.Ordinal),
+            "the adapter must retain the built-in queued long-event boundary");
+
+        int setup = adapter.IndexOf("Root_Play.SetupForQuickTestPlay", StringComparison.Ordinal);
+        int init = adapter.IndexOf("PageUtility.InitGameStart", StringComparison.Ordinal);
+        Assert(setup >= 0 && init > setup, "the adapter must preserve SetupForQuickTestPlay before InitGameStart");
+        foreach (string predicate in new[]
+        {
+            "UnityData.IsInMainThread", "GenScene.InEntryScene", "Current.ProgramState",
+            "Current.Root", "Current.Root_Entry", "Find.UIRoot", "Find.WindowStack",
+            "Current.Game", "WorldRendererUtility.WorldSelected", "Prefs.DevMode",
+            "UIMenuBackgroundManager.background", "LongEventHandler.AnyEventNowOrWaiting",
+            "LongEventHandler.ShouldWaitForEvent", "WindowLayer.Dialog"
+        })
+        {
+            Assert(adapter.Contains(predicate, StringComparison.Ordinal),
+                "verified main-menu lifecycle predicate is missing: " + predicate);
+        }
+    }
+
+    private static void TestQuicktestNoFallback()
+    {
+        string mod = ReadWorkspaceFile(Path.Combine("Source", "Mod", "DevBridge2Mod.cs"));
+        string adapter = ReadWorkspaceFile(Path.Combine("Source", "Mod", "DevBridgeQuicktestMenuAdapter.cs"));
+        string quicktestSource = mod + Environment.NewLine + adapter;
+        foreach (string forbidden in new[]
+        {
+            "GetCommandLineArgs", "--quicktest", "Input.GetMouseButton", "Event.current",
+            "SaveGame", ".rws", "Process.Start", "MapGenerator", "MousePosition"
+        })
+        {
+            Assert(!quicktestSource.Contains(forbidden, StringComparison.Ordinal),
+                "Quicktest path must not contain fallback mechanism: " + forbidden);
+        }
+    }
+
+    private static string ReadWorkspaceFile(string relativePath)
+    {
+        DirectoryInfo directory = new(Environment.CurrentDirectory);
+        while (directory != null)
+        {
+            string candidate = Path.Combine(directory.FullName, relativePath);
+            if (File.Exists(candidate))
+                return File.ReadAllText(candidate);
+            directory = directory.Parent;
+        }
+
+        throw new InvalidOperationException("workspace file not found: " + relativePath);
+    }
+
+    private static void AssertThrows<T>(Action action, string message) where T : Exception
+    {
+        try
+        {
+            action();
+        }
+        catch (T)
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(message);
     }
 
     private static void TestCoordinatorRootArgumentForms()

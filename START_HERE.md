@@ -16,7 +16,10 @@ Use `DevBridge.cmd` from the installed mod root.
 - `restart` waits for active tests, restarts once, and continues automatically.
 - Once `restart` is accepted, DevBridge owns it even if the requesting shell times out or disconnects; do not request it again. Use `DevBridge.cmd wait-ready` or `DevBridge.cmd status` to reconnect.
 - Once `restart` is requested, existing tests may finish, but no new test lease is granted on the old generation.
-- The restart completes only after every active lease has been released (or the conservative stale-lease timeout expires).
+- While the coordinator-owned game is running, restart remains durably queued until every active lease
+  is released (or its conservative stale-lease lifetime expires); normal contention has no short failure deadline.
+- If the owned game is already absent, Dev Bridge launches the replacement without waiting on old-generation
+  leases and preserves those leases for the ready replacement generation.
 - `test begin` waits through a pending restart, then acquires a lease on the new generation.
 - For assembly replacement, use `DevBridge.cmd stop <lease-id>`. Wait for `maintenanceReady=true` and
   `gameState=STOPPED`, replace and hash-check the assembly while RimWorld is stopped, then run
@@ -47,7 +50,8 @@ DevBridge.cmd test begin
 DevBridge.cmd test end <printed-id>
 ```
 
-`test begin` and `restart` may stay running while they wait. The coordinator owns the RimWorld process.
+`test begin` and `restart` may stay running while they wait. A caller timeout does not cancel a queued
+restart, and lease contention does not turn it into a terminal error. The coordinator owns the RimWorld process.
 It launches normally, then the DevBridge2 mod activates RimWorld's built-in Dev Quicktest from the main
 menu; no command-line quicktest mode or save is used. The readiness mod reports only after a playable map
 is loaded.
@@ -84,9 +88,9 @@ Dev Bridge does not infer that external work has finished. The lease holder must
 The same owner/session is idempotent for an already accepted stop, ensure-ready, or launch request;
 it does not create a second launch. Conflicting owners are rejected or serialized against the
 authoritative coordinator for the selected coordinator root and runtime slot. A request routed to a
-different root or slot is denied. Leases, readiness waits, launch attempts, and recovery actions are
-bounded. Abandoned leases are reclaimed after their bounded lifetime, and exhausted readiness or
-launch budgets become terminal failures rather than retry loops.
+different root or slot is denied. Lease contention waits durably; readiness waits, launch attempts,
+and recovery actions remain bounded. Abandoned leases are reclaimed after their bounded lifetime,
+and exhausted readiness or launch budgets become terminal failures rather than retry loops.
 
 Process control is identity-safe: a PID is accepted only with its recorded process start identity, so
 a stale or reused process cannot be stopped or treated as the owned RimWorld process. Assembly

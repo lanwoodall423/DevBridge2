@@ -38,9 +38,10 @@ finished; the lease holder must explicitly call `ensure-ready`.
 The same owner request is idempotent while its operation is already accepted, and concurrent
 conflicting requests are serialized or rejected by the authoritative coordinator. The coordinator
 root and runtime slot are part of ownership; requests for another root or slot do not attach to this
-session. Leases, readiness waits, launch attempts, and recovery actions have fixed bounds. An
-abandoned lease is reclaimed after its bounded lifetime, and an exhausted budget is a terminal
-failure rather than permission to retry indefinitely.
+session. Lease contention is a durable queue condition, not a short terminal timeout. If the owned
+game is already absent, replacement launch proceeds without terminating anything and retains active
+leases for the new generation. Abandoned leases are still reclaimed after their bounded lifetime;
+readiness waits, launch attempts, and recovery actions retain finite budgets.
 
 Process operations require the recorded process start identity as well as the PID, so a stale or
 reused process is rejected. Replace and hash-check assemblies only after `stop` confirms the process

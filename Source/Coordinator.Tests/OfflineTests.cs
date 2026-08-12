@@ -29,7 +29,10 @@ internal static class OfflineTests
         Run("duplicate launch requests have one slot owner", TestDuplicateLaunchOwnership);
         Run("fifty duplicate restart requests have one launch", TestDuplicateRestartOwnership);
         Run("competing restart owners cannot overwrite provenance", TestCompetingRestartOwners);
-        Run("recovery budget and waiting deadline are finite", TestFiniteRecovery);
+        Run("lease-blocked restart waits durably and resumes", TestDurableLeaseWait);
+        Run("missing process relaunches despite an active lease", TestMissingProcessRelaunchWithLease);
+        Run("legacy lease-wait expiry recovers automatically", TestLegacyLeaseWaitRecovery);
+        Run("recovery launch budget is finite", TestFiniteRecovery);
         Run("crash recovery never duplicates an ambiguous launch", TestCrashRecoveryNoDuplicateLaunch);
         Run("root and runtime slot bindings are authoritative", TestRuntimeScopeBinding);
         Run("ticket routing preserves its durable slot", TestTicketRouting);
@@ -394,23 +397,6 @@ internal static class OfflineTests
 
     private static void TestFiniteRecovery()
     {
-        using Fixture expired = new(new PersistedState
-        {
-            Generation = 1,
-            Phase = BridgePhase.DRAINING,
-            TargetGeneration = 2,
-            RestartPending = true,
-            WaitingForBridgeDeadlineUtc = ClockStart.AddSeconds(-1),
-            LaunchBudgetRemaining = 2,
-            Leases = new List<TestLease> { new() { Id = "T001", Agent = "holder", ClientProcessId = 77,
-                Generation = 1, StartedUtc = ClockStart } }
-        });
-        expired.State.StartRecoveryWork();
-        JsonCommandResponse expiredResponse = expired.State.CreateJsonResponse(Request("status"), 0,
-            Array.Empty<string>());
-        Assert(expiredResponse.ErrorCode == "WAITING_FOR_BRIDGE_EXPIRED" &&
-            expired.Adapter.LaunchCalls == 0, "expired WAITING_FOR_BRIDGE must become terminal without launch");
-
         using Fixture exhausted = new(new PersistedState
         {
             Generation = 1,
@@ -426,6 +412,86 @@ internal static class OfflineTests
             Array.Empty<string>());
         Assert(exhaustedResponse.ErrorCode == "LAUNCH_BUDGET_EXHAUSTED" &&
             exhausted.Adapter.LaunchCalls == 0, "exhausted launch budget must prevent recovery launch");
+    }
+
+    private static void TestDurableLeaseWait()
+    {
+        using Fixture fixture = Fixture.ReadyWithLease();
+        fixture.Adapter.ReadyOnLaunch = true;
+        Task<int> restart = Task.Run(() => fixture.State.Execute(
+            Request("restart", "restart-agent", 90), _ => { }, () => true));
+
+        Assert(SpinWait.SpinUntil(() => fixture.State.CreateJsonResponse(Request("status"), 0,
+                Array.Empty<string>()).State == "WAITING_FOR_BRIDGE", TimeSpan.FromSeconds(2)),
+            "restart must enter a durable lease wait while the owned process is running");
+        fixture.Clock.Advance(TimeSpan.FromMinutes(1));
+        JsonCommandResponse waiting = fixture.State.CreateJsonResponse(Request("status"), 0,
+            Array.Empty<string>());
+        Assert(waiting.State == "WAITING_FOR_BRIDGE" && waiting.RestartPending &&
+            waiting.ErrorCode == null && fixture.Adapter.LaunchCalls == 0,
+            "lease wait must not become a terminal timeout");
+
+        Assert(fixture.State.Execute(Request("test", "holder", 77, "end", "T001"), _ => { }, () => true) == 0,
+            "lease holder must be able to release the queued restart");
+        Assert(restart.Wait(TimeSpan.FromSeconds(2)) && restart.Result == 0 && fixture.Adapter.LaunchCalls == 1,
+            "queued restart must resume exactly once after the lease is released");
+    }
+
+    private static void TestMissingProcessRelaunchWithLease()
+    {
+        using Fixture fixture = new(new PersistedState
+        {
+            Generation = 1,
+            Phase = BridgePhase.STOPPED,
+            ErrorCode = "PROCESS_EXITED",
+            Error = "The coordinator-owned RimWorld process is no longer running.",
+            RequiresNewProcess = true,
+            Leases = new List<TestLease> { new() { Id = "T001", Agent = "holder", ClientProcessId = 77,
+                Generation = 1, StartedUtc = ClockStart } }
+        });
+        fixture.Adapter.ReadyOnLaunch = true;
+
+        List<string> output = new();
+        int exitCode = fixture.State.Execute(Request("restart", "restart-agent", 90), output.Add, () => true);
+        JsonCommandResponse response = fixture.State.CreateJsonResponse(Request("status", "holder", 77), exitCode,
+            Array.Empty<string>());
+        Assert(exitCode == 0 && response.State == "READY" && response.Generation == 2 &&
+            response.ActiveTests == 1 && fixture.Adapter.LaunchCalls == 1 &&
+            fixture.Adapter.TerminationRequests == 0,
+            "an absent process must relaunch once without discarding or waiting on the active lease (exit " +
+            exitCode + ", state " + response.State + ", generation " + response.Generation + ", tests " +
+            response.ActiveTests + ", launches " + fixture.Adapter.LaunchCalls + ", terminations " +
+            fixture.Adapter.TerminationRequests + ", output: " + string.Join(" | ", output) + ")");
+    }
+
+    private static void TestLegacyLeaseWaitRecovery()
+    {
+        using Fixture fixture = new(new PersistedState
+        {
+            Generation = 202,
+            Phase = BridgePhase.ERROR,
+            ErrorCode = "WAITING_FOR_BRIDGE_EXPIRED",
+            Error = "The durable WAITING_FOR_BRIDGE deadline expired; no launch was attempted.",
+            ProcessId = 34208,
+            ProcessStartUtcTicks = 639221723214541368,
+            RestartPending = false,
+            LaunchAttemptCount = 0,
+            LaunchBudgetRemaining = 2,
+            RequiresNewProcess = true,
+            Leases = new List<TestLease> { new() { Id = "9F8D", Agent = "agent-4D8C", ClientProcessId = 19852,
+                Generation = 202, StartedUtc = ClockStart } }
+        });
+        fixture.Adapter.ReadyOnLaunch = true;
+        fixture.State.StartRecoveryWork();
+
+        Assert(SpinWait.SpinUntil(() => fixture.State.CreateJsonResponse(Request("status"), 0,
+                Array.Empty<string>()).State == "READY", TimeSpan.FromSeconds(2)),
+            "legacy terminal lease wait must autonomously resume");
+        JsonCommandResponse response = fixture.State.CreateJsonResponse(Request("status"), 0,
+            Array.Empty<string>());
+        Assert(response.Generation == 203 && response.ActiveTests == 1 && response.ErrorCode == null &&
+            fixture.Adapter.LaunchCalls == 1 && fixture.Adapter.TerminationRequests == 0,
+            "legacy recovery must launch generation 203 exactly once and preserve the lease");
     }
 
     private static void TestDuplicateRestartOwnership()

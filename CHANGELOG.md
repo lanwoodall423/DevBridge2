@@ -1,5 +1,14 @@
 # Dev Bridge release notes
 
+## 1.2.2
+
+- Keeps lease-blocked restarts durably queued instead of converting normal contention into a
+  terminal 30-second `WAITING_FOR_BRIDGE_EXPIRED` failure.
+- If the coordinator-owned RimWorld process is already absent, an active lease no longer blocks the
+  replacement launch; the lease survives and advances to the ready replacement generation.
+- Automatically resumes legacy `WAITING_FOR_BRIDGE_EXPIRED` state when no launch was attempted,
+  preserving the finite launch budget and fail-closed process-identity checks.
+
 ## 1.2.1
 
 - Fixes a recovery deadlock where a persisted `PROCESS_INSPECTION_AMBIGUOUS` quarantine survived after

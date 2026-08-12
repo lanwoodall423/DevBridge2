@@ -772,7 +772,6 @@ internal sealed class CoordinatorOptions
 {
     internal TimeSpan ReadinessTimeout { get; init; } = TimeSpan.FromMinutes(6);
     internal TimeSpan ProcessExitTimeout { get; init; } = TimeSpan.FromSeconds(15);
-    internal TimeSpan WaitingForBridgeTimeout { get; init; } = TimeSpan.FromSeconds(30);
     internal int MaxLaunchAttempts { get; init; } = 2;
     internal IProcessAdapter ProcessAdapter { get; init; } = new SystemProcessAdapter();
     internal ICoordinatorClock Clock { get; init; } = SystemCoordinatorClock.Instance;
@@ -1072,7 +1071,6 @@ internal sealed class CoordinatorState
     {
         lock (gate)
         {
-            ExpireWaitingForBridgeLocked();
             if (state.RestartPending && state.Phase == BridgePhase.LOADING && state.ProcessId > 0)
                 StartMonitorLaunchLocked(state.TargetGeneration);
             else if (state.RestartPending && state.Phase == BridgePhase.LOADING)
@@ -1862,7 +1860,7 @@ internal sealed class CoordinatorState
                     state.TargetGeneration = targetGeneration;
                     state.RestartPending = true;
                     state.RestartRequestedUtc = clock.UtcNow;
-                    state.WaitingForBridgeDeadlineUtc = clock.UtcNow.Add(options.WaitingForBridgeTimeout);
+                    state.WaitingForBridgeDeadlineUtc = null;
                     state.RequiresNewProcess = true;
                     state.Error = null;
                     state.ErrorCode = null;
@@ -2167,17 +2165,15 @@ internal sealed class CoordinatorState
                     if (!state.RestartPending || state.TargetGeneration != targetGeneration)
                         return;
 
-                    ExpireWaitingForBridgeLocked();
-                    if (!state.RestartPending)
-                        return;
-
                     if (launchTask != null && !launchTask.IsCompleted)
                     {
                         Monitor.Wait(gate, 1000);
                         continue;
                     }
 
-                    if (state.Leases.Count > 0)
+                    bool ownedProcessRunning = state.ProcessId > 0 &&
+                        IsOwnedProcess(state.ProcessId, state.ProcessStartUtcTicks);
+                    if (state.Leases.Count > 0 && ownedProcessRunning)
                     {
                         if (state.Phase != BridgePhase.WAITING_FOR_BRIDGE)
                         {
@@ -2626,25 +2622,6 @@ internal sealed class CoordinatorState
         }
     }
 
-    private void ExpireWaitingForBridgeLocked()
-    {
-        if (!state.RestartPending || !state.WaitingForBridgeDeadlineUtc.HasValue ||
-            clock.UtcNow < state.WaitingForBridgeDeadlineUtc.Value.ToUniversalTime() ||
-            state.Leases.Count == 0)
-            return;
-
-        state.Phase = BridgePhase.ERROR;
-        state.RestartPending = false;
-        state.TargetGeneration = 0;
-        state.WaitingForBridgeDeadlineUtc = null;
-        state.ErrorCode = "WAITING_FOR_BRIDGE_EXPIRED";
-        state.Error = "The durable WAITING_FOR_BRIDGE deadline expired; no launch was attempted.";
-        state.LaunchOwner = null;
-        state.LaunchRequestKey = null;
-        SaveStateLocked();
-        Monitor.PulseAll(gate);
-    }
-
     private void RecoverProcessInspectionQuarantineLocked()
     {
         state.Phase = BridgePhase.STOPPED;
@@ -2669,10 +2646,10 @@ internal sealed class CoordinatorState
     private void SynchronizeLocked()
     {
         PruneStaleLeasesLocked();
-        ExpireWaitingForBridgeLocked();
 
         if (state.Phase == BridgePhase.LOADING && state.ProcessId <= 0 &&
-            (launchTask == null || launchTask.IsCompleted))
+            (launchTask == null || launchTask.IsCompleted) &&
+            (restartTask == null || restartTask.IsCompleted))
         {
             FailLaunch("the persisted launch has no verified process identity; no replacement launch was attempted",
                 "LAUNCH_RECOVERY_AMBIGUOUS");
@@ -3034,6 +3011,25 @@ internal sealed class CoordinatorState
         state.Leases ??= new List<TestLease>();
         state.ScopeTickets ??= new List<ScopeTicket>();
         state.Phase = Enum.IsDefined(state.Phase) ? state.Phase : BridgePhase.STOPPED;
+        if (string.Equals(state.ErrorCode, "WAITING_FOR_BRIDGE_EXPIRED", StringComparison.Ordinal) &&
+            state.RequiresNewProcess && state.LaunchAttemptCount == 0)
+        {
+            state.TargetGeneration = Math.Max(state.Generation + 1, state.TargetGeneration);
+            state.RestartPending = true;
+            state.RestartRequestedUtc ??= clock.UtcNow;
+            state.Phase = BridgePhase.WAITING_FOR_BRIDGE;
+            state.Error = null;
+            state.ErrorCode = null;
+            state.LaunchOwner = "coordinator@" + runtimeSlotId;
+            state.LaunchRequestKey = "recovered-wait-" + state.TargetGeneration;
+            state.WaitingForBridgeDeadlineUtc = null;
+            changed = true;
+        }
+        else if (state.RestartPending && state.WaitingForBridgeDeadlineUtc.HasValue)
+        {
+            state.WaitingForBridgeDeadlineUtc = null;
+            changed = true;
+        }
         if (state.RestartPending && state.TargetGeneration <= state.Generation)
             state.TargetGeneration = state.Generation + 1;
         if (state.Phase == BridgePhase.READY && state.Generation <= 0)

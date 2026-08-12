@@ -20,21 +20,14 @@ namespace DevBridge2
                     Current.ProgramState != ProgramState.Entry || root == null || entryRoot == null ||
                     !(uiRoot is UIRoot_Entry) || windowStack == null || Current.Game != null ||
                     WorldRendererUtility.WorldSelected || !Prefs.DevMode ||
-                    UIMenuBackgroundManager.background == null ||
                     LongEventHandler.AnyEventNowOrWaiting || LongEventHandler.ShouldWaitForEvent)
                 {
                     return false;
                 }
 
-                // This is the same window predicate used by UIRoot_Entry.ShouldDoMainMenu
-                // (Assembly-CSharp 1.6.9676.17735, method token 0x06004B6C).
-                for (int index = 0; index < windowStack.Count; index++)
-                {
-                    Window window = windowStack[index];
-                    if (window == null || (window.layer == WindowLayer.Dialog && !window.IsDebug))
-                        return false;
-                }
-
+                // Dialogs such as RimWorld's startup error log may cover the menu, but they do
+                // not invalidate the initialized Root_Entry/UIRoot_Entry lifecycle required by
+                // the built-in Quicktest callback.
                 return true;
             }
             catch

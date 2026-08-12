@@ -13,18 +13,21 @@ namespace DevBridge2
     {
         private readonly Func<bool> mainMenuReady;
         private readonly Action activateBuiltInButton;
-        private readonly int maxWaits;
-        private int waits;
+        private readonly Func<long> monotonicMilliseconds;
+        private readonly long maxWaitMilliseconds;
+        private long? waitStartedMilliseconds;
         private bool pending;
 
         public QuicktestActivationController(bool requested, Func<bool> mainMenuReady,
-            Action activateBuiltInButton, int maxWaits)
+            Action activateBuiltInButton, Func<long> monotonicMilliseconds, long maxWaitMilliseconds)
         {
             Requested = requested;
             pending = requested;
             this.mainMenuReady = mainMenuReady ?? throw new ArgumentNullException(nameof(mainMenuReady));
             this.activateBuiltInButton = activateBuiltInButton ?? throw new ArgumentNullException(nameof(activateBuiltInButton));
-            this.maxWaits = Math.Max(1, maxWaits);
+            this.monotonicMilliseconds = monotonicMilliseconds ??
+                throw new ArgumentNullException(nameof(monotonicMilliseconds));
+            this.maxWaitMilliseconds = Math.Max(1, maxWaitMilliseconds);
         }
 
         public bool Requested { get; }
@@ -39,8 +42,12 @@ namespace DevBridge2
             if (!Requested || !Pending || ActivationRequested || TerminalFailure)
                 return TerminalFailure ? QuicktestActivationResult.Failed : QuicktestActivationResult.Requested;
 
+            long now = monotonicMilliseconds();
+            if (!waitStartedMilliseconds.HasValue)
+                waitStartedMilliseconds = now;
+
             if (!onGameUiThread)
-                return WaitOrFail("the game/UI-thread boundary was not available");
+                return WaitOrFail("the game/UI-thread boundary was not available", now);
 
             bool ready;
             try
@@ -53,7 +60,7 @@ namespace DevBridge2
             }
 
             if (!ready)
-                return WaitOrFail("the genuine main menu did not become ready within the bounded activation window");
+                return WaitOrFail("the genuine main menu did not become ready within the bounded activation window", now);
 
             MainMenuReady = true;
             try
@@ -82,10 +89,10 @@ namespace DevBridge2
             Fail("built-in Dev Quicktest activation failed after queueing: " + Bounded(exception));
         }
 
-        private QuicktestActivationResult WaitOrFail(string reason)
+        private QuicktestActivationResult WaitOrFail(string reason, long now)
         {
-            waits++;
-            if (waits < maxWaits)
+            long elapsed = Math.Max(0, now - waitStartedMilliseconds.GetValueOrDefault(now));
+            if (elapsed < maxWaitMilliseconds)
                 return QuicktestActivationResult.WaitingForMainMenu;
             return Fail(reason);
         }

@@ -40,6 +40,7 @@ internal static class OfflineTests
         Run("quicktest callback preserves built-in order", TestQuicktestCallbackOrder);
         Run("quicktest old lifecycle failure is prevented", TestQuicktestLifecycleGuard);
         Run("quicktest activation failure clears pending state", TestQuicktestActivationFailure);
+        Run("quicktest callback bursts cannot consume the elapsed-time wait", TestQuicktestCallbackBurst);
         Run("quicktest readiness expiry is terminal", TestQuicktestReadinessExpiry);
         Run("quicktest source boundary and lifecycle predicates are structural", TestQuicktestStructuralBoundary);
         Run("quicktest path has no fallback activation mechanism", TestQuicktestNoFallback);
@@ -590,7 +591,7 @@ internal static class OfflineTests
         {
             activationCalls++;
             throw new NullReferenceException("simulated Root_Play lifecycle failure");
-        }, 3);
+        }, () => 0, 1000);
         Assert(failure.Tick(true) == QuicktestActivationResult.WaitingForMainMenu && activationCalls == 0 &&
             failure.Pending,
             "Quicktest must not activate before genuine main-menu readiness");
@@ -602,7 +603,7 @@ internal static class OfflineTests
             "terminal Quicktest failure must not retry or launch");
 
         int successfulCalls = 0;
-        QuicktestActivationController success = new(true, () => mainMenu, () => successfulCalls++, 3);
+        QuicktestActivationController success = new(true, () => mainMenu, () => successfulCalls++, () => 0, 1000);
         Assert(success.Tick(true) == QuicktestActivationResult.Requested && success.MainMenuReady &&
             success.ActivationRequested && !success.Pending && successfulCalls == 1,
             "built-in button activation must follow genuine main-menu readiness");
@@ -616,7 +617,7 @@ internal static class OfflineTests
         {
             readinessCalls++;
             return true;
-        }, () => activationCalls++, 3);
+        }, () => activationCalls++, () => 0, 1000);
 
         Assert(controller.Pending && !controller.MainMenuReady && activationCalls == 0,
             "registration must only leave a pending activation intent");
@@ -628,7 +629,7 @@ internal static class OfflineTests
     private static void TestQuicktestPreMainMenu()
     {
         int activationCalls = 0;
-        QuicktestActivationController controller = new(true, () => false, () => activationCalls++, 3);
+        QuicktestActivationController controller = new(true, () => false, () => activationCalls++, () => 0, 1000);
 
         Assert(controller.Tick(true) == QuicktestActivationResult.WaitingForMainMenu &&
             controller.Pending && activationCalls == 0,
@@ -639,7 +640,7 @@ internal static class OfflineTests
     {
         bool ready = true;
         int activationCalls = 0;
-        QuicktestActivationController controller = new(true, () => ready, () => activationCalls++, 3);
+        QuicktestActivationController controller = new(true, () => ready, () => activationCalls++, () => 0, 1000);
 
         Assert(controller.Tick(false) == QuicktestActivationResult.WaitingForMainMenu && activationCalls == 0,
             "a ready-looking request must not activate off the modeled game/UI thread");
@@ -650,7 +651,7 @@ internal static class OfflineTests
     private static void TestQuicktestSingleActivation()
     {
         int activationCalls = 0;
-        QuicktestActivationController controller = new(true, () => true, () => activationCalls++, 3);
+        QuicktestActivationController controller = new(true, () => true, () => activationCalls++, () => 0, 1000);
 
         Assert(controller.Tick(true) == QuicktestActivationResult.Requested, "first UI tick must queue activation");
         Assert(controller.Tick(true) == QuicktestActivationResult.Requested, "duplicate UI tick must be harmless");
@@ -666,7 +667,7 @@ internal static class OfflineTests
             operations.Add("QueueLongEvent:GeneratingMap");
             operations.Add("Root_Play.SetupForQuickTestPlay");
             operations.Add("PageUtility.InitGameStart");
-        }, 3);
+        }, () => 0, 1000);
 
         Assert(controller.Tick(true) == QuicktestActivationResult.Requested,
             "verified adapter model must queue successfully");
@@ -688,7 +689,7 @@ internal static class OfflineTests
         }, "the former direct path must reproduce the invalid lifecycle failure");
 
         int fakeLaunches = 0;
-        QuicktestActivationController corrected = new(true, () => initialized, () => fakeLaunches++, 3);
+        QuicktestActivationController corrected = new(true, () => initialized, () => fakeLaunches++, () => 0, 1000);
         Assert(corrected.Tick(true) == QuicktestActivationResult.WaitingForMainMenu && fakeLaunches == 0,
             "the corrected path must not enter the invalid lifecycle");
         initialized = true;
@@ -703,7 +704,7 @@ internal static class OfflineTests
         QuicktestActivationController controller = new(true, () => true, () =>
         {
             throw new InvalidOperationException("simulated queued activation failure");
-        }, 3);
+        }, () => 0, 1000);
 
         Assert(controller.Tick(true) == QuicktestActivationResult.Failed && controller.TerminalFailure &&
             !controller.Pending && fakeLaunches == 0 && restartRequests == 0,
@@ -711,7 +712,7 @@ internal static class OfflineTests
         Assert(controller.Tick(true) == QuicktestActivationResult.Failed && fakeLaunches == 0 &&
             restartRequests == 0, "terminal activation failure must not retry or request restart");
 
-        QuicktestActivationController queued = new(true, () => true, () => { }, 3);
+        QuicktestActivationController queued = new(true, () => true, () => { }, () => 0, 1000);
         Assert(queued.Tick(true) == QuicktestActivationResult.Requested && queued.ActivationRequested,
             "a queued adapter request must be marked consumed");
         queued.ReportActivationFailure(new InvalidOperationException("simulated deferred callback failure"));
@@ -719,14 +720,39 @@ internal static class OfflineTests
             "deferred queue failure must become terminal and clear the consumed request");
     }
 
+    private static void TestQuicktestCallbackBurst()
+    {
+        long elapsedMilliseconds = 0;
+        bool mainMenuReady = false;
+        int activationCalls = 0;
+        QuicktestActivationController controller = new(true, () => mainMenuReady, () => activationCalls++,
+            () => elapsedMilliseconds, 1000);
+
+        for (int index = 0; index < 1000; index++)
+            Assert(controller.Tick(true) == QuicktestActivationResult.WaitingForMainMenu,
+                "callback frequency must not consume an elapsed-time activation window");
+
+        Assert(controller.Pending && !controller.TerminalFailure && activationCalls == 0,
+            "a same-instant callback burst must leave Quicktest pending");
+        mainMenuReady = true;
+        Assert(controller.Tick(true) == QuicktestActivationResult.Requested && activationCalls == 1,
+            "Quicktest must still activate when the menu becomes ready after a callback burst");
+    }
+
     private static void TestQuicktestReadinessExpiry()
     {
         int fakeLaunches = 0;
         int restartRequests = 0;
-        QuicktestActivationController controller = new(true, () => false, () => fakeLaunches++, 2);
+        long elapsedMilliseconds = 0;
+        QuicktestActivationController controller = new(true, () => false, () => fakeLaunches++,
+            () => elapsedMilliseconds, 1000);
 
         Assert(controller.Tick(true) == QuicktestActivationResult.WaitingForMainMenu,
             "first invalid-readiness tick must remain bounded and pending");
+        elapsedMilliseconds = 999;
+        Assert(controller.Tick(true) == QuicktestActivationResult.WaitingForMainMenu && controller.Pending,
+            "readiness must remain pending before the elapsed-time deadline");
+        elapsedMilliseconds = 1000;
         Assert(controller.Tick(true) == QuicktestActivationResult.Failed && controller.TerminalFailure &&
             !controller.Pending && fakeLaunches == 0 && restartRequests == 0,
             "readiness expiry must become terminal with zero launches and restart requests");
@@ -753,13 +779,22 @@ internal static class OfflineTests
             "UnityData.IsInMainThread", "GenScene.InEntryScene", "Current.ProgramState",
             "Current.Root", "Current.Root_Entry", "Find.UIRoot", "Find.WindowStack",
             "Current.Game", "WorldRendererUtility.WorldSelected", "Prefs.DevMode",
-            "UIMenuBackgroundManager.background", "LongEventHandler.AnyEventNowOrWaiting",
-            "LongEventHandler.ShouldWaitForEvent", "WindowLayer.Dialog"
+            "LongEventHandler.AnyEventNowOrWaiting", "LongEventHandler.ShouldWaitForEvent"
         })
         {
             Assert(adapter.Contains(predicate, StringComparison.Ordinal),
                 "verified main-menu lifecycle predicate is missing: " + predicate);
         }
+
+        Assert(mod.Contains("DevBridgeQuicktestActivationDriver", StringComparison.Ordinal) &&
+            mod.Contains("private void Update()", StringComparison.Ordinal) &&
+            mod.Contains("DevBridgeQuicktestActivation.Tick()", StringComparison.Ordinal),
+            "Quicktest readiness must be driven by a persistent per-frame UI component");
+        Assert(!mod.Contains("ExecuteWhenFinished(TryActivate)", StringComparison.Ordinal),
+            "Quicktest readiness must not retry through long-event completion callbacks");
+        Assert(!adapter.Contains("WindowLayer.Dialog", StringComparison.Ordinal) &&
+            !adapter.Contains("UIMenuBackgroundManager.background", StringComparison.Ordinal),
+            "initialized entry lifecycle must not be rejected by visual menu overlays");
     }
 
     private static void TestQuicktestNoFallback()

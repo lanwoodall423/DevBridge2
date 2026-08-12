@@ -39,6 +39,7 @@ namespace DevBridge2
 
     internal static class DevBridgeQuicktestActivation
     {
+        private const long ActivationTimeoutMilliseconds = 60000;
         private static QuicktestActivationController controller;
 
         internal static void Configure()
@@ -50,22 +51,20 @@ namespace DevBridge2
                 controller = new QuicktestActivationController(requested,
                     DevBridgeQuicktestMenuAdapter.IsGenuineMainMenuReady,
                     () => DevBridgeQuicktestMenuAdapter.QueueBuiltInDevQuicktest(
-                        controller.ReportActivationFailure), maxWaits: 60);
-                LongEventHandler.ExecuteWhenFinished(TryActivate);
+                        controller.ReportActivationFailure), MonotonicMilliseconds,
+                    ActivationTimeoutMilliseconds);
+                LongEventHandler.ExecuteWhenFinished(DevBridgeQuicktestActivationDriver.EnsureCreated);
             }
         }
 
-        private static void TryActivate()
+        internal static bool Tick()
         {
             if (controller == null || !controller.Pending || controller.ActivationRequested || controller.TerminalFailure)
-                return;
+                return false;
 
             QuicktestActivationResult result = controller.Tick(UnityData.IsInMainThread);
             if (result == QuicktestActivationResult.WaitingForMainMenu)
-            {
-                LongEventHandler.ExecuteWhenFinished(TryActivate);
-                return;
-            }
+                return true;
 
             if (result == QuicktestActivationResult.Requested)
             {
@@ -77,8 +76,31 @@ namespace DevBridge2
                 Log.Error("[DevBridge2] quicktest activation reached a bounded terminal failure: " +
                     controller.Failure);
             }
+
+            return false;
         }
 
+        private static long MonotonicMilliseconds()
+        {
+            return (long)(Stopwatch.GetTimestamp() * (1000d / Stopwatch.Frequency));
+        }
+
+    }
+
+    internal sealed class DevBridgeQuicktestActivationDriver : MonoBehaviour
+    {
+        internal static void EnsureCreated()
+        {
+            GameObject driverObject = new GameObject("DevBridge2 Quicktest Activation");
+            UnityEngine.Object.DontDestroyOnLoad(driverObject);
+            driverObject.AddComponent<DevBridgeQuicktestActivationDriver>();
+        }
+
+        private void Update()
+        {
+            if (!DevBridgeQuicktestActivation.Tick())
+                UnityEngine.Object.Destroy(gameObject);
+        }
     }
 
     internal static class DevBridgeReadiness

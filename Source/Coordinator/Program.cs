@@ -1411,7 +1411,9 @@ internal static class ModProfileResolver
                 try
                 {
                     XDocument document = XDocument.Load(aboutPath, LoadOptions.PreserveWhitespace);
-                    string packageId = document.Descendants().FirstOrDefault(value =>
+                    // Dependency entries also contain packageId elements. Only the direct
+                    // packageId of ModMetaData identifies this installed mod.
+                    string packageId = document.Root?.Elements().FirstOrDefault(value =>
                         string.Equals(value.Name.LocalName, "packageId", StringComparison.OrdinalIgnoreCase))?.Value.Trim();
                     if (string.IsNullOrWhiteSpace(packageId))
                         continue;

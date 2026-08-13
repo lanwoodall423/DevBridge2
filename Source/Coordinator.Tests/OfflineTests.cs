@@ -62,6 +62,7 @@ internal static class OfflineTests
         Run("unprofiled launch preserves the existing mod list", TestUnprofiledLaunchPreservesMods);
         Run("baseline profile excludes managed projects and load-them-last", TestBaselineProfile);
         Run("profile dependency closure is ordered, deduplicated, and case-insensitive", TestProfileDependencyClosure);
+        Run("package discovery uses the mod package ID rather than dependency IDs", TestPackageDiscoveryUsesOwnPackageId);
         Run("profile config write waits for leases and process shutdown", TestProfileWriteWaitsForDrain);
         Run("profile writes fail closed on config and process races", TestProfileWritePreconditions);
         Run("generated config ownership survives lost state", TestGeneratedOwnershipSurvivesLostState);
@@ -1276,6 +1277,26 @@ internal static class OfflineTests
         Assert(first.ProfileFingerprint == second.ProfileFingerprint &&
                first.ResolvedMods.SequenceEqual(second.ResolvedMods, StringComparer.OrdinalIgnoreCase),
             "equivalent alias casing/order must produce one deterministic profile fingerprint and order");
+    }
+
+    private static void TestPackageDiscoveryUsesOwnPackageId()
+    {
+        using ProfileSetup setup = ProfileSetup.Create();
+        string aboutPath = Path.Combine(setup.MetadataRoot, "astryl.moderndevtools", "About", "About.xml");
+        File.WriteAllText(aboutPath,
+            "<ModMetaData><modDependencies><li><packageId>brrainz.harmony</packageId></li>" +
+            "</modDependencies><packageId>astryl.moderndevtools</packageId></ModMetaData>",
+            new UTF8Encoding(false));
+        Assert(setup.CaptureBaseline(), "package discovery: baseline capture must succeed");
+        JsonCommandResponse baseline = setup.Fixture.State.CreateJsonResponse(
+            Request("status"), 0, Array.Empty<string>());
+        ModProfile profile = ModProfileResolver.Resolve(setup.Fixture.Root, baseline.BaselineFingerprint,
+            new[] { "aquaculture" }, setup.Fixture.InstalledModsRoots);
+        Assert(profile.ResolvedMods.Contains("astryl.moderndevtools", StringComparer.OrdinalIgnoreCase),
+            "package discovery must use the direct mod package ID");
+        Assert(profile.ResolvedMods.Count(value =>
+                string.Equals(value, "brrainz.harmony", StringComparison.OrdinalIgnoreCase)) == 1,
+            "a dependency package ID must not create a duplicate installed package candidate");
     }
 
     private static void TestProfileWriteWaitsForDrain()

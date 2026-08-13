@@ -30,6 +30,8 @@ internal static class OfflineTests
         Run("fifty duplicate restart requests have one launch", TestDuplicateRestartOwnership);
         Run("competing restart owners cannot overwrite provenance", TestCompetingRestartOwners);
         Run("lease-blocked restart waits durably and resumes", TestDurableLeaseWait);
+        Run("lease heartbeats extend long-running tests", TestLeaseHeartbeat);
+        Run("orphaned leases expire without blocking a restart", TestOrphanLeaseExpiry);
         Run("missing process relaunches despite an active lease", TestMissingProcessRelaunchWithLease);
         Run("legacy lease-wait expiry recovers automatically", TestLegacyLeaseWaitRecovery);
         Run("recovery launch budget is finite", TestFiniteRecovery);
@@ -111,6 +113,10 @@ internal static class OfflineTests
 
         int nonHolder = fixture.State.Execute(Request("stop", "other", 78, "T001"), _ => { }, () => true);
         Assert(nonHolder != 0 && fixture.Adapter.TerminationRequests == 0, "non-holder must not stop");
+
+        using Fixture newCliProcess = Fixture.ReadyWithLease();
+        int sameAgent = newCliProcess.State.Execute(Request("stop", "holder", 78, "T001"), _ => { }, () => true);
+        Assert(sameAgent == 0, "the lease holder must be able to use a later CLI process");
 
         fixture.State = fixture.ReloadWithLease(ClockStart.AddHours(-2));
         int expired = fixture.State.Execute(Request("stop", "holder", 77, "T001"), _ => { }, () => true);
@@ -424,6 +430,18 @@ internal static class OfflineTests
         Assert(SpinWait.SpinUntil(() => fixture.State.CreateJsonResponse(Request("status"), 0,
                 Array.Empty<string>()).State == "WAITING_FOR_BRIDGE", TimeSpan.FromSeconds(2)),
             "restart must enter a durable lease wait while the owned process is running");
+
+        Task<int> status = Task.Run(() => fixture.State.Execute(Request("status", "diagnostic", 91), _ => { }, () => true));
+        bool statusCompleted = status.Wait(TimeSpan.FromSeconds(2));
+        Task<int> doctor = Task.Run(() => fixture.State.Execute(Request("doctor", "diagnostic", 91), _ => { }, () => true));
+        bool doctorCompleted = doctor.Wait(TimeSpan.FromSeconds(2));
+        List<string> waitReadyOutput = new();
+        Task<int> waitReady = Task.Run(() => fixture.State.Execute(
+            Request("wait-ready", "diagnostic", 91), waitReadyOutput.Add, () => true));
+        bool waitReadyStarted = SpinWait.SpinUntil(
+            () => waitReadyOutput.Any(value => value.StartsWith("Waiting for RimWorld generation", StringComparison.Ordinal)),
+            TimeSpan.FromSeconds(2));
+
         fixture.Clock.Advance(TimeSpan.FromMinutes(1));
         JsonCommandResponse waiting = fixture.State.CreateJsonResponse(Request("status"), 0,
             Array.Empty<string>());
@@ -435,6 +453,50 @@ internal static class OfflineTests
             "lease holder must be able to release the queued restart");
         Assert(restart.Wait(TimeSpan.FromSeconds(2)) && restart.Result == 0 && fixture.Adapter.LaunchCalls == 1,
             "queued restart must resume exactly once after the lease is released");
+        Assert(statusCompleted && doctorCompleted && waitReadyStarted,
+            "status, doctor, and wait-ready must remain callable while restart waits on a lease");
+        Assert(waitReady.Wait(TimeSpan.FromSeconds(2)) && waitReady.Result == 0,
+            "wait-ready must complete after the queued restart becomes ready");
+    }
+
+    private static void TestLeaseHeartbeat()
+    {
+        using Fixture fixture = Fixture.ReadyWithLease();
+        fixture.Clock.Advance(TimeSpan.FromMinutes(19));
+        int wrongAgent = fixture.State.Execute(Request("test", "other", 78, "renew", "T001"), _ => { }, () => true);
+        Assert(wrongAgent != 0, "another agent must not renew a test lease");
+
+        int renewed = fixture.State.Execute(Request("test", "holder", 78, "renew", "T001"), _ => { }, () => true);
+        Assert(renewed == 0, "an active lease must be renewable");
+
+        fixture.Clock.Advance(TimeSpan.FromMinutes(19));
+        fixture.State.Execute(Request("status"), _ => { }, () => true);
+        JsonCommandResponse active = fixture.State.CreateJsonResponse(Request("status"), 0, Array.Empty<string>());
+        Assert(active.ActiveTests == 1, "a renewed lease must survive the original stale interval");
+
+        fixture.Clock.Advance(TimeSpan.FromMinutes(2));
+        fixture.State.Execute(Request("status"), _ => { }, () => true);
+        JsonCommandResponse expired = fixture.State.CreateJsonResponse(Request("status"), 0, Array.Empty<string>());
+        Assert(expired.ActiveTests == 0, "a lease with no heartbeat must eventually expire");
+    }
+
+    private static void TestOrphanLeaseExpiry()
+    {
+        using Fixture fixture = Fixture.ReadyWithLease();
+        fixture.Adapter.ReadyOnLaunch = true;
+        Task<int> restart = Task.Run(() => fixture.State.Execute(
+            Request("restart", "restart-agent", 90), _ => { }, () => true));
+
+        Assert(SpinWait.SpinUntil(() => fixture.State.CreateJsonResponse(Request("status"), 0,
+                Array.Empty<string>()).State == "WAITING_FOR_BRIDGE", TimeSpan.FromSeconds(2)),
+            "restart must wait on the initial orphaned lease");
+        fixture.Clock.Advance(TimeSpan.FromMinutes(21));
+
+        Assert(restart.Wait(TimeSpan.FromSeconds(2)) && restart.Result == 0 && fixture.Adapter.LaunchCalls == 1,
+            "an abandoned lease must not block a replacement launch indefinitely");
+        JsonCommandResponse response = fixture.State.CreateJsonResponse(Request("status"), 0, Array.Empty<string>());
+        Assert(response.State == "READY" && response.ActiveTests == 0,
+            "the expired orphan lease must be removed before the replacement is ready");
     }
 
     private static void TestMissingProcessRelaunchWithLease()

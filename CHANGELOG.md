@@ -1,5 +1,14 @@
 # Dev Bridge release notes
 
+## 1.2.3
+
+- Reclaims test leases after 20 minutes without a heartbeat, preventing a timed-out runtime-test wrapper
+  from blocking every later restart for an hour.
+- Adds `DevBridge.cmd test renew <lease-id>` for long-running test and maintenance workflows.
+- Keeps status, doctor, wait-ready, and lease cleanup responsive while a restart waits on active tests.
+- Authorizes later lease-management CLI calls by lease ID and stable agent identity instead of the
+  short-lived client process ID.
+
 ## 1.2.2
 
 - Keeps lease-blocked restarts durably queued instead of converting normal contention into a

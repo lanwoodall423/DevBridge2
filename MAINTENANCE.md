@@ -40,8 +40,9 @@ conflicting requests are serialized or rejected by the authoritative coordinator
 root and runtime slot are part of ownership; requests for another root or slot do not attach to this
 session. Lease contention is a durable queue condition, not a short terminal timeout. If the owned
 game is already absent, replacement launch proceeds without terminating anything and retains active
-leases for the new generation. Abandoned leases are still reclaimed after their bounded lifetime;
-readiness waits, launch attempts, and recovery actions retain finite budgets.
+leases for the new generation. A lease heartbeat is required for work longer than 20 minutes; leases
+without a heartbeat are reclaimed after that bounded lifetime so a timed-out wrapper cannot block the
+runtime indefinitely. Readiness waits, launch attempts, and recovery actions retain finite budgets.
 
 Process operations require the recorded process start identity as well as the PID, so a stale or
 reused process is rejected. Replace and hash-check assemblies only after `stop` confirms the process
@@ -49,7 +50,7 @@ is gone; `ensure-ready` performs the single controlled relaunch and waits for no
 mod then requests built-in Dev Quicktest from the genuine main menu and reports readiness only after
 a playable map is available. Normal launches do not use command-line Quicktest or save arguments.
 
-For machine-readable output, append `--json` to `status`, `test begin`, `test end <lease-id>`,
+Use one stable `DEVBRIDGE_AGENT` value across separate CLI invocations that renew or manage the same lease. For machine-readable output, append `--json` to `status`, `test begin`, `test renew <lease-id>`, `test end <lease-id>`,
 `stop <lease-id>`, `ensure-ready <lease-id>`, `restart`, `wait-ready`, or `doctor`. Always inspect
 both the native process exit code and the JSON `exitCode`: native `0` is successful completion,
 native `2` is usage/request failure, native `4` is an operational refusal or bounded terminal

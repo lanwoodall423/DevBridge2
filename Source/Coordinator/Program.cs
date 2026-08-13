@@ -48,7 +48,7 @@ internal static class Program
 
     private static void PrintUsage()
     {
-        Console.WriteLine("DevBridge commands: status | test begin | test end <lease-id> | stop <lease-id> | ensure-ready <lease-id> | restart | wait-ready | doctor");
+        Console.WriteLine("DevBridge commands: status | test begin | test renew <lease-id> | test end <lease-id> | stop <lease-id> | ensure-ready <lease-id> | restart | wait-ready | doctor");
         Console.WriteLine("Append --json for machine-readable output.");
     }
 }
@@ -554,6 +554,7 @@ internal sealed class TestLease
     public int ClientProcessId { get; set; }
     public int Generation { get; set; }
     public DateTime StartedUtc { get; set; }
+    public DateTime LastHeartbeatUtc { get; set; }
 }
 
 internal sealed class JsonCommandResponse
@@ -684,6 +685,9 @@ internal sealed class JsonLeaseInfo
 
     [JsonPropertyName("startedUtc")]
     public DateTime StartedUtc { get; set; }
+
+    [JsonPropertyName("lastHeartbeatUtc")]
+    public DateTime LastHeartbeatUtc { get; set; }
 
     [JsonPropertyName("age")]
     public string Age { get; set; }
@@ -1000,7 +1004,11 @@ internal sealed class SystemProcessAdapter : IProcessAdapter
 internal sealed class CoordinatorState
 {
     private const string DevBridgePackageId = "lan.devbridge2";
-    private static readonly TimeSpan LeaseStaleAfter = TimeSpan.FromHours(1);
+    // CLI clients are intentionally short-lived, so client-process liveness cannot
+    // distinguish an active lease from a timed-out runner. Heartbeats keep long tests
+    // alive; the bounded default prevents one abandoned run from blocking a slot for
+    // the previous one-hour interval.
+    private static readonly TimeSpan LeaseStaleAfter = TimeSpan.FromMinutes(20);
     private static readonly TimeSpan ProgressInterval = TimeSpan.FromSeconds(5);
 
     private readonly string root;
@@ -1166,13 +1174,14 @@ internal sealed class CoordinatorState
     {
         if (arguments.Count == 0)
         {
-            emit("Usage: DevBridge.cmd test begin | test end <lease-id>");
+            emit("Usage: DevBridge.cmd test begin | test renew <lease-id> | test end <lease-id>");
             return 2;
         }
 
         return arguments[0].Trim().ToLowerInvariant() switch
         {
             "begin" => BeginLease(request, emit, connected),
+            "renew" => RenewLease(request, arguments, emit),
             "end" => EndLease(arguments, emit),
             _ => Unknown("test " + arguments[0], emit)
         };
@@ -1183,6 +1192,7 @@ internal sealed class CoordinatorState
         emit("DevBridge commands:");
         emit("  DevBridge.cmd status");
         emit("  DevBridge.cmd test begin");
+        emit("  DevBridge.cmd test renew <lease-id>");
         emit("  DevBridge.cmd test end <lease-id>");
         emit("  DevBridge.cmd stop <lease-id>");
         emit("  DevBridge.cmd ensure-ready <lease-id>");
@@ -1196,7 +1206,7 @@ internal sealed class CoordinatorState
     private static int Unknown(string command, Action<string> emit)
     {
         emit("Unknown DevBridge command: " + command);
-        emit("Use: status, test begin, test end <lease-id>, stop <lease-id>, ensure-ready <lease-id>, restart, wait-ready, doctor");
+        emit("Use: status, test begin, test renew <lease-id>, test end <lease-id>, stop <lease-id>, ensure-ready <lease-id>, restart, wait-ready, doctor");
         EmitNextCommand(emit, "DevBridge.cmd help");
         return 2;
     }
@@ -1217,36 +1227,32 @@ internal sealed class CoordinatorState
         PersistedState snapshot;
         ProcessStatusSnapshot processSnapshot = new();
         bool processInspectionAmbiguous = false;
-        lock (lifecycleGate)
+        lock (gate)
         {
-            lock (gate)
+            SynchronizeLocked();
+            processInspectionAmbiguous = state.ErrorCode == ProcessInspection.ErrorCode;
+            try
             {
-                SynchronizeLocked();
-                processInspectionAmbiguous = state.ErrorCode == ProcessInspection.ErrorCode;
-                try
-                {
-                    processSnapshot = EnumerateStatusProcessesLocked();
-                    if (state.MaintenanceReady && processSnapshot.MatchingProcessCount > 0)
-                        MarkMaintenanceProcessPresentLocked();
-                }
-                catch (ProcessInspectionException)
-                {
-                    processInspectionAmbiguous = true;
-                    MarkProcessInspectionAmbiguousLocked();
-                }
-                if (processInspectionAmbiguous && state.MaintenanceReady)
-                    MarkProcessInspectionAmbiguousLocked();
-
-                snapshot = CloneStateLocked();
+                processSnapshot = EnumerateStatusProcessesLocked();
+                if (state.MaintenanceReady && processSnapshot.MatchingProcessCount > 0)
+                    MarkMaintenanceProcessPresentLocked();
             }
+            catch (ProcessInspectionException)
+            {
+                processInspectionAmbiguous = true;
+                MarkProcessInspectionAmbiguousLocked();
+            }
+            if (processInspectionAmbiguous && state.MaintenanceReady)
+                MarkProcessInspectionAmbiguousLocked();
+
+            snapshot = CloneStateLocked();
         }
 
         emit("DevBridge2 status");
         emit("Agent/session: " + request.Agent);
         emit("State: " + snapshot.Phase);
         string heldLease = snapshot.Leases.FirstOrDefault(value =>
-            string.Equals(value.Agent, request.Agent, StringComparison.Ordinal) &&
-            value.ClientProcessId == request.ClientProcessId)?.Id;
+            string.Equals(value.Agent, request.Agent, StringComparison.Ordinal))?.Id;
         emit("gameState=" + snapshot.Phase + " maintenanceReady=" + snapshot.MaintenanceReady.ToString().ToLowerInvariant() +
             " leaseState=" + (heldLease == null ? "QUEUED" : "HELD"));
         emit("Generation: " + snapshot.Generation);
@@ -1265,7 +1271,7 @@ internal sealed class CoordinatorState
         emit("Session dirty: " + snapshot.SessionDirty);
         foreach (TestLease lease in snapshot.Leases.OrderBy(value => value.StartedUtc))
             emit("  " + lease.Id + " - " + lease.Agent + " - age " + FormatAge(lease.StartedUtc) +
-                " - stale in " + FormatStaleIn(lease.StartedUtc));
+                " - stale in " + FormatStaleIn(lease));
 
         if (snapshot.RestartPending)
         {
@@ -1322,33 +1328,29 @@ internal sealed class CoordinatorState
         bool processInspectionAmbiguous = false;
         bool processInspectionRecovered = false;
         List<UnmanagedRimWorldProcess> unmanagedProcesses = new();
-        lock (lifecycleGate)
+        lock (gate)
         {
-            lock (gate)
+            SynchronizeLocked();
+            RevalidateMaintenanceReadyLocked();
+            try
             {
-                SynchronizeLocked();
-                RevalidateMaintenanceReadyLocked();
-                try
+                ProcessStatusSnapshot processSnapshot = EnumerateStatusProcessesLocked();
+                processRunning = processSnapshot.OwnedProcessRunning;
+                unmanagedProcesses = processSnapshot.UnmanagedProcesses;
+                if (state.ErrorCode == ProcessInspection.ErrorCode &&
+                    state.Phase == BridgePhase.ERROR && !state.RestartPending &&
+                    state.Leases.Count == 0 && processSnapshot.MatchingProcessCount == 0)
                 {
-                    ProcessStatusSnapshot processSnapshot = EnumerateStatusProcessesLocked();
-                    processRunning = processSnapshot.OwnedProcessRunning;
-                    unmanagedProcesses = processSnapshot.UnmanagedProcesses;
-                    if (state.ErrorCode == ProcessInspection.ErrorCode &&
-                        state.Phase == BridgePhase.ERROR && !state.RestartPending &&
-                        state.Leases.Count == 0 && processSnapshot.MatchingProcessCount == 0)
-                    {
-                        RecoverProcessInspectionQuarantineLocked();
-                        processInspectionRecovered = true;
-                    }
+                    RecoverProcessInspectionQuarantineLocked();
+                    processInspectionRecovered = true;
                 }
-                catch (ProcessInspectionException)
-                {
-                    processInspectionAmbiguous = true;
-                    MarkProcessInspectionAmbiguousLocked();
-                }
-
-                snapshot = CloneStateLocked();
             }
+            catch (ProcessInspectionException)
+            {
+                processInspectionAmbiguous = true;
+                MarkProcessInspectionAmbiguousLocked();
+            }
+            snapshot = CloneStateLocked();
         }
 
         emit("DevBridge2 doctor");
@@ -1410,22 +1412,33 @@ internal sealed class CoordinatorState
     private int BeginLease(BridgeRequest request, Action<string> emit, Func<bool> connected)
     {
         emit("Agent/session: " + request.Agent);
-        lock (lifecycleGate)
+        bool startInitialLaunch;
+        lock (gate)
         {
-            lock (gate)
+            SynchronizeLocked();
+            if (state.Phase == BridgePhase.ERROR)
             {
-                SynchronizeLocked();
-                if (state.Phase == BridgePhase.STOPPED && state.Generation == 0 && !state.RestartPending)
+                emit("RimWorld is in ERROR state: " + state.Error);
+                EmitNextCommand(emit, "DevBridge.cmd doctor");
+                return 4;
+            }
+            startInitialLaunch = state.Phase == BridgePhase.STOPPED &&
+                state.Generation == 0 && !state.RestartPending;
+        }
+
+        if (startInitialLaunch)
+        {
+            lock (lifecycleGate)
+            {
+                lock (gate)
                 {
-                    emit("No ready RimWorld generation is running.");
-                    emit("DevBridge is launching RimWorld normally, then requesting built-in Dev Quicktest.");
-                    StartInitialLaunchLocked(LaunchOwnerFor(request));
-                }
-                else if (state.Phase == BridgePhase.ERROR)
-                {
-                    emit("RimWorld is in ERROR state: " + state.Error);
-                    EmitNextCommand(emit, "DevBridge.cmd doctor");
-                    return 4;
+                    SynchronizeLocked();
+                    if (state.Phase == BridgePhase.STOPPED && state.Generation == 0 && !state.RestartPending)
+                    {
+                        emit("No ready RimWorld generation is running.");
+                        emit("DevBridge is launching RimWorld normally, then requesting built-in Dev Quicktest.");
+                        StartInitialLaunchLocked(LaunchOwnerFor(request));
+                    }
                 }
             }
         }
@@ -1459,7 +1472,8 @@ internal sealed class CoordinatorState
                         Agent = string.IsNullOrWhiteSpace(request.Agent) ? "unknown-agent" : request.Agent,
                         ClientProcessId = request.ClientProcessId,
                         Generation = state.Generation,
-                        StartedUtc = clock.UtcNow
+                        StartedUtc = clock.UtcNow,
+                        LastHeartbeatUtc = clock.UtcNow
                     };
                     state.Leases.Add(lease);
                     SaveStateLocked();
@@ -1487,7 +1501,7 @@ internal sealed class CoordinatorState
         }
         emit("Generation: " + lease.Generation);
         emit(string.Empty);
-        emit("Next action: Test your mod, then run:");
+        emit("Next action: Test your mod; for work longer than 20 minutes, renew the lease, then run:");
         emit("DevBridge.cmd test end " + lease.Id);
         if (!connected())
         {
@@ -1495,6 +1509,34 @@ internal sealed class CoordinatorState
             return 4;
         }
         return 0;
+    }
+
+    private int RenewLease(BridgeRequest request, IReadOnlyList<string> arguments, Action<string> emit)
+    {
+        if (arguments.Count < 2 || string.IsNullOrWhiteSpace(arguments[1]))
+        {
+            emit("Usage: DevBridge.cmd test renew <lease-id>");
+            return 2;
+        }
+
+        string leaseId = arguments[1].Trim().ToUpperInvariant();
+        lock (gate)
+        {
+            PruneStaleLeasesLocked();
+            if (!TryGetLeaseHolderLocked(leaseId, request, out TestLease lease))
+            {
+                emit("Test lease renewal denied: lease " + leaseId +
+                    " is not held by this agent or has expired.");
+                return 4;
+            }
+
+            lease.LastHeartbeatUtc = clock.UtcNow;
+            SaveStateLocked();
+            Monitor.PulseAll(gate);
+            emit("Test lease renewed: " + lease.Id);
+            emit("Next action: Continue testing; renew the lease before its stale interval expires.");
+            return 0;
+        }
     }
 
     private int EndLease(IReadOnlyList<string> arguments, Action<string> emit)
@@ -1918,16 +1960,27 @@ internal sealed class CoordinatorState
     private int WaitReady(BridgeRequest request, Action<string> emit)
     {
         emit("Agent/session: " + request.Agent);
-        lock (lifecycleGate)
+        bool startInitialLaunch;
+        lock (gate)
         {
-            lock (gate)
+            SynchronizeLocked();
+            startInitialLaunch = state.Phase == BridgePhase.STOPPED &&
+                state.Generation == 0 && !state.RestartPending;
+        }
+
+        if (startInitialLaunch)
+        {
+            lock (lifecycleGate)
             {
-                SynchronizeLocked();
-                if (state.Phase == BridgePhase.STOPPED && state.Generation == 0 && !state.RestartPending)
+                lock (gate)
                 {
-                    emit("No ready RimWorld generation is running.");
-                    emit("DevBridge is launching RimWorld normally, then requesting built-in Dev Quicktest.");
-                    StartInitialLaunchLocked(LaunchOwnerFor(request));
+                    SynchronizeLocked();
+                    if (state.Phase == BridgePhase.STOPPED && state.Generation == 0 && !state.RestartPending)
+                    {
+                        emit("No ready RimWorld generation is running.");
+                        emit("DevBridge is launching RimWorld normally, then requesting built-in Dev Quicktest.");
+                        StartInitialLaunchLocked(LaunchOwnerFor(request));
+                    }
                 }
             }
         }
@@ -2026,7 +2079,7 @@ internal sealed class CoordinatorState
         emit("Waiting for " + snapshot.Leases.Count + " active test" + (snapshot.Leases.Count == 1 ? "" : "s") + ":");
         foreach (TestLease lease in snapshot.Leases.OrderBy(value => value.StartedUtc))
             emit("  " + lease.Id + " - " + lease.Agent + " - active " + FormatAge(lease.StartedUtc) +
-                " - stale in " + FormatStaleIn(lease.StartedUtc));
+                " - stale in " + FormatStaleIn(lease));
         EmitKeepWaiting(emit);
     }
 
@@ -2153,62 +2206,71 @@ internal sealed class CoordinatorState
     {
         try
         {
-            lock (lifecycleGate)
-            {
             int oldProcessId;
             long oldStartTicks;
-            while (true)
+            // Process-control operations remain serialized. The gate is intentionally
+            // not taken by status, doctor, wait-ready, or lease cleanup, so those
+            // commands remain responsive while this worker waits on a lease.
+            lock (lifecycleGate)
             {
-                lock (gate)
+                while (true)
                 {
-                    PruneStaleLeasesLocked();
-                    if (!state.RestartPending || state.TargetGeneration != targetGeneration)
-                        return;
-
-                    if (launchTask != null && !launchTask.IsCompleted)
+                    lock (gate)
                     {
-                        Monitor.Wait(gate, 1000);
-                        continue;
-                    }
+                        PruneStaleLeasesLocked();
+                        if (!state.RestartPending || state.TargetGeneration != targetGeneration)
+                            return;
 
-                    bool ownedProcessRunning = state.ProcessId > 0 &&
-                        IsOwnedProcess(state.ProcessId, state.ProcessStartUtcTicks);
-                    if (state.Leases.Count > 0 && ownedProcessRunning)
-                    {
-                        if (state.Phase != BridgePhase.WAITING_FOR_BRIDGE)
+                        if (launchTask != null && !launchTask.IsCompleted)
                         {
-                            state.Phase = BridgePhase.WAITING_FOR_BRIDGE;
+                            Monitor.Wait(gate, 1000);
+                            continue;
+                        }
+
+                        bool ownedProcessRunning = state.ProcessId > 0 &&
+                            IsOwnedProcess(state.ProcessId, state.ProcessStartUtcTicks);
+                        if (state.Leases.Count > 0 && ownedProcessRunning)
+                        {
+                            if (state.Phase != BridgePhase.WAITING_FOR_BRIDGE)
+                            {
+                                state.Phase = BridgePhase.WAITING_FOR_BRIDGE;
+                                SaveStateLocked();
+                            }
+                            Monitor.Wait(gate, 1000);
+                            continue;
+                        }
+
+                        if (state.Phase == BridgePhase.WAITING_FOR_BRIDGE)
+                        {
+                            state.Phase = BridgePhase.DRAINING;
                             SaveStateLocked();
                         }
-                        Monitor.Wait(gate, 1000);
-                        continue;
-                    }
 
-                    if (state.Phase == BridgePhase.WAITING_FOR_BRIDGE)
-                    {
-                        state.Phase = BridgePhase.DRAINING;
+                        state.Phase = BridgePhase.RESTARTING;
+                        state.Error = null;
+                        state.ErrorCode = null;
+                        state.MaintenanceReady = false;
+                        oldProcessId = state.ProcessId;
+                        oldStartTicks = state.ProcessStartUtcTicks;
+                        DeleteReadinessLocked();
                         SaveStateLocked();
+                        break;
                     }
-
-                    state.Phase = BridgePhase.RESTARTING;
-                    state.Error = null;
-                    state.ErrorCode = null;
-                    state.MaintenanceReady = false;
-                    oldProcessId = state.ProcessId;
-                    oldStartTicks = state.ProcessStartUtcTicks;
-                    DeleteReadinessLocked();
-                    SaveStateLocked();
-                    break;
                 }
-            }
 
-            (bool stopped, string stopErrorCode, string stopError) = StopOwnedProcess(oldProcessId, oldStartTicks);
-            if (!stopped)
-            {
-                FailLaunch(stopError, stopErrorCode);
-                return;
-            }
-            LaunchGenerationWorker(targetGeneration, isRestart: true, owner: owner);
+                lock (gate)
+                {
+                    if (!state.RestartPending || state.TargetGeneration != targetGeneration)
+                        return;
+                }
+
+                (bool stopped, string stopErrorCode, string stopError) = StopOwnedProcess(oldProcessId, oldStartTicks);
+                if (!stopped)
+                {
+                    FailLaunch(stopError, stopErrorCode);
+                    return;
+                }
+                LaunchGenerationWorker(targetGeneration, isRestart: true, owner: owner);
             }
         }
         catch (Exception exception)
@@ -2510,10 +2572,12 @@ internal sealed class CoordinatorState
 
     private bool TryGetLeaseHolderLocked(string leaseId, BridgeRequest request, out TestLease lease)
     {
+        // CLI commands are separate short-lived processes. The lease ID is the
+        // capability and Agent is the durable caller identity; ClientProcessId
+        // remains diagnostic metadata rather than a later-command authorization key.
         lease = state.Leases.FirstOrDefault(value =>
             string.Equals(value.Id, leaseId, StringComparison.OrdinalIgnoreCase) &&
-            string.Equals(value.Agent, request.Agent, StringComparison.Ordinal) &&
-            value.ClientProcessId == request.ClientProcessId);
+            string.Equals(value.Agent, request.Agent, StringComparison.Ordinal));
         return lease != null;
     }
 
@@ -2707,7 +2771,7 @@ internal sealed class CoordinatorState
     {
         DateTime cutoff = clock.UtcNow - LeaseStaleAfter;
         int before = state.Leases.Count;
-        state.Leases.RemoveAll(lease => lease == null || lease.StartedUtc.ToUniversalTime() < cutoff);
+        state.Leases.RemoveAll(lease => lease == null || LeaseActivityUtc(lease) < cutoff);
         if (state.Leases.Count != before)
         {
             SaveStateLocked();
@@ -3010,6 +3074,14 @@ internal sealed class CoordinatorState
 
         state.Leases ??= new List<TestLease>();
         state.ScopeTickets ??= new List<ScopeTicket>();
+        foreach (TestLease lease in state.Leases.Where(value => value != null))
+        {
+            if (lease.LastHeartbeatUtc == default)
+            {
+                lease.LastHeartbeatUtc = lease.StartedUtc;
+                changed = true;
+            }
+        }
         state.Phase = Enum.IsDefined(state.Phase) ? state.Phase : BridgePhase.STOPPED;
         if (string.Equals(state.ErrorCode, "WAITING_FOR_BRIDGE_EXPIRED", StringComparison.Ordinal) &&
             state.RequiresNewProcess && state.LaunchAttemptCount == 0)
@@ -3178,8 +3250,7 @@ internal sealed class CoordinatorState
             LaunchGeneration = snapshot.LaunchGeneration,
             MaintenanceReady = snapshot.MaintenanceReady,
             LeaseState = snapshot.Leases.Any(value =>
-                string.Equals(value.Agent, request.Agent, StringComparison.Ordinal) &&
-                value.ClientProcessId == request.ClientProcessId) ? "HELD" : "QUEUED",
+                string.Equals(value.Agent, request.Agent, StringComparison.Ordinal)) ? "HELD" : "QUEUED",
             SessionDirty = snapshot.SessionDirty,
             ActiveTests = snapshot.Leases.Count,
             RestartPending = snapshot.RestartPending,
@@ -3229,6 +3300,12 @@ internal sealed class CoordinatorState
         {
             response.LeaseId = request.Arguments[1];
         }
+        else if (string.Equals(request.Command, "test", StringComparison.OrdinalIgnoreCase) &&
+                 string.Equals(subcommand, "renew", StringComparison.OrdinalIgnoreCase) &&
+                 request.Arguments.Count > 1)
+        {
+            response.LeaseId = request.Arguments[1];
+        }
         else if ((string.Equals(request.Command, "stop", StringComparison.OrdinalIgnoreCase) ||
                   string.Equals(request.Command, "ensure-ready", StringComparison.OrdinalIgnoreCase)) &&
                  request.Arguments.Count > 0)
@@ -3258,7 +3335,7 @@ internal sealed class CoordinatorState
 
         if (string.Equals(command, "test", StringComparison.OrdinalIgnoreCase) &&
             string.Equals(subcommand, "begin", StringComparison.OrdinalIgnoreCase) && exitCode == 0)
-            return "Test your mod, then run: DevBridge.cmd test end " + leaseId;
+            return "Test your mod; renew before 20 minutes for long runs, then run: DevBridge.cmd test end " + leaseId;
 
         if (string.Equals(command, "test", StringComparison.OrdinalIgnoreCase) &&
             string.Equals(subcommand, "end", StringComparison.OrdinalIgnoreCase) && exitCode == 0)
@@ -3267,6 +3344,10 @@ internal sealed class CoordinatorState
                 ? "Keep waiting. Do not launch, kill, or restart RimWorld yourself."
                 : "Continue your workflow; run DevBridge.cmd restart only after a change requiring a fresh process.";
         }
+
+        if (string.Equals(command, "test", StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(subcommand, "renew", StringComparison.OrdinalIgnoreCase) && exitCode == 0)
+            return "Continue testing; renew the lease before its stale interval expires.";
 
         if (string.Equals(command, "stop", StringComparison.OrdinalIgnoreCase) && exitCode == 0)
             return "Replace the assembly, verify its hash, then run: DevBridge.cmd ensure-ready " + leaseId;
@@ -3303,9 +3384,21 @@ internal sealed class CoordinatorState
             Agent = lease.Agent,
             Generation = lease.Generation,
             StartedUtc = lease.StartedUtc,
+            LastHeartbeatUtc = LeaseActivityUtc(lease),
             Age = FormatAge(lease.StartedUtc),
-            StaleIn = FormatStaleIn(lease.StartedUtc)
+            StaleIn = FormatStaleIn(lease)
         };
+    }
+
+    private static string FormatStaleIn(TestLease lease)
+    {
+        return FormatStaleIn(LeaseActivityUtc(lease));
+    }
+
+    private static DateTime LeaseActivityUtc(TestLease lease)
+    {
+        return (lease.LastHeartbeatUtc == default ? lease.StartedUtc : lease.LastHeartbeatUtc)
+            .ToUniversalTime();
     }
 
     private static string FormatStaleIn(DateTime startedUtc)

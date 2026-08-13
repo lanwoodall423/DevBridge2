@@ -9,7 +9,8 @@ Use `DevBridge.cmd` from the installed mod root.
 - Use `DevBridge.cmd` for all game coordination.
 - Run `DevBridge.cmd test begin` before interacting with the current game.
 - Test leases are shared: multiple agents may hold active leases and test the same ready generation concurrently.
-- Run the exact `DevBridge.cmd test end <lease-id>` command printed by `test begin` afterward.
+- Run `DevBridge.cmd test renew <lease-id>` periodically during long-running tests, then run the exact
+  `DevBridge.cmd test end <lease-id>` command printed by `test begin` afterward.
 - Maintenance ownership is exclusive: acquire a lease first, then use `stop <lease-id>` and keep that lease until `ensure-ready <lease-id>` completes.
 - Use `DevBridge.cmd restart` after a build requires a fresh RimWorld process.
 - Waiting is normal. Do not abort a command just because another agent is testing.
@@ -17,7 +18,7 @@ Use `DevBridge.cmd` from the installed mod root.
 - Once `restart` is accepted, DevBridge owns it even if the requesting shell times out or disconnects; do not request it again. Use `DevBridge.cmd wait-ready` or `DevBridge.cmd status` to reconnect.
 - Once `restart` is requested, existing tests may finish, but no new test lease is granted on the old generation.
 - While the coordinator-owned game is running, restart remains durably queued until every active lease
-  is released (or its conservative stale-lease lifetime expires); normal contention has no short failure deadline.
+  is released (or its bounded stale-lease lifetime expires); normal contention has no short failure deadline.
 - If the owned game is already absent, Dev Bridge launches the replacement without waiting on old-generation
   leases and preserves those leases for the ready replacement generation.
 - `test begin` waits through a pending restart, then acquires a lease on the new generation.
@@ -34,6 +35,7 @@ Use `DevBridge.cmd` from the installed mod root.
   `DevBridge.cmd doctor`. A complete census proving zero matching processes clears the stale quarantine
   to `STOPPED` without launching anything; then run the separately printed `DevBridge.cmd restart`.
 - Diagnostics show the agent/session identity beside leases. Set `DEVBRIDGE_AGENT` to choose an explicit identity; otherwise each CLI session gets a short automatic ID.
+- Use the same `DEVBRIDGE_AGENT` value for `test renew`, `stop`, and `ensure-ready` commands that manage a lease acquired by an earlier CLI invocation.
 - Append `--json` to `status`, `test begin`, `test end <lease-id>`, `restart`, `wait-ready`, or `doctor` for one machine-readable JSON result.
 
 ## Normal workflow
@@ -41,6 +43,7 @@ Use `DevBridge.cmd` from the installed mod root.
 ```text
 DevBridge.cmd test begin
 # interact with RimWorld and test the mod
+DevBridge.cmd test renew <lease-id> # repeat before the stale interval during long tests
 DevBridge.cmd test end <lease-id> # use the exact ID printed above
 
 # after rebuilding a mod:
@@ -68,7 +71,9 @@ DevBridge.cmd wait-ready
 DevBridge.cmd doctor
 ```
 
-Runtime state and logs are kept in `Runtime`. A lease abandoned for about one hour is reclaimed automatically.
+Runtime state and logs are kept in `Runtime`. A lease with no heartbeat is reclaimed after 20 minutes. This
+prevents a timed-out test wrapper from blocking the runtime indefinitely. Long-running tests must renew with
+`DevBridge.cmd test renew <lease-id>`; the renewal resets the stale timer without changing the lease generation.
 
 ## Maintenance workflow
 
@@ -108,6 +113,7 @@ exists. A terminal failure such as `READINESS_TIMEOUT` is a bounded result: insp
 set DEVBRIDGE_AGENT=agent-a
 DevBridge.cmd test begin --json
 # Save the returned leaseId as <lease-id>.
+DevBridge.cmd test renew <lease-id> --json # repeat during long-running work
 DevBridge.cmd stop <lease-id> --json
 # Confirm gameState=STOPPED, maintenanceReady=true, and leaseState=HELD.
 # Perform the build/edit/assembly replacement and verify its hash while RimWorld is stopped.

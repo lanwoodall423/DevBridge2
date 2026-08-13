@@ -39,39 +39,67 @@ namespace DevBridge2
 
     internal static class DevBridgeQuicktestActivation
     {
-        private static bool requested;
-        private static bool attempted;
+        private const long ActivationTimeoutMilliseconds = 60000;
+        private static QuicktestActivationController controller;
 
         internal static void Configure()
         {
-            requested = string.Equals(Environment.GetEnvironmentVariable("DEVBRIDGE_QUICKTEST_REQUESTED"), "1",
+            bool requested = string.Equals(Environment.GetEnvironmentVariable("DEVBRIDGE_QUICKTEST_REQUESTED"), "1",
                 StringComparison.Ordinal);
             if (requested)
-                LongEventHandler.ExecuteWhenFinished(TryActivate);
+            {
+                controller = new QuicktestActivationController(requested,
+                    DevBridgeQuicktestMenuAdapter.IsGenuineMainMenuReady,
+                    () => DevBridgeQuicktestMenuAdapter.QueueBuiltInDevQuicktest(
+                        controller.ReportActivationFailure), MonotonicMilliseconds,
+                    ActivationTimeoutMilliseconds);
+                LongEventHandler.ExecuteWhenFinished(DevBridgeQuicktestActivationDriver.EnsureCreated);
+            }
         }
 
-        private static void TryActivate()
+        internal static bool Tick()
         {
-            if (!requested || attempted)
-                return;
+            if (controller == null || !controller.Pending || controller.ActivationRequested || controller.TerminalFailure)
+                return false;
 
-            attempted = true;
-            if (!GenScene.InEntryScene)
+            QuicktestActivationResult result = controller.Tick(UnityData.IsInMainThread);
+            if (result == QuicktestActivationResult.WaitingForMainMenu)
+                return true;
+
+            if (result == QuicktestActivationResult.Requested)
             {
-                Log.Warning("[DevBridge2] Built-in Dev Quicktest was requested, but RimWorld was not at the main menu.");
-                return;
+                Log.Message("[DevBridge2] quicktestMainMenu=true; genuine main-menu UI is ready.");
+                Log.Message("[DevBridge2] quicktestRequested=true; built-in Dev Quicktest button activation queued.");
+            }
+            else
+            {
+                Log.Error("[DevBridge2] quicktest activation reached a bounded terminal failure: " +
+                    controller.Failure);
             }
 
-            try
-            {
-                PageUtility.InitGameStart();
-                Root_Play.SetupForQuickTestPlay();
-                Log.Message("[DevBridge2] quicktestRequested=true; built-in Dev Quicktest requested from the main menu.");
-            }
-            catch (Exception exception)
-            {
-                Log.Error("[DevBridge2] Built-in Dev Quicktest activation failed: " + exception);
-            }
+            return false;
+        }
+
+        private static long MonotonicMilliseconds()
+        {
+            return (long)(Stopwatch.GetTimestamp() * (1000d / Stopwatch.Frequency));
+        }
+
+    }
+
+    internal sealed class DevBridgeQuicktestActivationDriver : MonoBehaviour
+    {
+        internal static void EnsureCreated()
+        {
+            GameObject driverObject = new GameObject("DevBridge2 Quicktest Activation");
+            UnityEngine.Object.DontDestroyOnLoad(driverObject);
+            driverObject.AddComponent<DevBridgeQuicktestActivationDriver>();
+        }
+
+        private void Update()
+        {
+            if (!DevBridgeQuicktestActivation.Tick())
+                UnityEngine.Object.Destroy(gameObject);
         }
     }
 

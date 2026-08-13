@@ -1,4 +1,5 @@
 using System.Text.Json;
+using DevBridge2;
 
 namespace DevBridge.Coordinator;
 
@@ -20,9 +21,36 @@ internal static class OfflineTests
         Run("restart retains immediate launch behavior", TestImmediateRestart);
         Run("duplicate stop is idempotent", TestDuplicateStop);
         Run("process inspection uncertainty fails closed", TestInspectionFailsClosed);
+        Run("doctor clears a stale inspection quarantine after a zero-process census", TestDoctorRecoversInspectionQuarantine);
+        Run("doctor keeps inspection quarantine when the census is not conclusively empty", TestDoctorRecoveryFailsClosed);
         Run("maintenance claims are freshly re-enumerated", TestMaintenanceRevalidation);
         Run("uncertain maintenance operations make no adapter calls", TestMaintenanceInspectionNoLaunch);
         Run("status uses one authoritative process snapshot", TestStatusSnapshotConsistency);
+        Run("duplicate launch requests have one slot owner", TestDuplicateLaunchOwnership);
+        Run("fifty duplicate restart requests have one launch", TestDuplicateRestartOwnership);
+        Run("competing restart owners cannot overwrite provenance", TestCompetingRestartOwners);
+        Run("lease-blocked restart waits durably and resumes", TestDurableLeaseWait);
+        Run("missing process relaunches despite an active lease", TestMissingProcessRelaunchWithLease);
+        Run("legacy lease-wait expiry recovers automatically", TestLegacyLeaseWaitRecovery);
+        Run("recovery launch budget is finite", TestFiniteRecovery);
+        Run("crash recovery never duplicates an ambiguous launch", TestCrashRecoveryNoDuplicateLaunch);
+        Run("root and runtime slot bindings are authoritative", TestRuntimeScopeBinding);
+        Run("ticket routing preserves its durable slot", TestTicketRouting);
+        Run("goal wake and MCP scope metadata is preserved", TestScopeMetadata);
+        Run("quicktest activation is ordered and bounded", TestQuicktestActivation);
+        Run("quicktest request only records pending intent", TestQuicktestRequestRegistration);
+        Run("quicktest pre-menu readiness cannot activate", TestQuicktestPreMainMenu);
+        Run("quicktest activation uses one UI-thread boundary", TestQuicktestUiThreadBoundary);
+        Run("quicktest duplicate ticks produce one activation", TestQuicktestSingleActivation);
+        Run("quicktest callback preserves built-in order", TestQuicktestCallbackOrder);
+        Run("quicktest old lifecycle failure is prevented", TestQuicktestLifecycleGuard);
+        Run("quicktest activation failure clears pending state", TestQuicktestActivationFailure);
+        Run("quicktest callback bursts cannot consume the elapsed-time wait", TestQuicktestCallbackBurst);
+        Run("quicktest readiness expiry is terminal", TestQuicktestReadinessExpiry);
+        Run("quicktest source boundary and lifecycle predicates are structural", TestQuicktestStructuralBoundary);
+        Run("quicktest path has no fallback activation mechanism", TestQuicktestNoFallback);
+        Run("coordinator-root argument forms are accepted", TestCoordinatorRootArgumentForms);
+        Run("wrapper propagates native exit codes", DevBridgeWrapperTests.Run);
 
         Console.WriteLine(failures == 0 ? "OFFLINE TESTS PASS" : "OFFLINE TESTS FAIL: " + failures);
         return failures == 0 ? 0 : 1;
@@ -348,6 +376,642 @@ internal static class OfflineTests
         }
     }
 
+    private static void TestDuplicateLaunchOwnership()
+    {
+        using Fixture fixture = Fixture.MaintenanceWithLease();
+        fixture.Adapter.ReadyOnLaunch = true;
+
+        Task<int>[] requests = Enumerable.Range(0, 50)
+            .Select(_ => Task.Run(() => fixture.State.Execute(
+                Request("ensure-ready", "holder", 77, "T001"), _ => { }, () => true)))
+            .ToArray();
+        Task.WaitAll(requests);
+
+        Assert(requests.All(value => value.Result == 0), "same-owner duplicate ensure requests must be idempotent");
+        Assert(fixture.Adapter.LaunchCalls == 1, "fifty duplicate requests must have exactly one launch attempt");
+        JsonCommandResponse response = fixture.State.CreateJsonResponse(Request("status", "holder", 77), 0,
+            Array.Empty<string>());
+        Assert(response.LaunchOwner == null && response.ActiveTests == 1,
+            "completed launch ownership must not leave an orphan owner or lease");
+    }
+
+    private static void TestFiniteRecovery()
+    {
+        using Fixture exhausted = new(new PersistedState
+        {
+            Generation = 1,
+            Phase = BridgePhase.DRAINING,
+            TargetGeneration = 2,
+            RestartPending = true,
+            LaunchOwner = "recovery-owner@1",
+            LaunchRequestKey = "restart-2",
+            LaunchBudgetRemaining = 0
+        });
+        exhausted.State.StartRecoveryWork();
+        JsonCommandResponse exhaustedResponse = exhausted.State.CreateJsonResponse(Request("status"), 0,
+            Array.Empty<string>());
+        Assert(exhaustedResponse.ErrorCode == "LAUNCH_BUDGET_EXHAUSTED" &&
+            exhausted.Adapter.LaunchCalls == 0, "exhausted launch budget must prevent recovery launch");
+    }
+
+    private static void TestDurableLeaseWait()
+    {
+        using Fixture fixture = Fixture.ReadyWithLease();
+        fixture.Adapter.ReadyOnLaunch = true;
+        Task<int> restart = Task.Run(() => fixture.State.Execute(
+            Request("restart", "restart-agent", 90), _ => { }, () => true));
+
+        Assert(SpinWait.SpinUntil(() => fixture.State.CreateJsonResponse(Request("status"), 0,
+                Array.Empty<string>()).State == "WAITING_FOR_BRIDGE", TimeSpan.FromSeconds(2)),
+            "restart must enter a durable lease wait while the owned process is running");
+        fixture.Clock.Advance(TimeSpan.FromMinutes(1));
+        JsonCommandResponse waiting = fixture.State.CreateJsonResponse(Request("status"), 0,
+            Array.Empty<string>());
+        Assert(waiting.State == "WAITING_FOR_BRIDGE" && waiting.RestartPending &&
+            waiting.ErrorCode == null && fixture.Adapter.LaunchCalls == 0,
+            "lease wait must not become a terminal timeout");
+
+        Assert(fixture.State.Execute(Request("test", "holder", 77, "end", "T001"), _ => { }, () => true) == 0,
+            "lease holder must be able to release the queued restart");
+        Assert(restart.Wait(TimeSpan.FromSeconds(2)) && restart.Result == 0 && fixture.Adapter.LaunchCalls == 1,
+            "queued restart must resume exactly once after the lease is released");
+    }
+
+    private static void TestMissingProcessRelaunchWithLease()
+    {
+        using Fixture fixture = new(new PersistedState
+        {
+            Generation = 1,
+            Phase = BridgePhase.STOPPED,
+            ErrorCode = "PROCESS_EXITED",
+            Error = "The coordinator-owned RimWorld process is no longer running.",
+            RequiresNewProcess = true,
+            Leases = new List<TestLease> { new() { Id = "T001", Agent = "holder", ClientProcessId = 77,
+                Generation = 1, StartedUtc = ClockStart } }
+        });
+        fixture.Adapter.ReadyOnLaunch = true;
+
+        List<string> output = new();
+        int exitCode = fixture.State.Execute(Request("restart", "restart-agent", 90), output.Add, () => true);
+        JsonCommandResponse response = fixture.State.CreateJsonResponse(Request("status", "holder", 77), exitCode,
+            Array.Empty<string>());
+        Assert(exitCode == 0 && response.State == "READY" && response.Generation == 2 &&
+            response.ActiveTests == 1 && fixture.Adapter.LaunchCalls == 1 &&
+            fixture.Adapter.TerminationRequests == 0,
+            "an absent process must relaunch once without discarding or waiting on the active lease (exit " +
+            exitCode + ", state " + response.State + ", generation " + response.Generation + ", tests " +
+            response.ActiveTests + ", launches " + fixture.Adapter.LaunchCalls + ", terminations " +
+            fixture.Adapter.TerminationRequests + ", output: " + string.Join(" | ", output) + ")");
+    }
+
+    private static void TestLegacyLeaseWaitRecovery()
+    {
+        using Fixture fixture = new(new PersistedState
+        {
+            Generation = 202,
+            Phase = BridgePhase.ERROR,
+            ErrorCode = "WAITING_FOR_BRIDGE_EXPIRED",
+            Error = "The durable WAITING_FOR_BRIDGE deadline expired; no launch was attempted.",
+            ProcessId = 34208,
+            ProcessStartUtcTicks = 639221723214541368,
+            RestartPending = false,
+            LaunchAttemptCount = 0,
+            LaunchBudgetRemaining = 2,
+            RequiresNewProcess = true,
+            Leases = new List<TestLease> { new() { Id = "9F8D", Agent = "agent-4D8C", ClientProcessId = 19852,
+                Generation = 202, StartedUtc = ClockStart } }
+        });
+        fixture.Adapter.ReadyOnLaunch = true;
+        fixture.State.StartRecoveryWork();
+
+        Assert(SpinWait.SpinUntil(() => fixture.State.CreateJsonResponse(Request("status"), 0,
+                Array.Empty<string>()).State == "READY", TimeSpan.FromSeconds(2)),
+            "legacy terminal lease wait must autonomously resume");
+        JsonCommandResponse response = fixture.State.CreateJsonResponse(Request("status"), 0,
+            Array.Empty<string>());
+        Assert(response.Generation == 203 && response.ActiveTests == 1 && response.ErrorCode == null &&
+            fixture.Adapter.LaunchCalls == 1 && fixture.Adapter.TerminationRequests == 0,
+            "legacy recovery must launch generation 203 exactly once and preserve the lease");
+    }
+
+    private static void TestDuplicateRestartOwnership()
+    {
+        using Fixture fixture = Fixture.ReadyWithoutLease();
+        fixture.Adapter.ReadyOnLaunch = true;
+        fixture.Adapter.BlockWaitForExit = true;
+        BridgeRequest request = Request("restart", "restart-agent", 90);
+        Task<int> first = Task.Factory.StartNew(() => fixture.State.Execute(request, _ => { }, () => true),
+            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        Assert(fixture.Adapter.TerminationRequested.Wait(TimeSpan.FromSeconds(10)),
+            "restart did not reach the identity-checked stop");
+
+        Task<int>[] duplicates = Enumerable.Range(0, 49)
+            .Select(_ => Task.Factory.StartNew(() => fixture.State.Execute(Request("restart", "restart-agent", 90), _ => { }, () => true),
+                CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default))
+            .ToArray();
+        fixture.Adapter.ReleaseWait.Set();
+        Assert(first.Wait(TimeSpan.FromSeconds(10)), "primary restart did not finish");
+        Assert(Task.WaitAll(duplicates, TimeSpan.FromSeconds(10)), "duplicate restarts did not finish");
+        Assert(first.Result == 0 && duplicates.All(value => value.Result == 0),
+            "same-owner duplicate restarts must be idempotent");
+        Assert(fixture.Adapter.LaunchCalls == 1, "fifty duplicate restarts must have exactly one launch attempt");
+    }
+
+    private static void TestCompetingRestartOwners()
+    {
+        using Fixture fixture = Fixture.ReadyWithoutLease();
+        fixture.Adapter.ReadyOnLaunch = true;
+        fixture.Adapter.BlockWaitForExit = true;
+        Task<int> primary = Task.Factory.StartNew(() => fixture.State.Execute(Request("restart", "owner-a", 90), _ => { }, () => true),
+            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        Assert(fixture.Adapter.TerminationRequested.Wait(TimeSpan.FromSeconds(10)),
+            "primary owner did not acquire the restart slot");
+        Task<int> competing = Task.Factory.StartNew(
+            () => fixture.State.Execute(Request("restart", "owner-b", 91), _ => { }, () => true),
+            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        Thread.Sleep(100);
+        PersistedState pending = JsonSerializer.Deserialize<PersistedState>(
+            File.ReadAllText(Path.Combine(fixture.Root, "Runtime", "state.json")), Program.JsonOptions);
+        Assert(pending?.LaunchOwner == "owner-a@90", "competing owner overwrote launch provenance");
+        fixture.Adapter.ReleaseWait.Set();
+        Assert(primary.Wait(TimeSpan.FromSeconds(10)) && primary.Result == 0, "primary restart did not finish");
+        Assert(competing.Wait(TimeSpan.FromSeconds(10)) && competing.Result == 4,
+            "a competing owner must be rejected while the slot is pending");
+        Assert(fixture.Adapter.LaunchCalls == 1, "competing owner must not create a second launch");
+    }
+
+    private static void TestCrashRecoveryNoDuplicateLaunch()
+    {
+        using Fixture ambiguous = new(new PersistedState
+        {
+            Generation = 1,
+            Phase = BridgePhase.LOADING,
+            TargetGeneration = 2,
+            RestartPending = true,
+            LaunchOwner = "owner-a@90",
+            LaunchRequestKey = "restart-2",
+            LaunchBudgetRemaining = 2,
+            ProcessId = 0,
+            ProcessStartUtcTicks = 0
+        });
+        ambiguous.State.StartRecoveryWork();
+        JsonCommandResponse response = ambiguous.State.CreateJsonResponse(Request("status"), 0,
+            Array.Empty<string>());
+        Assert(response.ErrorCode == "LAUNCH_RECOVERY_AMBIGUOUS" && ambiguous.Adapter.LaunchCalls == 0,
+            "reconnect without an exact process identity must fail closed without relaunching");
+
+        using Fixture monitored = Fixture.LoadingWithLease();
+        monitored.State.StartRecoveryWork();
+        Assert(monitored.Adapter.LaunchCalls == 0, "recovery monitoring must not invoke the launcher");
+    }
+
+    private static void TestScopeMetadata()
+    {
+        using Fixture fixture = Fixture.ReadyWithoutLease();
+        BridgeRequest request = Request("status", "scope-agent", 91);
+        request.GoalId = "goal-7";
+        request.WakeId = "wake-8";
+        request.McpRequestId = "mcp-9";
+        JsonCommandResponse response = fixture.State.CreateJsonResponse(request, 0, Array.Empty<string>());
+        Assert(response.GoalId == "goal-7" && response.WakeId == "wake-8" && response.McpRequestId == "mcp-9",
+            "scope metadata was not preserved through the coordinator response");
+    }
+
+    private static void TestRuntimeScopeBinding()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "DevBridge2-scope-" + Guid.NewGuid().ToString("N"));
+        string other = Path.Combine(root, "other");
+        ParsedArguments separated = ParsedArguments.Parse(new[] { "--root", root, "--coordinator-root", root, "status" });
+        ParsedArguments equals = ParsedArguments.Parse(new[] { "--coordinator-root=" + root, "status" });
+        Assert(RuntimeScope.PathsEqual(separated.Root, root) && RuntimeScope.PathsEqual(separated.CoordinatorRoot, root),
+            "separated coordinator-root form must bind to root");
+        Assert(RuntimeScope.PathsEqual(equals.Root, root) && RuntimeScope.PathsEqual(equals.CoordinatorRoot, root),
+            "equals coordinator-root form must bind to root");
+
+        bool mismatchRejected = false;
+        try { ParsedArguments.Parse(new[] { "--root", root, "--coordinator-root", other, "status" }); }
+        catch (ArgumentException) { mismatchRejected = true; }
+        Assert(mismatchRejected, "mismatched command-line roots must be rejected");
+
+        using Fixture fixture = Fixture.ReadyWithoutLease();
+        fixture.WriteState(new PersistedState
+        {
+            CoordinatorRoot = other,
+            RuntimeSlotId = "slot-other",
+            Generation = 1,
+            Phase = BridgePhase.READY
+        });
+        bool persistedMismatchRejected = false;
+        try { fixture.Reload(); }
+        catch (InvalidOperationException) { persistedMismatchRejected = true; }
+        Assert(persistedMismatchRejected, "a persisted root mismatch must be rejected even if the legacy path is absent");
+    }
+
+    private static void TestTicketRouting()
+    {
+        using Fixture fixture = Fixture.ReadyWithoutLease();
+        fixture.WriteState(new PersistedState
+        {
+            CoordinatorRoot = fixture.Root,
+            RuntimeSlotId = RuntimeScope.ForRoot(fixture.Root),
+            Generation = 1,
+            Phase = BridgePhase.READY,
+            ProcessId = 101,
+            ProcessStartUtcTicks = 1001,
+            ScopeTickets = new List<ScopeTicket>
+            {
+                new() { Id = "ticket-1", CoordinatorRoot = fixture.Root,
+                    RuntimeSlotId = RuntimeScope.ForRoot(fixture.Root) }
+            }
+        });
+        ParsedArguments ticketArguments = ParsedArguments.Parse(new[]
+            { "--root", fixture.Root, "--ticket", "ticket-1", "status" });
+        ParsedArguments ticketEqualsArguments = ParsedArguments.Parse(new[]
+            { "--root=" + fixture.Root, "--ticket=ticket-1", "status" });
+        Assert(ticketArguments.TicketId == "ticket-1" && ticketArguments.RuntimeSlotId == null &&
+            ticketEqualsArguments.TicketId == "ticket-1" && ticketEqualsArguments.RuntimeSlotId == null,
+            "ticket-only CLI requests must preserve the ticket without inventing a root-derived slot");
+        Assert(RuntimeScope.ResolveTicketSlot(fixture.Root, "ticket-1") == RuntimeScope.ForRoot(fixture.Root),
+            "ticket-only startup must resolve the persisted slot before connecting");
+        Assert(PipeNames.ForSlot(fixture.Root, "slot-a") != PipeNames.ForSlot(fixture.Root, "slot-b"),
+            "different runtime slots must have distinct coordinator pipe endpoints");
+        fixture.State = fixture.Reload();
+        BridgeRequest request = Request("status", "ticket-agent", 88);
+        request.TicketId = "ticket-1";
+        int exitCode = fixture.State.Execute(request, _ => { }, () => true);
+        Assert(exitCode == 0, "ticket-only routing must resolve its durable authoritative slot");
+        Assert(fixture.Adapter.LaunchCalls == 0 && fixture.Adapter.TerminationRequests == 0,
+            "ticket routing must not create lifecycle side effects");
+
+        BridgeRequest conflicting = Request("status", "ticket-agent", 88);
+        conflicting.TicketId = "ticket-1";
+        conflicting.CoordinatorRoot = "C:\\wrong-root";
+        conflicting.RuntimeSlotId = "slot-wrong";
+        Assert(fixture.State.Execute(conflicting, _ => { }, () => true) == 4,
+            "ticket scope conflicts must be rejected rather than silently rewritten");
+    }
+
+    private static void TestQuicktestActivation()
+    {
+        bool mainMenu = false;
+        int activationCalls = 0;
+        QuicktestActivationController failure = new(true, () => mainMenu, () =>
+        {
+            activationCalls++;
+            throw new NullReferenceException("simulated Root_Play lifecycle failure");
+        }, () => 0, 1000);
+        Assert(failure.Tick(true) == QuicktestActivationResult.WaitingForMainMenu && activationCalls == 0 &&
+            failure.Pending,
+            "Quicktest must not activate before genuine main-menu readiness");
+        mainMenu = true;
+        Assert(failure.Tick(true) == QuicktestActivationResult.Failed && failure.TerminalFailure &&
+            !failure.Pending && activationCalls == 1,
+            "observed built-in activation failure must be bounded and terminal");
+        Assert(failure.Tick(true) == QuicktestActivationResult.Failed && activationCalls == 1,
+            "terminal Quicktest failure must not retry or launch");
+
+        int successfulCalls = 0;
+        QuicktestActivationController success = new(true, () => mainMenu, () => successfulCalls++, () => 0, 1000);
+        Assert(success.Tick(true) == QuicktestActivationResult.Requested && success.MainMenuReady &&
+            success.ActivationRequested && !success.Pending && successfulCalls == 1,
+            "built-in button activation must follow genuine main-menu readiness");
+    }
+
+    private static void TestQuicktestRequestRegistration()
+    {
+        int readinessCalls = 0;
+        int activationCalls = 0;
+        QuicktestActivationController controller = new(true, () =>
+        {
+            readinessCalls++;
+            return true;
+        }, () => activationCalls++, () => 0, 1000);
+
+        Assert(controller.Pending && !controller.MainMenuReady && activationCalls == 0,
+            "registration must only leave a pending activation intent");
+        Assert(controller.Tick(false) == QuicktestActivationResult.WaitingForMainMenu &&
+            readinessCalls == 0 && activationCalls == 0,
+            "the request handler must not inspect or activate from outside the UI boundary");
+    }
+
+    private static void TestQuicktestPreMainMenu()
+    {
+        int activationCalls = 0;
+        QuicktestActivationController controller = new(true, () => false, () => activationCalls++, () => 0, 1000);
+
+        Assert(controller.Tick(true) == QuicktestActivationResult.WaitingForMainMenu &&
+            controller.Pending && activationCalls == 0,
+            "pre-main-menu readiness must defer activation");
+    }
+
+    private static void TestQuicktestUiThreadBoundary()
+    {
+        bool ready = true;
+        int activationCalls = 0;
+        QuicktestActivationController controller = new(true, () => ready, () => activationCalls++, () => 0, 1000);
+
+        Assert(controller.Tick(false) == QuicktestActivationResult.WaitingForMainMenu && activationCalls == 0,
+            "a ready-looking request must not activate off the modeled game/UI thread");
+        Assert(controller.Tick(true) == QuicktestActivationResult.Requested && activationCalls == 1,
+            "the same request must activate once it reaches the game/UI-thread boundary");
+    }
+
+    private static void TestQuicktestSingleActivation()
+    {
+        int activationCalls = 0;
+        QuicktestActivationController controller = new(true, () => true, () => activationCalls++, () => 0, 1000);
+
+        Assert(controller.Tick(true) == QuicktestActivationResult.Requested, "first UI tick must queue activation");
+        Assert(controller.Tick(true) == QuicktestActivationResult.Requested, "duplicate UI tick must be harmless");
+        Assert(controller.Tick(true) == QuicktestActivationResult.Requested && activationCalls == 1,
+            "duplicate ticks or callbacks must not activate twice");
+    }
+
+    private static void TestQuicktestCallbackOrder()
+    {
+        List<string> operations = new();
+        QuicktestActivationController controller = new(true, () => true, () =>
+        {
+            operations.Add("QueueLongEvent:GeneratingMap");
+            operations.Add("Root_Play.SetupForQuickTestPlay");
+            operations.Add("PageUtility.InitGameStart");
+        }, () => 0, 1000);
+
+        Assert(controller.Tick(true) == QuicktestActivationResult.Requested,
+            "verified adapter model must queue successfully");
+        Assert(operations.SequenceEqual(new[]
+        {
+            "QueueLongEvent:GeneratingMap",
+            "Root_Play.SetupForQuickTestPlay",
+            "PageUtility.InitGameStart"
+        }), "verified built-in callback order must be preserved");
+    }
+
+    private static void TestQuicktestLifecycleGuard()
+    {
+        bool initialized = false;
+        AssertThrows<NullReferenceException>(() =>
+        {
+            if (!initialized)
+                throw new NullReferenceException("simulated Root_Play lifecycle failure");
+        }, "the former direct path must reproduce the invalid lifecycle failure");
+
+        int fakeLaunches = 0;
+        QuicktestActivationController corrected = new(true, () => initialized, () => fakeLaunches++, () => 0, 1000);
+        Assert(corrected.Tick(true) == QuicktestActivationResult.WaitingForMainMenu && fakeLaunches == 0,
+            "the corrected path must not enter the invalid lifecycle");
+        initialized = true;
+        Assert(corrected.Tick(true) == QuicktestActivationResult.Requested && fakeLaunches == 1,
+            "the corrected path may activate only after lifecycle readiness");
+    }
+
+    private static void TestQuicktestActivationFailure()
+    {
+        int fakeLaunches = 0;
+        int restartRequests = 0;
+        QuicktestActivationController controller = new(true, () => true, () =>
+        {
+            throw new InvalidOperationException("simulated queued activation failure");
+        }, () => 0, 1000);
+
+        Assert(controller.Tick(true) == QuicktestActivationResult.Failed && controller.TerminalFailure &&
+            !controller.Pending && fakeLaunches == 0 && restartRequests == 0,
+            "activation failure must be terminal, clear pending state, and launch nothing");
+        Assert(controller.Tick(true) == QuicktestActivationResult.Failed && fakeLaunches == 0 &&
+            restartRequests == 0, "terminal activation failure must not retry or request restart");
+
+        QuicktestActivationController queued = new(true, () => true, () => { }, () => 0, 1000);
+        Assert(queued.Tick(true) == QuicktestActivationResult.Requested && queued.ActivationRequested,
+            "a queued adapter request must be marked consumed");
+        queued.ReportActivationFailure(new InvalidOperationException("simulated deferred callback failure"));
+        Assert(queued.TerminalFailure && !queued.Pending && !queued.ActivationRequested,
+            "deferred queue failure must become terminal and clear the consumed request");
+    }
+
+    private static void TestQuicktestCallbackBurst()
+    {
+        long elapsedMilliseconds = 0;
+        bool mainMenuReady = false;
+        int activationCalls = 0;
+        QuicktestActivationController controller = new(true, () => mainMenuReady, () => activationCalls++,
+            () => elapsedMilliseconds, 1000);
+
+        for (int index = 0; index < 1000; index++)
+            Assert(controller.Tick(true) == QuicktestActivationResult.WaitingForMainMenu,
+                "callback frequency must not consume an elapsed-time activation window");
+
+        Assert(controller.Pending && !controller.TerminalFailure && activationCalls == 0,
+            "a same-instant callback burst must leave Quicktest pending");
+        mainMenuReady = true;
+        Assert(controller.Tick(true) == QuicktestActivationResult.Requested && activationCalls == 1,
+            "Quicktest must still activate when the menu becomes ready after a callback burst");
+    }
+
+    private static void TestQuicktestReadinessExpiry()
+    {
+        int fakeLaunches = 0;
+        int restartRequests = 0;
+        long elapsedMilliseconds = 0;
+        QuicktestActivationController controller = new(true, () => false, () => fakeLaunches++,
+            () => elapsedMilliseconds, 1000);
+
+        Assert(controller.Tick(true) == QuicktestActivationResult.WaitingForMainMenu,
+            "first invalid-readiness tick must remain bounded and pending");
+        elapsedMilliseconds = 999;
+        Assert(controller.Tick(true) == QuicktestActivationResult.WaitingForMainMenu && controller.Pending,
+            "readiness must remain pending before the elapsed-time deadline");
+        elapsedMilliseconds = 1000;
+        Assert(controller.Tick(true) == QuicktestActivationResult.Failed && controller.TerminalFailure &&
+            !controller.Pending && fakeLaunches == 0 && restartRequests == 0,
+            "readiness expiry must become terminal with zero launches and restart requests");
+    }
+
+    private static void TestQuicktestStructuralBoundary()
+    {
+        string mod = ReadWorkspaceFile(Path.Combine("Source", "Mod", "DevBridge2Mod.cs"));
+        string adapter = ReadWorkspaceFile(Path.Combine("Source", "Mod", "DevBridgeQuicktestMenuAdapter.cs"));
+
+        Assert(!mod.Contains("Root_Play.SetupForQuickTestPlay", StringComparison.Ordinal) &&
+            !mod.Contains("PageUtility.InitGameStart", StringComparison.Ordinal),
+            "DevBridge2Mod request handler must not directly reference the leaf or setup method");
+        Assert(adapter.Contains("LongEventHandler.QueueLongEvent", StringComparison.Ordinal) &&
+            adapter.Contains("\"GeneratingMap\"", StringComparison.Ordinal) &&
+            adapter.Contains("GameAndMapInitExceptionHandlers.ErrorWhileGeneratingMap", StringComparison.Ordinal),
+            "the adapter must retain the built-in queued long-event boundary");
+
+        int setup = adapter.IndexOf("Root_Play.SetupForQuickTestPlay", StringComparison.Ordinal);
+        int init = adapter.IndexOf("PageUtility.InitGameStart", StringComparison.Ordinal);
+        Assert(setup >= 0 && init > setup, "the adapter must preserve SetupForQuickTestPlay before InitGameStart");
+        foreach (string predicate in new[]
+        {
+            "UnityData.IsInMainThread", "GenScene.InEntryScene", "Current.ProgramState",
+            "Current.Root", "Current.Root_Entry", "Find.UIRoot", "Find.WindowStack",
+            "Current.Game", "WorldRendererUtility.WorldSelected", "Prefs.DevMode",
+            "LongEventHandler.AnyEventNowOrWaiting", "LongEventHandler.ShouldWaitForEvent"
+        })
+        {
+            Assert(adapter.Contains(predicate, StringComparison.Ordinal),
+                "verified main-menu lifecycle predicate is missing: " + predicate);
+        }
+
+        Assert(mod.Contains("DevBridgeQuicktestActivationDriver", StringComparison.Ordinal) &&
+            mod.Contains("private void Update()", StringComparison.Ordinal) &&
+            mod.Contains("DevBridgeQuicktestActivation.Tick()", StringComparison.Ordinal),
+            "Quicktest readiness must be driven by a persistent per-frame UI component");
+        Assert(!mod.Contains("ExecuteWhenFinished(TryActivate)", StringComparison.Ordinal),
+            "Quicktest readiness must not retry through long-event completion callbacks");
+        Assert(!adapter.Contains("WindowLayer.Dialog", StringComparison.Ordinal) &&
+            !adapter.Contains("UIMenuBackgroundManager.background", StringComparison.Ordinal),
+            "initialized entry lifecycle must not be rejected by visual menu overlays");
+    }
+
+    private static void TestQuicktestNoFallback()
+    {
+        string mod = ReadWorkspaceFile(Path.Combine("Source", "Mod", "DevBridge2Mod.cs"));
+        string adapter = ReadWorkspaceFile(Path.Combine("Source", "Mod", "DevBridgeQuicktestMenuAdapter.cs"));
+        string quicktestSource = mod + Environment.NewLine + adapter;
+        foreach (string forbidden in new[]
+        {
+            "GetCommandLineArgs", "--quicktest", "Input.GetMouseButton", "Event.current",
+            "SaveGame", ".rws", "Process.Start", "MapGenerator", "MousePosition"
+        })
+        {
+            Assert(!quicktestSource.Contains(forbidden, StringComparison.Ordinal),
+                "Quicktest path must not contain fallback mechanism: " + forbidden);
+        }
+    }
+
+    private static void TestDoctorRecoversInspectionQuarantine()
+    {
+        using Fixture fixture = new(new PersistedState
+        {
+            Generation = 193,
+            Phase = BridgePhase.ERROR,
+            Error = ProcessInspection.Message,
+            ErrorCode = ProcessInspection.ErrorCode,
+            LaunchId = "stale-launch",
+            LaunchGeneration = 194,
+            TargetGeneration = 194,
+            ProcessId = 26844,
+            ProcessStartUtcTicks = 639221499641606101,
+            LaunchStartedUtc = ClockStart,
+            RequiresNewProcess = true
+        });
+
+        BridgeRequest doctorRequest = Request("doctor");
+        List<string> output = new();
+        int doctorExit = fixture.State.Execute(doctorRequest, output.Add, () => true);
+        JsonCommandResponse recovered = fixture.State.CreateJsonResponse(doctorRequest, doctorExit, output);
+
+        Assert(doctorExit == 0 && recovered.State == "STOPPED" && recovered.ErrorCode == null,
+            "a complete zero-process census must recover the stale inspection quarantine to STOPPED");
+        Assert(recovered.RimWorldPid == 0 && recovered.RimWorldProcessStartIdentity == 0 &&
+            recovered.RequiresNewProcess && !recovered.RestartPending,
+            "recovery must clear the stale process identity and require a new explicit launch");
+        Assert(fixture.Adapter.EnumerationCalls == 1 && fixture.Adapter.TerminationRequests == 0 &&
+            fixture.Adapter.LaunchCalls == 0,
+            "doctor recovery must use one census and make zero termination or launch calls");
+        Assert(output.Any(value => value.Contains("zero-process census", StringComparison.Ordinal)) &&
+            output.Any(value => value.Contains("DevBridge.cmd restart", StringComparison.Ordinal)),
+            "doctor must report the recovery and direct the operator to an explicit restart");
+
+        fixture.State = fixture.Reload();
+        JsonCommandResponse persisted = fixture.State.CreateJsonResponse(Request("status"), 0, Array.Empty<string>());
+        Assert(persisted.State == "STOPPED" && persisted.RimWorldPid == 0 && persisted.ErrorCode == null,
+            "the recovered stopped state must be durable");
+
+        fixture.Adapter.ReadyOnLaunch = true;
+        List<string> restartOutput = new();
+        int restartExit = fixture.State.Execute(Request("restart"), restartOutput.Add, () => true);
+        Assert(restartExit == 0 && fixture.Adapter.LaunchCalls == 1,
+            "only the later explicit restart may launch the replacement generation (exit " + restartExit +
+            ", launches " + fixture.Adapter.LaunchCalls + ", output: " + string.Join(" | ", restartOutput) + ")");
+    }
+
+    private static void TestDoctorRecoveryFailsClosed()
+    {
+        using (Fixture incomplete = new(new PersistedState
+        {
+            Generation = 1,
+            Phase = BridgePhase.ERROR,
+            Error = ProcessInspection.Message,
+            ErrorCode = ProcessInspection.ErrorCode,
+            ProcessId = 101,
+            ProcessStartUtcTicks = 1001,
+            RequiresNewProcess = true
+        }))
+        {
+            incomplete.Adapter.EnumerationIncomplete = true;
+            int exitCode = incomplete.State.Execute(Request("doctor"), _ => { }, () => true);
+            JsonCommandResponse response = incomplete.State.CreateJsonResponse(Request("status"), exitCode,
+                Array.Empty<string>());
+            Assert(response.State == "ERROR" && response.ErrorCode == ProcessInspection.ErrorCode &&
+                response.RimWorldPid == 101,
+                "an incomplete census must preserve the quarantine and stale identity for diagnosis");
+            Assert(incomplete.Adapter.TerminationRequests == 0 && incomplete.Adapter.LaunchCalls == 0,
+                "an incomplete census must make zero process-control calls");
+        }
+
+        using (Fixture present = new(new PersistedState
+        {
+            Generation = 1,
+            Phase = BridgePhase.ERROR,
+            Error = ProcessInspection.Message,
+            ErrorCode = ProcessInspection.ErrorCode,
+            ProcessId = 101,
+            ProcessStartUtcTicks = 1001,
+            RequiresNewProcess = true
+        }))
+        {
+            present.Adapter.Add(new FakeProcess(999, 9999, present.RimWorldPath));
+            int exitCode = present.State.Execute(Request("doctor"), _ => { }, () => true);
+            JsonCommandResponse response = present.State.CreateJsonResponse(Request("status"), exitCode,
+                Array.Empty<string>());
+            Assert(response.State == "ERROR" && response.ErrorCode == ProcessInspection.ErrorCode,
+                "a matching RimWorld process must preserve the inspection quarantine");
+            Assert(present.Adapter.TerminationRequests == 0 && present.Adapter.LaunchCalls == 0,
+                "doctor must never control or launch a process while deciding recovery");
+        }
+    }
+
+    private static string ReadWorkspaceFile(string relativePath)
+    {
+        DirectoryInfo directory = new(Environment.CurrentDirectory);
+        while (directory != null)
+        {
+            string candidate = Path.Combine(directory.FullName, relativePath);
+            if (File.Exists(candidate))
+                return File.ReadAllText(candidate);
+            directory = directory.Parent;
+        }
+
+        throw new InvalidOperationException("workspace file not found: " + relativePath);
+    }
+
+    private static void AssertThrows<T>(Action action, string message) where T : Exception
+    {
+        try
+        {
+            action();
+        }
+        catch (T)
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(message);
+    }
+
+    private static void TestCoordinatorRootArgumentForms()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "DevBridge2-argument-" + Guid.NewGuid().ToString("N"));
+        ParsedArguments separated = ParsedArguments.Parse(new[] { "--coordinator-root", root, "--json", "status" });
+        ParsedArguments equals = ParsedArguments.Parse(new[] { "--coordinator-root=" + root, "--json", "status" });
+        Assert(separated.Command.SequenceEqual(new[] { "--json", "status" }) &&
+            equals.Command.SequenceEqual(new[] { "--json", "status" }),
+            "both coordinator-root forms must preserve command forwarding");
+    }
+
     private static BridgeRequest Request(string command, string agent = "agent", int pid = 1, params string[] arguments)
     {
         return new BridgeRequest
@@ -373,12 +1037,16 @@ internal static class OfflineTests
         internal readonly FakeProcessAdapter Adapter;
         internal CoordinatorState State;
 
-        private Fixture(PersistedState initial)
+        internal Fixture(PersistedState initial)
         {
             Root = Path.Combine(Path.GetTempPath(), "DevBridge2-offline-" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(Path.Combine(Root, "Runtime"));
+            Directory.CreateDirectory(Path.Combine(Root, "About"));
+            Directory.CreateDirectory(Path.Combine(Root, "1.6", "Assemblies"));
             RimWorldPath = Path.Combine(Root, "RimWorldWin64.exe");
             File.WriteAllText(RimWorldPath, "offline-test-executable");
+            File.WriteAllText(Path.Combine(Root, "About", "About.xml"), "<ModMetaData />");
+            File.WriteAllText(Path.Combine(Root, "1.6", "Assemblies", "DevBridge2.dll"), "offline-test-assembly");
             File.WriteAllText(Path.Combine(Root, "ModsConfig.xml"), "<activeMods><li>lan.devbridge2</li></activeMods>");
             Clock = new FakeClock(ClockStart);
             Adapter = new FakeProcessAdapter(RimWorldPath, Root, Clock);

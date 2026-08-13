@@ -1,5 +1,36 @@
 # Dev Bridge release notes
 
+## Unreleased
+
+- Adds strictly opt-in mod profiles with `restart --projects none|alias[,alias...]` and the
+  `mods status`, `mods capture-baseline`, and `mods restore-baseline` commands.
+- Captures a durable byte-for-byte user ModsConfig baseline, tracks generated ownership and hashes,
+  writes profiles atomically only after lease/process draining, and refuses unexpected external edits.
+- Resolves installed mod metadata case-insensitively through arbitrary dependency depth, honors
+  dependency and load-order constraints, deduplicates shared dependencies, detects cycles, and never
+  injects `ferny.loadthemlast`.
+- Persists immutable accepted profile roots, ordered package IDs, and deterministic fingerprints, and
+  exposes the profile contract through status JSON. Existing unprofiled launches retain their behavior.
+
+## 1.2.4
+
+- Replaces the long stale-lease window with an approximately two-minute renewable lease.
+- Adds connected `DevBridge.cmd test session` heartbeats over the existing named pipe; the coordinator
+  stops renewing when that owner disconnects, is cancelled, or crashes, with no detached heartbeat process.
+- Keeps accepted restarts durably queued and reports `lastHeartbeatUtc`, `expiresUtc`, and numeric
+  `retryAfterSeconds` in machine-readable diagnostics, including the next blocking lease expiration.
+- Requires both lease ID and stable agent identity for `test renew` and `test end`.
+- Documents that waiting is normal and agents should reconnect with `wait-ready` rather than end their task.
+
+## 1.2.3
+
+- Reclaims test leases after a bounded period without a heartbeat, preventing a timed-out runtime-test wrapper
+  from blocking every later restart.
+- Adds `DevBridge.cmd test renew <lease-id>` for long-running test and maintenance workflows.
+- Keeps status, doctor, wait-ready, and lease cleanup responsive while a restart waits on active tests.
+- Authorizes later lease-management CLI calls by lease ID and stable agent identity instead of the
+  short-lived client process ID.
+
 ## 1.2.2
 
 - Keeps lease-blocked restarts durably queued instead of converting normal contention into a

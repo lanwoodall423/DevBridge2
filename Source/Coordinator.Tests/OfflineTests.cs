@@ -1,4 +1,7 @@
+using System.Collections.Concurrent;
+using System.Text;
 using System.Text.Json;
+using System.Xml.Linq;
 using DevBridge2;
 
 namespace DevBridge.Coordinator;
@@ -30,8 +33,12 @@ internal static class OfflineTests
         Run("fifty duplicate restart requests have one launch", TestDuplicateRestartOwnership);
         Run("competing restart owners cannot overwrite provenance", TestCompetingRestartOwners);
         Run("lease-blocked restart waits durably and resumes", TestDurableLeaseWait);
-        Run("lease heartbeats extend long-running tests", TestLeaseHeartbeat);
+        Run("connected lease sessions heartbeat active tests", TestConnectedLeaseSession);
+        Run("stopped lease sessions expire without an orphan heartbeat", TestStoppedLeaseSessionExpires);
+        Run("lease heartbeats and stable-agent authorization", TestLeaseHeartbeatAndAuthorization);
         Run("orphaned leases expire without blocking a restart", TestOrphanLeaseExpiry);
+        Run("shared leases block restart until the final lease ends", TestMultipleSharedLeases);
+        Run("lease JSON reports exact expiration and retry timing", TestLeaseJsonTiming);
         Run("missing process relaunches despite an active lease", TestMissingProcessRelaunchWithLease);
         Run("legacy lease-wait expiry recovers automatically", TestLegacyLeaseWaitRecovery);
         Run("recovery launch budget is finite", TestFiniteRecovery);
@@ -52,6 +59,17 @@ internal static class OfflineTests
         Run("quicktest source boundary and lifecycle predicates are structural", TestQuicktestStructuralBoundary);
         Run("quicktest path has no fallback activation mechanism", TestQuicktestNoFallback);
         Run("coordinator-root argument forms are accepted", TestCoordinatorRootArgumentForms);
+        Run("unprofiled launch preserves the existing mod list", TestUnprofiledLaunchPreservesMods);
+        Run("baseline profile excludes managed projects and load-them-last", TestBaselineProfile);
+        Run("profile dependency closure is ordered, deduplicated, and case-insensitive", TestProfileDependencyClosure);
+        Run("profile config write waits for leases and process shutdown", TestProfileWriteWaitsForDrain);
+        Run("profile writes fail closed on config and process races", TestProfileWritePreconditions);
+        Run("generated config ownership survives lost state", TestGeneratedOwnershipSurvivesLostState);
+        Run("invalid profiles fail before mutation or launch", TestInvalidProfilesFailClosed);
+        Run("accepted profile survives coordinator recovery and conflicts", TestProfileRecoveryAndConflict);
+        Run("recovery launches the frozen accepted profile without re-resolving metadata", TestFrozenProfileRecovery);
+        Run("corrupt persisted profiles quarantine recovery", TestCorruptPersistedProfileQuarantine);
+        Run("baseline restore is byte-for-byte and rejects external edits", TestBaselineRestoreSafety);
         Run("wrapper propagates native exit codes", DevBridgeWrapperTests.Run);
 
         Console.WriteLine(failures == 0 ? "OFFLINE TESTS PASS" : "OFFLINE TESTS FAIL: " + failures);
@@ -435,9 +453,9 @@ internal static class OfflineTests
         bool statusCompleted = status.Wait(TimeSpan.FromSeconds(2));
         Task<int> doctor = Task.Run(() => fixture.State.Execute(Request("doctor", "diagnostic", 91), _ => { }, () => true));
         bool doctorCompleted = doctor.Wait(TimeSpan.FromSeconds(2));
-        List<string> waitReadyOutput = new();
+        ConcurrentQueue<string> waitReadyOutput = new();
         Task<int> waitReady = Task.Run(() => fixture.State.Execute(
-            Request("wait-ready", "diagnostic", 91), waitReadyOutput.Add, () => true));
+            Request("wait-ready", "diagnostic", 91), waitReadyOutput.Enqueue, () => true));
         bool waitReadyStarted = SpinWait.SpinUntil(
             () => waitReadyOutput.Any(value => value.StartsWith("Waiting for RimWorld generation", StringComparison.Ordinal)),
             TimeSpan.FromSeconds(2));
@@ -448,6 +466,12 @@ internal static class OfflineTests
         Assert(waiting.State == "WAITING_FOR_BRIDGE" && waiting.RestartPending &&
             waiting.ErrorCode == null && fixture.Adapter.LaunchCalls == 0,
             "lease wait must not become a terminal timeout");
+        Assert(waiting.RestartQueued, "waiting JSON must identify the queued restart");
+        Assert(waiting.NextLeaseExpirationUtc == ClockStart.AddMinutes(2), "waiting JSON must identify the next lease expiration");
+        Assert(waiting.RetryAfterSeconds == 60, "waiting JSON must identify the numeric retry timing");
+        Assert(waiting.NextAction.Contains("queued", StringComparison.OrdinalIgnoreCase) &&
+            waiting.NextAction.Contains("expire", StringComparison.OrdinalIgnoreCase),
+            "waiting JSON next action must explain queued ownership and expiration");
 
         Assert(fixture.State.Execute(Request("test", "holder", 77, "end", "T001"), _ => { }, () => true) == 0,
             "lease holder must be able to release the queued restart");
@@ -459,25 +483,57 @@ internal static class OfflineTests
             "wait-ready must complete after the queued restart becomes ready");
     }
 
-    private static void TestLeaseHeartbeat()
+    private static void TestConnectedLeaseSession()
     {
-        using Fixture fixture = Fixture.ReadyWithLease();
-        fixture.Clock.Advance(TimeSpan.FromMinutes(19));
-        int wrongAgent = fixture.State.Execute(Request("test", "other", 78, "renew", "T001"), _ => { }, () => true);
-        Assert(wrongAgent != 0, "another agent must not renew a test lease");
+        using Fixture fixture = Fixture.ReadyWithoutLease();
+        List<string> output = new();
+        DateTime ownerStopsUtc = ClockStart.AddMinutes(5);
+        int result = fixture.State.Execute(Request("test", "session-owner", 501, "session"), output.Add,
+            () => fixture.Clock.UtcNow < ownerStopsUtc);
 
-        int renewed = fixture.State.Execute(Request("test", "holder", 78, "renew", "T001"), _ => { }, () => true);
-        Assert(renewed == 0, "an active lease must be renewable");
+        Assert(result == 0, "a connected lease session must end cleanly when its owner disconnects");
+        Assert(output.Any(line => line.StartsWith("Test lease heartbeat:", StringComparison.Ordinal)),
+            "a connected lease session must emit regular heartbeat progress");
 
-        fixture.Clock.Advance(TimeSpan.FromMinutes(19));
-        fixture.State.Execute(Request("status"), _ => { }, () => true);
         JsonCommandResponse active = fixture.State.CreateJsonResponse(Request("status"), 0, Array.Empty<string>());
-        Assert(active.ActiveTests == 1, "a renewed lease must survive the original stale interval");
+        Assert(active.ActiveTests == 1, "regular session heartbeats must keep a long-running test alive");
+        Assert(active.Leases[0].LastHeartbeatUtc == ClockStart.AddMinutes(4).AddSeconds(30),
+            "the connected session must heartbeat on the configured cadence");
+    }
+
+    private static void TestStoppedLeaseSessionExpires()
+    {
+        using Fixture fixture = Fixture.ReadyWithoutLease();
+        DateTime ownerStopsUtc = ClockStart.AddSeconds(45);
+        int result = fixture.State.Execute(Request("test", "crashed-owner", 502, "session"), _ => { },
+            () => fixture.Clock.UtcNow < ownerStopsUtc);
+        Assert(result == 0, "a crashed or cancelled session must stop without a terminal coordinator error");
 
         fixture.Clock.Advance(TimeSpan.FromMinutes(2));
-        fixture.State.Execute(Request("status"), _ => { }, () => true);
         JsonCommandResponse expired = fixture.State.CreateJsonResponse(Request("status"), 0, Array.Empty<string>());
-        Assert(expired.ActiveTests == 0, "a lease with no heartbeat must eventually expire");
+        Assert(expired.ActiveTests == 0,
+            "once the session owner stops, the lease must expire within the bounded interval");
+    }
+
+    private static void TestLeaseHeartbeatAndAuthorization()
+    {
+        using Fixture fixture = Fixture.ReadyWithLease();
+        fixture.Clock.Advance(TimeSpan.FromSeconds(90));
+        int wrongAgentRenew = fixture.State.Execute(Request("test", "other", 78, "renew", "T001"), _ => { }, () => true);
+        int wrongAgentEnd = fixture.State.Execute(Request("test", "other", 78, "end", "T001"), _ => { }, () => true);
+        Assert(wrongAgentRenew != 0, "another agent must not renew a test lease");
+        Assert(wrongAgentEnd != 0, "another agent must not end a test lease");
+
+        int renewed = fixture.State.Execute(Request("test", "holder", 78, "renew", "T001"), _ => { }, () => true);
+        Assert(renewed == 0, "an active lease must be renewable by its stable agent identity");
+
+        fixture.Clock.Advance(TimeSpan.FromSeconds(119));
+        JsonCommandResponse active = fixture.State.CreateJsonResponse(Request("status"), 0, Array.Empty<string>());
+        Assert(active.ActiveTests == 1, "a renewed lease must survive its previous expiration time");
+
+        fixture.Clock.Advance(TimeSpan.FromSeconds(2));
+        JsonCommandResponse expired = fixture.State.CreateJsonResponse(Request("status"), 0, Array.Empty<string>());
+        Assert(expired.ActiveTests == 0, "a lease with no further heartbeat must eventually expire");
     }
 
     private static void TestOrphanLeaseExpiry()
@@ -490,13 +546,59 @@ internal static class OfflineTests
         Assert(SpinWait.SpinUntil(() => fixture.State.CreateJsonResponse(Request("status"), 0,
                 Array.Empty<string>()).State == "WAITING_FOR_BRIDGE", TimeSpan.FromSeconds(2)),
             "restart must wait on the initial orphaned lease");
-        fixture.Clock.Advance(TimeSpan.FromMinutes(21));
+        fixture.Clock.Advance(TimeSpan.FromSeconds(119));
+        JsonCommandResponse stillBlocked = fixture.State.CreateJsonResponse(Request("status"), 0, Array.Empty<string>());
+        Assert(stillBlocked.State == "WAITING_FOR_BRIDGE" && stillBlocked.ActiveTests == 1 &&
+            fixture.Adapter.LaunchCalls == 0, "an unexpired lease must still block the owned process restart");
+        fixture.Clock.Advance(TimeSpan.FromSeconds(1));
 
         Assert(restart.Wait(TimeSpan.FromSeconds(2)) && restart.Result == 0 && fixture.Adapter.LaunchCalls == 1,
-            "an abandoned lease must not block a replacement launch indefinitely");
+            "an abandoned lease must release the queued restart within the bounded interval");
         JsonCommandResponse response = fixture.State.CreateJsonResponse(Request("status"), 0, Array.Empty<string>());
         Assert(response.State == "READY" && response.ActiveTests == 0,
             "the expired orphan lease must be removed before the replacement is ready");
+    }
+
+    private static void TestMultipleSharedLeases()
+    {
+        using Fixture fixture = Fixture.ReadyWithLeases();
+        fixture.Adapter.ReadyOnLaunch = true;
+        Task<int> restart = Task.Run(() => fixture.State.Execute(
+            Request("restart", "restart-agent", 90), _ => { }, () => true));
+
+        Assert(SpinWait.SpinUntil(() => fixture.State.CreateJsonResponse(Request("status"), 0,
+                Array.Empty<string>()).State == "WAITING_FOR_BRIDGE", TimeSpan.FromSeconds(2)),
+            "shared leases must block restart while the owned process is running");
+        fixture.State.Execute(Request("test", "holder-a", 77, "end", "T001"), _ => { }, () => true);
+        fixture.Clock.Advance(TimeSpan.FromMinutes(1));
+        Assert(fixture.Adapter.LaunchCalls == 0,
+            "ending one shared lease must not release a restart blocked by another lease");
+
+        fixture.Clock.Advance(TimeSpan.FromMinutes(1));
+        Assert(restart.Wait(TimeSpan.FromSeconds(2)) && restart.Result == 0 && fixture.Adapter.LaunchCalls == 1,
+            "the queued restart must resume once after the final shared lease expires");
+        Assert(fixture.State.Execute(Request("status"), _ => { }, () => true) == 0,
+            "status must remain responsive while shared lease contention drains");
+    }
+
+    private static void TestLeaseJsonTiming()
+    {
+        using Fixture fixture = Fixture.ReadyWithLease();
+        JsonCommandResponse initial = fixture.State.CreateJsonResponse(Request("status"), 0, Array.Empty<string>());
+        JsonLeaseInfo lease = initial.Leases.Single();
+        DateTime expectedExpiry = ClockStart.AddMinutes(2);
+        Assert(lease.LastHeartbeatUtc == ClockStart && lease.ExpiresUtc == expectedExpiry &&
+            lease.RetryAfterSeconds == 120, "lease JSON must expose exact fake-clock heartbeat and retry timing");
+        Assert(initial.NextLeaseExpirationUtc == expectedExpiry && initial.RetryAfterSeconds == 120,
+            "top-level JSON must expose exact next lease expiration and retry timing");
+        string serialized = JsonSerializer.Serialize(initial, Program.JsonOptions);
+        Assert(!serialized.Contains("staleIn", StringComparison.Ordinal),
+            "machine-readable lease JSON must not require parsing the staleIn display string");
+
+        fixture.Clock.Advance(TimeSpan.FromSeconds(31));
+        JsonCommandResponse later = fixture.State.CreateJsonResponse(Request("status"), 0, Array.Empty<string>());
+        Assert(later.Leases.Single().RetryAfterSeconds == 89,
+            "lease retry timing must remain numeric and exact after fake-clock advancement");
     }
 
     private static void TestMissingProcessRelaunchWithLease()
@@ -1074,6 +1176,428 @@ internal static class OfflineTests
             "both coordinator-root forms must preserve command forwarding");
     }
 
+    private static void TestUnprofiledLaunchPreservesMods()
+    {
+        using Fixture fixture = new(new PersistedState { Generation = 0, Phase = BridgePhase.STOPPED });
+        string original = "<ModsConfigData>\r\n  <activeMods>\r\n    <li>lan.devbridge2</li>\r\n    <li>user.custom.mod</li>\r\n  </activeMods>\r\n  <customSetting>keep-me</customSetting>\r\n</ModsConfigData>";
+        File.WriteAllText(Path.Combine(fixture.Root, "ModsConfig.xml"), original, new UTF8Encoding(false));
+        fixture.Adapter.ReadyOnLaunch = true;
+        int exitCode = fixture.State.Execute(Request("restart", "agent", 1), _ => { }, () => true);
+        Assert(exitCode == 0, "unprofiled restart must still launch successfully");
+        Assert(File.ReadAllText(Path.Combine(fixture.Root, "ModsConfig.xml")) == original,
+            "restart without --projects must not rewrite the user mod list");
+        Assert(fixture.State.CreateJsonResponse(Request("status"), 0, Array.Empty<string>()).ProfileMode == "legacy",
+            "unprofiled launch must remain in legacy profile mode");
+    }
+
+    private static void TestBaselineProfile()
+    {
+        using ProfileSetup setup = ProfileSetup.Create();
+        Assert(setup.CaptureBaseline(), "baseline capture must succeed");
+        setup.Fixture.Adapter.ReadyOnLaunch = true;
+        int exitCode = setup.Fixture.State.Execute(
+            Request("restart", "agent", 1, "--projects", "none"), _ => { }, () => true);
+        Assert(exitCode == 0, "baseline profile restart must succeed");
+        List<string> active = ActiveMods(setup.Fixture.Root);
+        Assert(active.SequenceEqual(ModProfileResolver.AlwaysOnPackageIds, StringComparer.OrdinalIgnoreCase),
+            "baseline profile must contain exactly the always-on mods in stable order");
+        Assert(!active.Any(value => value.Contains("loadthemlast", StringComparison.OrdinalIgnoreCase)),
+            "baseline profile must never inject Load Them Last");
+        JsonCommandResponse response = setup.Fixture.State.CreateJsonResponse(
+            Request("mods", "agent", 1, "status"), 0, Array.Empty<string>());
+        Assert(response.ProfileMode == ModProfile.BaselineMode && response.RequestedProjects.Count == 0,
+            "JSON must report the explicit baseline profile");
+        Assert(response.ResolvedMods.SequenceEqual(active, StringComparer.OrdinalIgnoreCase) &&
+               !string.IsNullOrWhiteSpace(response.ProfileFingerprint) &&
+               !string.IsNullOrWhiteSpace(response.BaselineFingerprint),
+            "JSON must report the exact resolved baseline profile and fingerprints");
+    }
+
+    private static void TestProfileDependencyClosure()
+    {
+        using ProfileSetup setup = ProfileSetup.Create();
+        Assert(setup.CaptureBaseline(), "baseline capture must succeed");
+        setup.Fixture.Adapter.ReadyOnLaunch = true;
+        int exitCode = setup.Fixture.State.Execute(
+            Request("restart", "agent", 1, "--projects", "horticulture,aquaculture"), _ => { }, () => true);
+        Assert(exitCode == 0, "project profile restart must succeed");
+        List<string> active = ActiveMods(setup.Fixture.Root);
+        List<string> lower = active.Select(value => value.ToLowerInvariant()).ToList();
+        string[] expected =
+        {
+            "oskarpotocki.vanillafactionsexpanded.core",
+            "vanillaexpanded.vcef",
+            "ferny.replacelib",
+            "ferny.progressionagriculture",
+            "lan.aquaculture.fishing",
+            "lan.horticulture.novelseeds"
+        };
+        foreach (string packageId in expected)
+            Assert(lower.Contains(packageId), "dependency closure is missing " + packageId);
+        Assert(lower.Distinct(StringComparer.OrdinalIgnoreCase).Count() == lower.Count,
+            "shared dependencies must be deduplicated");
+        Assert(IndexOf(lower, "oskarpotocki.vanillafactionsexpanded.core") < IndexOf(lower, "vanillaexpanded.vcef") &&
+               IndexOf(lower, "vanillaexpanded.vcef") < IndexOf(lower, "ferny.replacelib") &&
+               IndexOf(lower, "ferny.replacelib") < IndexOf(lower, "ferny.progressionagriculture"),
+            "dependencies must precede their dependents");
+        Assert(IndexOf(lower, "lan.aquaculture.fishing") < IndexOf(lower, "lan.horticulture.novelseeds"),
+            "loadBefore/loadAfter constraints must be honored");
+        Assert(!lower.Contains(ModProfileResolver.ForbiddenPackageId),
+            "Load Them Last must never be included");
+        JsonCommandResponse response = setup.Fixture.State.CreateJsonResponse(
+            Request("mods", "agent", 1, "status"), 0, Array.Empty<string>());
+        Assert(response.ProfileMode == ModProfile.ProjectsMode &&
+               response.RequestedProjects.SequenceEqual(new[] { "aquaculture", "horticulture" }),
+            "JSON must report canonical requested project aliases");
+        Assert(response.ResolvedProjectPackageIds.Count == 2 && response.ResolvedMods.Count == active.Count,
+            "JSON must expose both resolved roots and the complete ordered profile");
+
+        ModProfile first = ModProfileResolver.Resolve(setup.Fixture.Root, response.BaselineFingerprint,
+            new[] { "HORTICULTURE", "aquaculture" }, setup.Fixture.InstalledModsRoots);
+        ModProfile second = ModProfileResolver.Resolve(setup.Fixture.Root, response.BaselineFingerprint,
+            new[] { "aquaculture", "horticulture" }, setup.Fixture.InstalledModsRoots);
+        Assert(first.ProfileFingerprint == second.ProfileFingerprint &&
+               first.ResolvedMods.SequenceEqual(second.ResolvedMods, StringComparer.OrdinalIgnoreCase),
+            "equivalent alias casing/order must produce one deterministic profile fingerprint and order");
+    }
+
+    private static void TestProfileWriteWaitsForDrain()
+    {
+        using ProfileSetup setup = ProfileSetup.Create();
+        Assert(setup.CaptureBaseline(), "baseline capture must succeed");
+        byte[] baseline = File.ReadAllBytes(Path.Combine(setup.Fixture.Root, "ModsConfig.xml"));
+        PersistedState initial = JsonSerializer.Deserialize<PersistedState>(
+            File.ReadAllText(Path.Combine(setup.Fixture.Root, "Runtime", "state.json")), Program.JsonOptions);
+        initial.Generation = 1;
+        initial.Phase = BridgePhase.READY;
+        initial.LaunchId = "launch-ready";
+        initial.LaunchGeneration = 1;
+        initial.ProcessId = 101;
+        initial.ProcessStartUtcTicks = 1001;
+        initial.LaunchStartedUtc = ClockStart;
+        initial.Leases = new List<TestLease> { setup.Fixture.Lease("T001", "holder", 77, ClockStart) };
+        setup.Fixture.WriteState(initial);
+        FakeProcess oldProcess = new(101, 1001, setup.Fixture.RimWorldPath);
+        setup.Fixture.Adapter.Add(oldProcess);
+        setup.Fixture.State = setup.Fixture.Reload();
+        setup.Fixture.Adapter.ReadyOnLaunch = true;
+
+        Task<int> restart = Task.Run(() => setup.Fixture.State.Execute(
+            Request("restart", "agent", 1, "--projects", "horticulture"), _ => { }, () => true));
+        Assert(SpinWait.SpinUntil(() =>
+        {
+            JsonCommandResponse status = setup.Fixture.State.CreateJsonResponse(
+                Request("status"), 0, Array.Empty<string>());
+            return status.RestartPending && setup.Fixture.Adapter.LaunchCalls == 0;
+        }, TimeSpan.FromSeconds(2)), "profile restart must wait while the lease is active");
+        Assert(File.ReadAllBytes(Path.Combine(setup.Fixture.Root, "ModsConfig.xml")).SequenceEqual(baseline) &&
+               !oldProcess.HasExited,
+            "profile config must not change while the old process and blocking lease remain");
+
+        Assert(setup.Fixture.State.Execute(Request("test", "holder", 77, "end", "T001"), _ => { }, () => true) == 0,
+            "lease holder must be able to release the blocking lease");
+        Assert(restart.Wait(TimeSpan.FromSeconds(10)) && restart.Result == 0,
+            "profile restart must resume exactly once after the lease drains");
+        Assert(oldProcess.HasExited && setup.Fixture.Adapter.LaunchCalls == 1 &&
+               ActiveMods(setup.Fixture.Root).Contains("lan.horticulture.novelseeds", StringComparer.OrdinalIgnoreCase),
+            "profile config must be written after owned-process shutdown and before the replacement launch");
+    }
+
+    private static void TestProfileWritePreconditions()
+    {
+        using (ProfileSetup capture = ProfileSetup.Create())
+        {
+            capture.Fixture.BeforeModsConfigWrite = () => File.WriteAllText(
+                Path.Combine(capture.Fixture.Root, "ModsConfig.xml"), "<capture-race />", new UTF8Encoding(false));
+            capture.Fixture.State = capture.Fixture.Reload();
+            int exitCode = capture.Fixture.State.Execute(
+                Request("mods", "agent", 1, "capture-baseline"), _ => { }, () => true);
+            Assert(exitCode != 0 && !File.Exists(Path.Combine(capture.Fixture.Root, "Runtime", "ModsConfig.baseline.xml")) &&
+                   File.ReadAllText(Path.Combine(capture.Fixture.Root, "ModsConfig.xml")) == "<capture-race />",
+                "a concurrent edit must not be captured as the durable baseline");
+        }
+
+        using (ProfileSetup edited = ProfileSetup.Create())
+        {
+            Assert(edited.CaptureBaseline(), "external-edit race: baseline capture must succeed");
+            edited.Fixture.Adapter.ReadyOnLaunch = true;
+            edited.Fixture.BeforeModsConfigWrite = () => File.WriteAllText(
+                Path.Combine(edited.Fixture.Root, "ModsConfig.xml"), "<user-edit />", new UTF8Encoding(false));
+            edited.Fixture.State = edited.Fixture.Reload();
+            int exitCode = edited.Fixture.State.Execute(
+                Request("restart", "agent", 1, "--projects", "horticulture"), _ => { }, () => true);
+            JsonCommandResponse response = edited.Fixture.State.CreateJsonResponse(
+                Request("status"), exitCode, Array.Empty<string>());
+            Assert(exitCode != 0 && response.ErrorCode == "MODS_CONFIG_EXTERNAL_EDIT" &&
+                   edited.Fixture.Adapter.LaunchCalls == 0 && File.ReadAllText(
+                       Path.Combine(edited.Fixture.Root, "ModsConfig.xml")) == "<user-edit />",
+                "a concurrent ModsConfig edit must be detected before the profile replaces it or launches");
+        }
+
+        using (ProfileSetup process = ProfileSetup.Create())
+        {
+            Assert(process.CaptureBaseline(), "process race: baseline capture must succeed");
+            byte[] baseline = File.ReadAllBytes(Path.Combine(process.Fixture.Root, "ModsConfig.xml"));
+            process.Fixture.Adapter.ReadyOnLaunch = true;
+            process.Fixture.BeforeModsConfigWrite = () => process.Fixture.Adapter.Add(
+                new FakeProcess(999, 9999, process.Fixture.RimWorldPath));
+            process.Fixture.State = process.Fixture.Reload();
+            int exitCode = process.Fixture.State.Execute(
+                Request("restart", "agent", 1, "--projects", "horticulture"), _ => { }, () => true);
+            JsonCommandResponse response = process.Fixture.State.CreateJsonResponse(
+                Request("status"), exitCode, Array.Empty<string>());
+            Assert(exitCode != 0 && response.ErrorCode == "MODS_CONFIG_PROCESS_RUNNING" &&
+                   process.Fixture.Adapter.LaunchCalls == 0 && File.ReadAllBytes(
+                       Path.Combine(process.Fixture.Root, "ModsConfig.xml")).SequenceEqual(baseline),
+                "a process appearing before the config write must prevent both mutation and launch");
+        }
+
+        using (Fixture legacy = new(new PersistedState { Generation = 0, Phase = BridgePhase.STOPPED }))
+        {
+            File.WriteAllText(Path.Combine(legacy.Root, "ModsConfig.xml"),
+                "<ModsConfigData><activeMods><li>user.custom.mod</li></activeMods></ModsConfigData>",
+                new UTF8Encoding(false));
+            legacy.Adapter.ReadyOnLaunch = true;
+            legacy.BeforeModsConfigWrite = () => File.WriteAllText(
+                Path.Combine(legacy.Root, "ModsConfig.xml"), "<user-edit />", new UTF8Encoding(false));
+            legacy.State = legacy.Reload();
+            int exitCode = legacy.State.Execute(Request("restart", "agent", 1), _ => { }, () => true);
+            JsonCommandResponse response = legacy.State.CreateJsonResponse(
+                Request("status"), exitCode, Array.Empty<string>());
+            Assert(exitCode != 0 && response.ErrorCode == "MODS_CONFIG_EXTERNAL_EDIT" &&
+                   legacy.Adapter.LaunchCalls == 0 && File.ReadAllText(
+                       Path.Combine(legacy.Root, "ModsConfig.xml")) == "<user-edit />",
+                "legacy DevBridge activation must also reject a concurrent config edit");
+        }
+    }
+
+    private static void TestGeneratedOwnershipSurvivesLostState()
+    {
+        using ProfileSetup setup = ProfileSetup.Create();
+        Assert(setup.CaptureBaseline(), "lost-state ownership: baseline capture must succeed");
+        setup.Fixture.Adapter.ReadyOnLaunch = true;
+        Assert(setup.Fixture.State.Execute(
+            Request("restart", "agent", 1, "--projects", "horticulture"), _ => { }, () => true) == 0,
+            "lost-state ownership: reduced profile launch must succeed");
+
+        byte[] generated = File.ReadAllBytes(Path.Combine(setup.Fixture.Root, "ModsConfig.xml"));
+        setup.Fixture.Adapter.Current.ForceTerminate();
+        File.Delete(Path.Combine(setup.Fixture.Root, "Runtime", "state.json"));
+        setup.Fixture.State = setup.Fixture.Reload();
+        int exitCode = setup.Fixture.State.Execute(
+            Request("mods", "agent", 1, "capture-baseline"), _ => { }, () => true);
+        JsonCommandResponse response = setup.Fixture.State.CreateJsonResponse(
+            Request("status"), exitCode, Array.Empty<string>());
+        Assert(exitCode != 0 && response.ErrorCode == "PROFILE_BASELINE_GENERATED" &&
+               File.ReadAllBytes(Path.Combine(setup.Fixture.Root, "ModsConfig.xml")).SequenceEqual(generated) &&
+               File.Exists(Path.Combine(setup.Fixture.Root, "Runtime", "ModsConfig.generated.json")),
+            "generated reduced output must remain identifiable even when state.json is lost");
+    }
+
+    private static void TestInvalidProfilesFailClosed()
+    {
+        AssertInvalidProfile("missing dependency", setup =>
+        {
+            Directory.Delete(Path.Combine(setup.MetadataRoot, "progression"), true);
+        }, "PROFILE_MISSING_PACKAGE");
+
+        AssertInvalidProfile("ambiguous package", setup =>
+        {
+            WriteInstalledMetadata(setup.MetadataRoot, "duplicate-replacelib", "FERNY.ReplaceLib", "");
+        }, "PROFILE_AMBIGUOUS_PACKAGE");
+
+        AssertInvalidProfile("malformed dependency metadata", setup =>
+        {
+            WriteInstalledMetadata(setup.MetadataRoot, "horticulture",
+                "lan.horticulture.novelseeds", "<modDependencies>unparseable dependency text</modDependencies>");
+        }, "PROFILE_MALFORMED_METADATA");
+
+        AssertInvalidProfile("dependency cycle", setup =>
+        {
+            WriteInstalledMetadata(setup.MetadataRoot, "horticulture",
+                "lan.horticulture.novelseeds", "<modDependencies><li>ferny.progressionagriculture</li></modDependencies>");
+            WriteInstalledMetadata(setup.MetadataRoot, "progression",
+                "ferny.progressionagriculture", "<modDependencies><li>lan.horticulture.novelseeds</li></modDependencies>");
+        }, "PROFILE_DEPENDENCY_CYCLE");
+    }
+
+    private static void AssertInvalidProfile(string name, Action<ProfileSetup> mutate, string expectedCode)
+    {
+        using ProfileSetup setup = ProfileSetup.Create();
+        Assert(setup.CaptureBaseline(), name + ": baseline capture must succeed");
+        byte[] before = File.ReadAllBytes(Path.Combine(setup.Fixture.Root, "ModsConfig.xml"));
+        mutate(setup);
+        int exitCode = setup.Fixture.State.Execute(
+            Request("restart", "agent", 1, "--projects", "horticulture"), _ => { }, () => true);
+        JsonCommandResponse response = setup.Fixture.State.CreateJsonResponse(
+            Request("mods", "agent", 1, "status"), exitCode, Array.Empty<string>());
+        Assert(exitCode != 0 && response.ErrorCode == expectedCode,
+            name + " must fail with " + expectedCode + " (actual " + response.ErrorCode + ")");
+        Assert(setup.Fixture.Adapter.LaunchCalls == 0 &&
+               File.ReadAllBytes(Path.Combine(setup.Fixture.Root, "ModsConfig.xml")).SequenceEqual(before),
+            name + " must fail before launch or ModsConfig mutation");
+        Assert(!setup.Fixture.State.CreateJsonResponse(Request("status"), exitCode, Array.Empty<string>()).RestartPending,
+            name + " must not leave a pending restart");
+    }
+
+    private static void TestProfileRecoveryAndConflict()
+    {
+        using ProfileSetup setup = ProfileSetup.Create();
+        Assert(setup.CaptureBaseline(), "baseline capture must succeed");
+        setup.Fixture.Adapter.ReadyOnLaunch = true;
+        int exitCode = setup.Fixture.State.Execute(
+            Request("restart", "agent", 1, "--projects", "horticulture"), _ => { }, () => true);
+        Assert(exitCode == 0, "profile restart must complete before recovery check");
+        string fingerprint = setup.Fixture.State.CreateJsonResponse(
+            Request("mods", "agent", 1, "status"), 0, Array.Empty<string>()).ProfileFingerprint;
+        setup.Fixture.State = setup.Fixture.Reload();
+        JsonCommandResponse recovered = setup.Fixture.State.CreateJsonResponse(
+            Request("mods", "agent", 1, "status"), 0, Array.Empty<string>());
+        Assert(recovered.ProfileFingerprint == fingerprint && recovered.ResolvedMods.Count > 0,
+            "accepted profile and fingerprint must survive coordinator recovery");
+
+        // A conflicting request is rejected from the durable pending record before the
+        // lifecycle worker can acquire its process-control gate.
+        PersistedState pending = JsonSerializer.Deserialize<PersistedState>(
+            File.ReadAllText(Path.Combine(setup.Fixture.Root, "Runtime", "state.json")), Program.JsonOptions);
+        pending.RestartPending = true;
+        pending.TargetGeneration = pending.Generation + 1;
+        pending.LaunchOwner = "agent@1";
+        pending.LaunchRequestKey = "restart-" + pending.TargetGeneration;
+        pending.Phase = BridgePhase.DRAINING;
+        setup.Fixture.WriteState(pending);
+        setup.Fixture.State = setup.Fixture.Reload();
+        int conflict = setup.Fixture.State.Execute(
+            Request("restart", "agent", 1, "--projects", "aquaculture"), _ => { }, () => true);
+        JsonCommandResponse conflictResponse = setup.Fixture.State.CreateJsonResponse(
+            Request("mods", "agent", 1, "status"), conflict, Array.Empty<string>());
+        Assert(conflict != 0 && conflictResponse.ErrorCode == "PROFILE_CONFLICT",
+            "a conflicting project request must not replace a pending profile");
+        Assert(conflictResponse.ProfileFingerprint == fingerprint,
+            "the accepted pending profile fingerprint must remain unchanged after conflict");
+
+        int legacyConflict = setup.Fixture.State.Execute(
+            Request("restart", "agent", 1), _ => { }, () => true);
+        JsonCommandResponse legacyConflictResponse = setup.Fixture.State.CreateJsonResponse(
+            Request("status"), legacyConflict, Array.Empty<string>());
+        Assert(legacyConflict != 0 && legacyConflictResponse.ErrorCode == "PROFILE_CONFLICT" &&
+               legacyConflictResponse.ProfileFingerprint == fingerprint,
+            "an unprofiled restart must not be treated as a duplicate of an accepted reduced profile");
+    }
+
+    private static void TestCorruptPersistedProfileQuarantine()
+    {
+        using ProfileSetup setup = ProfileSetup.Create();
+        Assert(setup.CaptureBaseline(), "corrupt profile: baseline capture must succeed");
+        PersistedState baseline = JsonSerializer.Deserialize<PersistedState>(
+            File.ReadAllText(Path.Combine(setup.Fixture.Root, "Runtime", "state.json")), Program.JsonOptions);
+        baseline.ProfileMode = ModProfile.ProjectsMode;
+        baseline.RequestedProjects = new List<string> { "horticulture" };
+        baseline.ResolvedProjectPackageIds = new List<string> { "lan.horticulture.novelseeds" };
+        baseline.ResolvedMods = ModProfileResolver.AlwaysOnPackageIds.ToList();
+        baseline.ResolvedMods.Add("lan.horticulture.novelseeds");
+        baseline.ProfileFingerprint = "not-a-fingerprint";
+        baseline.RestartPending = true;
+        baseline.TargetGeneration = 1;
+        baseline.Phase = BridgePhase.DRAINING;
+        baseline.LaunchOwner = "agent@1";
+        baseline.LaunchRequestKey = "restart-1";
+        setup.Fixture.WriteState(baseline);
+        setup.Fixture.State = setup.Fixture.Reload();
+        setup.Fixture.State.StartRecoveryWork();
+        JsonCommandResponse response = setup.Fixture.State.CreateJsonResponse(
+            Request("status"), 0, Array.Empty<string>());
+        Assert(response.ErrorCode == "PROFILE_FINGERPRINT_MISMATCH" && !response.RestartPending &&
+               setup.Fixture.Adapter.LaunchCalls == 0,
+            "corrupt accepted profile state must quarantine recovery without silently falling back or launching");
+    }
+
+    private static void TestFrozenProfileRecovery()
+    {
+        using ProfileSetup setup = ProfileSetup.Create();
+        Assert(setup.CaptureBaseline(), "frozen recovery: baseline capture must succeed");
+        setup.Fixture.Adapter.ReadyOnLaunch = true;
+        Assert(setup.Fixture.State.Execute(
+            Request("restart", "agent", 1, "--projects", "horticulture"), _ => { }, () => true) == 0,
+            "frozen recovery: initial profile launch must succeed");
+
+        PersistedState pending = JsonSerializer.Deserialize<PersistedState>(
+            File.ReadAllText(Path.Combine(setup.Fixture.Root, "Runtime", "state.json")), Program.JsonOptions);
+        int targetGeneration = pending.Generation + 1;
+        pending.RestartPending = true;
+        pending.TargetGeneration = targetGeneration;
+        pending.Phase = BridgePhase.RESTARTING;
+        pending.LaunchOwner = "agent@1";
+        pending.LaunchRequestKey = "restart-" + targetGeneration;
+        pending.ProcessId = 0;
+        pending.ProcessStartUtcTicks = 0;
+        pending.LaunchId = null;
+        pending.LaunchGeneration = targetGeneration;
+        pending.RestartRequestedUtc = ClockStart;
+        pending.RequiresNewProcess = true;
+        pending.Error = null;
+        pending.ErrorCode = null;
+        setup.Fixture.Adapter.Current.ForceTerminate();
+        setup.Fixture.WriteState(pending);
+        Directory.Delete(setup.MetadataRoot, true);
+        setup.Fixture.State = setup.Fixture.Reload();
+        int launchesBeforeRecovery = setup.Fixture.Adapter.LaunchCalls;
+        setup.Fixture.State.StartRecoveryWork();
+        Assert(SpinWait.SpinUntil(() =>
+        {
+            JsonCommandResponse response = setup.Fixture.State.CreateJsonResponse(
+                Request("status"), 0, Array.Empty<string>());
+            return response.Generation == targetGeneration && response.State == "READY" &&
+                   !response.RestartPending;
+        }, TimeSpan.FromSeconds(10)),
+            "recovery must complete using the accepted profile even when installed metadata is gone");
+        JsonCommandResponse recovered = setup.Fixture.State.CreateJsonResponse(
+            Request("mods", "agent", 1, "status"), 0, Array.Empty<string>());
+        Assert(setup.Fixture.Adapter.LaunchCalls == launchesBeforeRecovery + 1 &&
+               recovered.ProfileMode == ModProfile.ProjectsMode &&
+               recovered.RequestedProjects.SequenceEqual(new[] { "horticulture" }) &&
+               ActiveMods(setup.Fixture.Root).SequenceEqual(recovered.ResolvedMods, StringComparer.OrdinalIgnoreCase),
+            "recovery must preserve the frozen profile roots, order, and exactly-once launch");
+    }
+
+    private static void TestBaselineRestoreSafety()
+    {
+        using ProfileSetup setup = ProfileSetup.Create();
+        byte[] original = File.ReadAllBytes(Path.Combine(setup.Fixture.Root, "ModsConfig.xml"));
+        Assert(setup.CaptureBaseline(), "baseline capture must succeed");
+        setup.Fixture.Adapter.ReadyOnLaunch = true;
+        Assert(setup.Fixture.State.Execute(
+            Request("restart", "agent", 1, "--projects", "horticulture"), _ => { }, () => true) == 0,
+            "profile launch must succeed before restore");
+        setup.Fixture.Adapter.Current.ForceTerminate();
+        int recapture = setup.Fixture.State.Execute(
+            Request("mods", "agent", 1, "capture-baseline"), _ => { }, () => true);
+        JsonCommandResponse recaptureResponse = setup.Fixture.State.CreateJsonResponse(
+            Request("status"), recapture, Array.Empty<string>());
+            Assert(recapture != 0 && recaptureResponse.ErrorCode == "PROFILE_BASELINE_GENERATED",
+            "a generated reduced profile must never be silently recaptured as the user baseline");
+        int restored = setup.Fixture.State.Execute(Request("mods", "agent", 1, "restore-baseline"), _ => { }, () => true);
+        Assert(restored == 0 && File.ReadAllBytes(Path.Combine(setup.Fixture.Root, "ModsConfig.xml")).SequenceEqual(original),
+            "atomic restore must reproduce the captured bytes exactly");
+
+        File.WriteAllText(Path.Combine(setup.Fixture.Root, "ModsConfig.xml"), "<user-edit />", new UTF8Encoding(false));
+        int refused = setup.Fixture.State.Execute(Request("mods", "agent", 1, "restore-baseline"), _ => { }, () => true);
+        Assert(refused != 0 && File.ReadAllText(Path.Combine(setup.Fixture.Root, "ModsConfig.xml")) == "<user-edit />",
+            "unexpected external edits must never be overwritten by restore");
+    }
+
+    private static int IndexOf(IReadOnlyList<string> values, string value) =>
+        values.ToList().IndexOf(value);
+
+    private static List<string> ActiveMods(string root)
+    {
+        XDocument document = XDocument.Load(Path.Combine(root, "ModsConfig.xml"));
+        XElement active = document.Descendants().Single(value =>
+            string.Equals(value.Name.LocalName, "activeMods", StringComparison.OrdinalIgnoreCase));
+        return active.Elements().Where(value => string.Equals(value.Name.LocalName, "li", StringComparison.OrdinalIgnoreCase))
+            .Select(value => value.Value.Trim()).ToList();
+    }
+
     private static BridgeRequest Request(string command, string agent = "agent", int pid = 1, params string[] arguments)
     {
         return new BridgeRequest
@@ -1091,6 +1615,86 @@ internal static class OfflineTests
             throw new InvalidOperationException(message);
     }
 
+    private static void WriteInstalledMetadata(string metadataRoot, string directoryName, string packageId,
+        string dependencySection, string loadBefore = "", string loadAfter = "")
+    {
+        string directory = Path.Combine(metadataRoot, directoryName, "About");
+        Directory.CreateDirectory(directory);
+        string dependencies = dependencySection?.Trim() ?? string.Empty;
+        if (dependencies.Length > 0 && !dependencies.StartsWith("<", StringComparison.Ordinal))
+        {
+            dependencies = "<modDependencies>" + string.Join(string.Empty,
+                dependencies.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                    .Select(value => "<li>" + value + "</li>")) + "</modDependencies>";
+        }
+        string before = string.IsNullOrWhiteSpace(loadBefore) ? string.Empty :
+            "<loadBefore><li>" + loadBefore + "</li></loadBefore>";
+        string after = string.IsNullOrWhiteSpace(loadAfter) ? string.Empty :
+            "<loadAfter><li>" + loadAfter + "</li></loadAfter>";
+        File.WriteAllText(Path.Combine(directory, "About.xml"),
+            "<ModMetaData><packageId>" + packageId + "</packageId>" + dependencies + before + after + "</ModMetaData>");
+    }
+
+    private sealed class ProfileSetup : IDisposable
+    {
+        internal readonly Fixture Fixture;
+        internal readonly string MetadataRoot;
+
+        private ProfileSetup(Fixture fixture, string metadataRoot)
+        {
+            Fixture = fixture;
+            MetadataRoot = metadataRoot;
+        }
+
+        internal static ProfileSetup Create()
+        {
+            Fixture fixture = new(new PersistedState { Generation = 0, Phase = BridgePhase.STOPPED });
+            string metadataRoot = Path.Combine(fixture.Root, "InstalledMods");
+            Directory.CreateDirectory(metadataRoot);
+            fixture.InstalledModsRoots = new[] { metadataRoot };
+            WriteAllMetadata(metadataRoot);
+            File.WriteAllText(Path.Combine(fixture.Root, "ModsConfig.xml"),
+                "<ModsConfigData>\r\n  <activeMods>\r\n" +
+                string.Join("\r\n", new[]
+                {
+                    "    <li>lan.devbridge2</li>",
+                    "    <li>lan.horticulture.novelseeds</li>",
+                    "    <li>lan.aquaculture.fishing</li>",
+                    "    <li>ferny.loadthemlast</li>"
+                }) + "\r\n  </activeMods>\r\n</ModsConfigData>", new UTF8Encoding(false));
+            fixture.State = fixture.Reload();
+            return new ProfileSetup(fixture, metadataRoot);
+        }
+
+        internal bool CaptureBaseline()
+        {
+            return Fixture.State.Execute(Request("mods", "agent", 1, "capture-baseline"), _ => { }, () => true) == 0;
+        }
+
+        public void Dispose() => Fixture.Dispose();
+
+        private static void WriteAllMetadata(string metadataRoot)
+        {
+            foreach (string packageId in ModProfileResolver.AlwaysOnPackageIds)
+                WriteInstalledMetadata(metadataRoot, packageId, packageId, "");
+
+            WriteInstalledMetadata(metadataRoot, "deferred-reality", "lan.deferredreality.framework", "");
+            WriteInstalledMetadata(metadataRoot, "insight-canvas", "lan.insightcanvas", "");
+            WriteInstalledMetadata(metadataRoot, "knowledge-framework", "lan.knowledgeframework", "");
+            WriteInstalledMetadata(metadataRoot, "frontier", "lan.frontier", "");
+            WriteInstalledMetadata(metadataRoot, "aquaculture", "lan.aquaculture.fishing",
+                "FERNY.ReplaceLib", "ferny.progressionagriculture", "");
+            WriteInstalledMetadata(metadataRoot, "horticulture", "lan.horticulture.novelseeds",
+                "ferny.progressionagriculture", "", "lan.aquaculture.fishing");
+            WriteInstalledMetadata(metadataRoot, "wildlife", "lan.wildlife", "");
+            WriteInstalledMetadata(metadataRoot, "progression", "ferny.progressionagriculture", "ferny.replacelib");
+            WriteInstalledMetadata(metadataRoot, "replacelib", "FERNY.ReplaceLib", "vanillaexpanded.vcef");
+            WriteInstalledMetadata(metadataRoot, "vcef", "vanillaexpanded.vcef",
+                "oskarpotocki.vanillafactionsexpanded.core");
+            WriteInstalledMetadata(metadataRoot, "vfe-core", "oskarpotocki.vanillafactionsexpanded.core", "");
+        }
+    }
+
     private sealed class Fixture : IDisposable
     {
         internal readonly string Root;
@@ -1098,6 +1702,8 @@ internal static class OfflineTests
         internal readonly FakeClock Clock;
         internal readonly FakeProcessAdapter Adapter;
         internal CoordinatorState State;
+        internal IReadOnlyList<string> InstalledModsRoots { get; set; }
+        internal Action BeforeModsConfigWrite { get; set; }
 
         internal Fixture(PersistedState initial)
         {
@@ -1116,9 +1722,12 @@ internal static class OfflineTests
             State = Reload();
         }
 
-        internal TestLease Lease(DateTime started) => new()
+        internal TestLease Lease(DateTime started) => Lease("T001", "holder", 77, started);
+
+        internal TestLease Lease(string id, string agent, int pid, DateTime started) => new()
         {
-            Id = "T001", Agent = "holder", ClientProcessId = 77, Generation = 1, StartedUtc = started
+            Id = id, Agent = agent, ClientProcessId = pid, Generation = 1,
+            StartedUtc = started, LastHeartbeatUtc = started
         };
 
         internal static Fixture LoadingWithLease()
@@ -1135,7 +1744,8 @@ internal static class OfflineTests
                 LaunchStartedUtc = ClockStart,
                 Leases = new List<TestLease>
                 {
-                    new() { Id = "T001", Agent = "holder", ClientProcessId = 77, Generation = 0, StartedUtc = ClockStart }
+                    new() { Id = "T001", Agent = "holder", ClientProcessId = 77, Generation = 0,
+                        StartedUtc = ClockStart, LastHeartbeatUtc = ClockStart }
                 }
             });
             fixture.Adapter.Add(new FakeProcess(101, 1001, fixture.RimWorldPath));
@@ -1153,7 +1763,31 @@ internal static class OfflineTests
                 ProcessId = 101,
                 ProcessStartUtcTicks = 1001,
                 LaunchStartedUtc = ClockStart,
-                Leases = new List<TestLease> { new() { Id = "T001", Agent = "holder", ClientProcessId = 77, Generation = 1, StartedUtc = ClockStart } }
+                Leases = new List<TestLease> { new() { Id = "T001", Agent = "holder", ClientProcessId = 77, Generation = 1,
+                    StartedUtc = ClockStart, LastHeartbeatUtc = ClockStart } }
+            });
+            fixture.Adapter.Add(new FakeProcess(101, 1001, fixture.RimWorldPath));
+            return fixture;
+        }
+
+        internal static Fixture ReadyWithLeases()
+        {
+            Fixture fixture = new(new PersistedState
+            {
+                Generation = 1,
+                Phase = BridgePhase.READY,
+                LaunchId = "launch-ready",
+                LaunchGeneration = 1,
+                ProcessId = 101,
+                ProcessStartUtcTicks = 1001,
+                LaunchStartedUtc = ClockStart,
+                Leases = new List<TestLease>
+                {
+                    new() { Id = "T001", Agent = "holder-a", ClientProcessId = 77, Generation = 1,
+                        StartedUtc = ClockStart, LastHeartbeatUtc = ClockStart },
+                    new() { Id = "T002", Agent = "holder-b", ClientProcessId = 78, Generation = 1,
+                        StartedUtc = ClockStart, LastHeartbeatUtc = ClockStart }
+                }
             });
             fixture.Adapter.Add(new FakeProcess(101, 1001, fixture.RimWorldPath));
             return fixture;
@@ -1185,7 +1819,8 @@ internal static class OfflineTests
                 SessionDirty = true,
                 ProcessId = 0,
                 ProcessStartUtcTicks = 0,
-                Leases = new List<TestLease> { new() { Id = "T001", Agent = "holder", ClientProcessId = 77, Generation = 1, StartedUtc = ClockStart } }
+                Leases = new List<TestLease> { new() { Id = "T001", Agent = "holder", ClientProcessId = 77, Generation = 1,
+                    StartedUtc = ClockStart, LastHeartbeatUtc = ClockStart } }
             });
         }
 
@@ -1231,7 +1866,9 @@ internal static class OfflineTests
                 ProcessAdapter = Adapter,
                 Clock = Clock,
                 RimWorldExecutablePath = RimWorldPath,
-                ModsConfigPath = Path.Combine(Root, "ModsConfig.xml")
+                ModsConfigPath = Path.Combine(Root, "ModsConfig.xml"),
+                InstalledModsRoots = InstalledModsRoots,
+                BeforeModsConfigWrite = BeforeModsConfigWrite
             });
         }
 

@@ -1,10 +1,13 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.IO.Pipes;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
+using System.Xml.Linq;
 
 namespace DevBridge.Coordinator;
 
@@ -48,8 +51,8 @@ internal static class Program
 
     private static void PrintUsage()
     {
-        Console.WriteLine("DevBridge commands: status | test begin | test renew <lease-id> | test end <lease-id> | stop <lease-id> | ensure-ready <lease-id> | restart | wait-ready | doctor");
-        Console.WriteLine("Append --json for machine-readable output.");
+        Console.WriteLine("DevBridge commands: status | mods status | mods capture-baseline | mods restore-baseline | test begin | test session | test renew <lease-id> | test end <lease-id> | stop <lease-id> | ensure-ready <lease-id> | restart [--projects none|alias[,alias...]] | wait-ready | doctor");
+        Console.WriteLine("Append --json to a non-session command for machine-readable output.");
     }
 }
 
@@ -536,8 +539,28 @@ internal sealed class PersistedState
     public int LaunchBudgetRemaining { get; set; }
     public DateTime? WaitingForBridgeDeadlineUtc { get; set; }
     public bool RequiresNewProcess { get; set; }
+    public string ProfileMode { get; set; } = ModProfile.LegacyMode;
+    public List<string> RequestedProjects { get; set; } = new();
+    public List<string> ResolvedProjectPackageIds { get; set; } = new();
+    public List<string> ResolvedMods { get; set; } = new();
+    public string ProfileFingerprint { get; set; }
+    public string BaselineFingerprint { get; set; }
+    public string ModsConfigOwnership { get; set; }
+    public string ModsConfigGeneratedHash { get; set; }
+    public string ModsConfigGeneratedProfileFingerprint { get; set; }
+    public int ModsConfigGeneratedGeneration { get; set; }
+    public string ProfileErrorCode { get; set; }
+    public string ProfileError { get; set; }
+    public string ProfileConflict { get; set; }
     public List<ScopeTicket> ScopeTickets { get; set; } = new();
     public List<TestLease> Leases { get; set; } = new();
+}
+
+internal sealed class GeneratedModsConfigManifest
+{
+    public string Hash { get; set; }
+    public string ProfileFingerprint { get; set; }
+    public int Generation { get; set; }
 }
 
 internal sealed class ScopeTicket
@@ -631,8 +654,41 @@ internal sealed class JsonCommandResponse
     [JsonPropertyName("waitingForBridgeDeadlineUtc")]
     public DateTime? WaitingForBridgeDeadlineUtc { get; set; }
 
+    [JsonPropertyName("restartQueued")]
+    public bool RestartQueued { get; set; }
+
+    [JsonPropertyName("nextLeaseExpirationUtc")]
+    public DateTime? NextLeaseExpirationUtc { get; set; }
+
+    [JsonPropertyName("retryAfterSeconds")]
+    public int? RetryAfterSeconds { get; set; }
+
     [JsonPropertyName("requiresNewProcess")]
     public bool RequiresNewProcess { get; set; }
+
+    [JsonPropertyName("profileMode")]
+    public string ProfileMode { get; set; }
+
+    [JsonPropertyName("requestedProjects")]
+    public List<string> RequestedProjects { get; set; } = new();
+
+    [JsonPropertyName("resolvedProjectPackageIds")]
+    public List<string> ResolvedProjectPackageIds { get; set; } = new();
+
+    [JsonPropertyName("resolvedMods")]
+    public List<string> ResolvedMods { get; set; } = new();
+
+    [JsonPropertyName("profileFingerprint")]
+    public string ProfileFingerprint { get; set; }
+
+    [JsonPropertyName("baselineFingerprint")]
+    public string BaselineFingerprint { get; set; }
+
+    [JsonPropertyName("modsConfigOwnership")]
+    public string ModsConfigOwnership { get; set; }
+
+    [JsonPropertyName("profileConflict")]
+    public string ProfileConflict { get; set; }
 
     [JsonPropertyName("accepted")]
     public bool? Accepted { get; set; }
@@ -689,11 +745,15 @@ internal sealed class JsonLeaseInfo
     [JsonPropertyName("lastHeartbeatUtc")]
     public DateTime LastHeartbeatUtc { get; set; }
 
+    [JsonPropertyName("expiresUtc")]
+    public DateTime ExpiresUtc { get; set; }
+
+    [JsonPropertyName("retryAfterSeconds")]
+    public int RetryAfterSeconds { get; set; }
+
     [JsonPropertyName("age")]
     public string Age { get; set; }
 
-    [JsonPropertyName("staleIn")]
-    public string StaleIn { get; set; }
 }
 
 internal sealed class ReadinessRecord
@@ -777,12 +837,18 @@ internal sealed class CoordinatorOptions
     internal TimeSpan ReadinessTimeout { get; init; } = TimeSpan.FromMinutes(6);
     internal TimeSpan ProcessExitTimeout { get; init; } = TimeSpan.FromSeconds(15);
     internal int MaxLaunchAttempts { get; init; } = 2;
+    internal TimeSpan LeaseDuration { get; init; } = TimeSpan.FromMinutes(2);
+    internal TimeSpan LeaseHeartbeatInterval { get; init; } = TimeSpan.FromSeconds(30);
+    internal TimeSpan LeaseSessionPollInterval { get; init; } = TimeSpan.FromSeconds(1);
+    internal TimeSpan LeaseProgressInterval { get; init; } = TimeSpan.FromSeconds(5);
     internal IProcessAdapter ProcessAdapter { get; init; } = new SystemProcessAdapter();
     internal ICoordinatorClock Clock { get; init; } = SystemCoordinatorClock.Instance;
     internal string RimWorldExecutablePath { get; init; }
     internal string ModsConfigPath { get; init; }
     internal string CoordinatorRoot { get; init; }
     internal string RuntimeSlotId { get; init; }
+    internal IReadOnlyList<string> InstalledModsRoots { get; init; }
+    internal Action BeforeModsConfigWrite { get; init; }
 
     internal static CoordinatorOptions ForProduction()
     {
@@ -792,6 +858,542 @@ internal sealed class CoordinatorOptions
             timeout = TimeSpan.FromSeconds(seconds);
 
         return new CoordinatorOptions { ReadinessTimeout = timeout };
+    }
+}
+
+internal sealed class ProfileException : Exception
+{
+    internal ProfileException(string code, string message) : base(message)
+    {
+        Code = code;
+    }
+
+    internal string Code { get; }
+}
+
+internal sealed class ModProfile
+{
+    internal const string LegacyMode = "legacy";
+    internal const string BaselineMode = "baseline";
+    internal const string ProjectsMode = "projects";
+
+    internal string Mode { get; init; } = LegacyMode;
+    internal List<string> RequestedProjects { get; init; } = new();
+    internal List<string> ResolvedProjectPackageIds { get; init; } = new();
+    internal List<string> ResolvedMods { get; init; } = new();
+    internal string ProfileFingerprint { get; init; }
+    internal string BaselineFingerprint { get; init; }
+
+    internal ModProfile Clone() => new()
+    {
+        Mode = Mode,
+        RequestedProjects = RequestedProjects.ToList(),
+        ResolvedProjectPackageIds = ResolvedProjectPackageIds.ToList(),
+        ResolvedMods = ResolvedMods.ToList(),
+        ProfileFingerprint = ProfileFingerprint,
+        BaselineFingerprint = BaselineFingerprint
+    };
+}
+
+internal sealed class InstalledModMetadata
+{
+    internal string PackageId { get; init; }
+    internal string DirectoryPath { get; init; }
+    internal XDocument Document { get; init; }
+    internal string MetadataError { get; init; }
+    internal bool ReferencesLoaded { get; set; }
+    internal List<string> Dependencies { get; } = new();
+    internal List<string> LoadBefore { get; } = new();
+    internal List<string> LoadAfter { get; } = new();
+}
+
+internal static class ModProfileResolver
+{
+    internal const string DevBridgePackageId = "lan.devbridge2";
+    internal const string ForbiddenPackageId = "ferny.loadthemlast";
+
+    internal static readonly string[] AlwaysOnPackageIds =
+    {
+        "zetrith.prepatcher",
+        "brrainz.harmony",
+        "taranchuk.fastergameloading",
+        "ilyvion.loadingprogress",
+        "ludeon.rimworld",
+        "ludeon.rimworld.royalty",
+        "ludeon.rimworld.ideology",
+        "ludeon.rimworld.biotech",
+        "ludeon.rimworld.anomaly",
+        "ludeon.rimworld.odyssey",
+        DevBridgePackageId,
+        "mlie.dingongameloaded",
+        "dubwise.dubsperformanceanalyzer.steam",
+        "astryl.moderndevtools"
+    };
+
+    private static readonly IReadOnlyDictionary<string, string> ProjectAliases =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["deferred-reality"] = "lan.deferredreality.framework",
+            ["insight-canvas"] = "lan.insightcanvas",
+            ["knowledge-framework"] = "lan.knowledgeframework",
+            ["frontier"] = "lan.frontier",
+            ["aquaculture"] = "lan.aquaculture.fishing",
+            ["horticulture"] = "lan.horticulture.novelseeds",
+            ["wildlife"] = "lan.wildlife"
+        };
+
+    internal static bool TryGetProjectPackageId(string alias, out string packageId) =>
+        ProjectAliases.TryGetValue(alias ?? string.Empty, out packageId);
+
+    internal static IReadOnlyList<string> CanonicalAliases(IEnumerable<string> aliases)
+    {
+        List<string> result = new();
+        foreach (string alias in aliases ?? Array.Empty<string>())
+        {
+            string trimmed = alias?.Trim() ?? string.Empty;
+            if (trimmed.Length == 0)
+                continue;
+            if (string.Equals(trimmed, "none", StringComparison.OrdinalIgnoreCase))
+                throw new ProfileException("PROFILE_INVALID_REQUEST",
+                    "--projects none must be used alone; it cannot be combined with a project alias.");
+            if (!TryGetProjectPackageId(trimmed, out _))
+                throw new ProfileException("PROFILE_UNKNOWN_PROJECT",
+                    "Unknown project alias '" + trimmed + "'. Use: " +
+                    string.Join(", ", ProjectAliases.Keys.OrderBy(value => value, StringComparer.Ordinal)) + ".");
+            if (result.Contains(trimmed.ToLowerInvariant(), StringComparer.Ordinal))
+                throw new ProfileException("PROFILE_DUPLICATE_PROJECT",
+                    "Project alias '" + trimmed + "' was requested more than once.");
+            result.Add(trimmed.ToLowerInvariant());
+        }
+
+        result.Sort(StringComparer.Ordinal);
+        return result;
+    }
+
+    internal static ModProfile Resolve(string coordinatorRoot, string baselineFingerprint,
+        IReadOnlyList<string> aliases, IReadOnlyList<string> configuredRoots = null)
+    {
+        if (string.IsNullOrWhiteSpace(baselineFingerprint))
+            throw new ProfileException("PROFILE_BASELINE_MISSING",
+                "Capture the user ModsConfig first with: DevBridge.cmd mods capture-baseline");
+
+        List<string> canonicalAliases = CanonicalAliases(aliases).ToList();
+        string mode = canonicalAliases.Count == 0 ? ModProfile.BaselineMode : ModProfile.ProjectsMode;
+        List<string> requestedPackageIds = canonicalAliases
+            .Select(alias => ProjectAliases[alias])
+            .ToList();
+        List<string> roots = AlwaysOnPackageIds.Concat(requestedPackageIds).ToList();
+
+        Dictionary<string, List<InstalledModMetadata>> installed = Discover(coordinatorRoot, configuredRoots);
+        Dictionary<string, InstalledModMetadata> resolved = new(StringComparer.OrdinalIgnoreCase);
+        Dictionary<string, int> visiting = new(StringComparer.OrdinalIgnoreCase);
+        List<string> stack = new();
+        Dictionary<string, int> discoveryOrder = new(StringComparer.OrdinalIgnoreCase);
+        Dictionary<string, int> rootOrder = new(StringComparer.OrdinalIgnoreCase);
+        int discovery = 0;
+
+        for (int index = 0; index < roots.Count; index++)
+        {
+            InstalledModMetadata root = Find(installed, roots[index], "project root");
+            rootOrder.TryAdd(root.PackageId, index);
+            Visit(root);
+        }
+
+        Dictionary<string, HashSet<string>> edges = resolved.Keys.ToDictionary(
+            key => key, _ => new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+            StringComparer.OrdinalIgnoreCase);
+        Dictionary<string, int> indegree = resolved.Keys.ToDictionary(
+            key => key, _ => 0, StringComparer.OrdinalIgnoreCase);
+
+        foreach (InstalledModMetadata metadata in resolved.Values)
+        {
+            foreach (string dependency in metadata.Dependencies)
+            {
+                InstalledModMetadata dependencyMetadata = Find(installed, dependency, "dependency of " + metadata.PackageId);
+                AddEdge(dependencyMetadata.PackageId, metadata.PackageId);
+            }
+
+            foreach (string before in metadata.LoadBefore)
+            {
+                if (resolved.TryGetValue(before, out InstalledModMetadata target))
+                    AddEdge(metadata.PackageId, target.PackageId);
+            }
+
+            foreach (string after in metadata.LoadAfter)
+            {
+                if (resolved.TryGetValue(after, out InstalledModMetadata target))
+                    AddEdge(target.PackageId, metadata.PackageId);
+            }
+        }
+
+        List<string> orderedKeys = new();
+        List<string> ready = indegree.Where(pair => pair.Value == 0).Select(pair => pair.Key).ToList();
+        while (ready.Count > 0)
+        {
+            ready.Sort(CompareOrder);
+            string next = ready[0];
+            ready.RemoveAt(0);
+            orderedKeys.Add(next);
+            foreach (string dependent in edges[next])
+            {
+                indegree[dependent]--;
+                if (indegree[dependent] == 0)
+                    ready.Add(dependent);
+            }
+        }
+
+        if (orderedKeys.Count != resolved.Count)
+        {
+            string cycle = string.Join(", ", indegree.Where(pair => pair.Value > 0)
+                .Select(pair => resolved[pair.Key].PackageId).OrderBy(value => value, StringComparer.OrdinalIgnoreCase));
+            throw new ProfileException("PROFILE_DEPENDENCY_CYCLE",
+                "The requested profile contains a dependency/load-order cycle involving: " + cycle + ".");
+        }
+
+        List<string> resolvedMods = orderedKeys.Select(key => resolved[key].PackageId).ToList();
+        List<string> resolvedProjects = requestedPackageIds
+            .Select(packageId => Find(installed, packageId, "project root").PackageId)
+            .ToList();
+        string fingerprint = Fingerprint(mode, baselineFingerprint, canonicalAliases, resolvedProjects, resolvedMods);
+        ModProfile profile = new()
+        {
+            Mode = mode,
+            RequestedProjects = canonicalAliases,
+            ResolvedProjectPackageIds = resolvedProjects,
+            ResolvedMods = resolvedMods,
+            ProfileFingerprint = fingerprint,
+            BaselineFingerprint = baselineFingerprint
+        };
+        ValidateResolvedProfile(profile);
+        return profile;
+
+        void Visit(InstalledModMetadata metadata)
+        {
+            if (string.Equals(metadata.PackageId, ForbiddenPackageId, StringComparison.OrdinalIgnoreCase))
+                throw new ProfileException("PROFILE_FORBIDDEN_MOD",
+                    "The profile must never include " + ForbiddenPackageId + ".");
+
+            if (visiting.TryGetValue(metadata.PackageId, out int status))
+            {
+                if (status == 1)
+                {
+                    int start = stack.FindIndex(value => string.Equals(value, metadata.PackageId,
+                        StringComparison.OrdinalIgnoreCase));
+                    IEnumerable<string> cycle = (start < 0 ? stack : stack.Skip(start))
+                        .Concat(new[] { metadata.PackageId });
+                    throw new ProfileException("PROFILE_DEPENDENCY_CYCLE",
+                        "The requested profile contains a dependency cycle: " + string.Join(" -> ", cycle) + ".");
+                }
+                return;
+            }
+
+            visiting[metadata.PackageId] = 1;
+            stack.Add(metadata.PackageId);
+            LoadReferences(metadata);
+            foreach (string dependency in metadata.Dependencies)
+                Visit(Find(installed, dependency, "dependency of " + metadata.PackageId));
+            stack.RemoveAt(stack.Count - 1);
+            visiting[metadata.PackageId] = 2;
+            resolved[metadata.PackageId] = metadata;
+            discoveryOrder.TryAdd(metadata.PackageId, discovery++);
+        }
+
+        int CompareOrder(string left, string right)
+        {
+            int leftRoot = rootOrder.TryGetValue(left, out int lr) ? lr : int.MaxValue;
+            int rightRoot = rootOrder.TryGetValue(right, out int rr) ? rr : int.MaxValue;
+            int result = leftRoot.CompareTo(rightRoot);
+            if (result != 0)
+                return result;
+            result = discoveryOrder[left].CompareTo(discoveryOrder[right]);
+            return result != 0 ? result : StringComparer.OrdinalIgnoreCase.Compare(left, right);
+        }
+
+        void AddEdge(string from, string to)
+        {
+            if (string.Equals(from, to, StringComparison.OrdinalIgnoreCase) || !edges.ContainsKey(from) ||
+                !edges.ContainsKey(to) || !edges[from].Add(to))
+                return;
+            indegree[to]++;
+        }
+    }
+
+    internal static void ValidateResolvedProfile(ModProfile profile)
+    {
+        if (profile == null)
+            throw new ProfileException("PROFILE_INVALID_STATE", "The accepted profile is missing.");
+        if (profile.Mode != ModProfile.BaselineMode && profile.Mode != ModProfile.ProjectsMode)
+            throw new ProfileException("PROFILE_INVALID_STATE", "The accepted profile mode is invalid: " + profile.Mode + ".");
+        if (!IsSha256(profile.BaselineFingerprint))
+            throw new ProfileException("PROFILE_INVALID_STATE", "The accepted profile has no valid baseline fingerprint.");
+
+        List<string> aliases;
+        try
+        {
+            aliases = CanonicalAliases(profile.RequestedProjects).ToList();
+        }
+        catch (ProfileException exception)
+        {
+            throw new ProfileException("PROFILE_INVALID_STATE",
+                "The accepted profile has invalid project roots: " + exception.Message);
+        }
+
+        if (profile.Mode == ModProfile.BaselineMode && aliases.Count != 0)
+            throw new ProfileException("PROFILE_INVALID_STATE", "A baseline profile cannot contain project roots.");
+        if (profile.Mode == ModProfile.ProjectsMode && aliases.Count == 0)
+            throw new ProfileException("PROFILE_INVALID_STATE", "A project profile must contain at least one project root.");
+
+        List<string> expectedProjects = aliases.Select(alias => ProjectAliases[alias]).ToList();
+        if (!SequenceEqualPackageIds(expectedProjects, profile.ResolvedProjectPackageIds))
+            throw new ProfileException("PROFILE_INVALID_STATE", "The accepted profile's project package IDs do not match its aliases.");
+
+        List<string> resolvedMods = profile.ResolvedMods ?? new List<string>();
+        HashSet<string> seen = new(StringComparer.OrdinalIgnoreCase);
+        foreach (string packageId in resolvedMods)
+        {
+            if (string.IsNullOrWhiteSpace(packageId) || packageId.Any(char.IsWhiteSpace))
+                throw new ProfileException("PROFILE_INVALID_STATE", "The accepted profile contains a malformed package ID.");
+            if (!seen.Add(packageId))
+                throw new ProfileException("PROFILE_INVALID_STATE", "The accepted profile contains duplicate package ID " + packageId + ".");
+            if (string.Equals(packageId, ForbiddenPackageId, StringComparison.OrdinalIgnoreCase))
+                throw new ProfileException("PROFILE_INVALID_STATE", "The accepted profile contains forbidden package ID " + ForbiddenPackageId + ".");
+        }
+
+        foreach (string required in AlwaysOnPackageIds)
+        {
+            if (!seen.Contains(required))
+                throw new ProfileException("PROFILE_REQUIRED_MOD_MISSING",
+                    "The accepted profile is missing required tooling package " + required + ".");
+        }
+
+        if (string.IsNullOrWhiteSpace(profile.ProfileFingerprint))
+            throw new ProfileException("PROFILE_INVALID_STATE", "The accepted profile has no fingerprint.");
+        string expectedFingerprint = Fingerprint(profile.Mode, profile.BaselineFingerprint,
+            aliases, expectedProjects, resolvedMods);
+        if (!string.Equals(profile.ProfileFingerprint, expectedFingerprint, StringComparison.Ordinal))
+            throw new ProfileException("PROFILE_FINGERPRINT_MISMATCH",
+                "The accepted profile fingerprint does not match its persisted roots and ordered package list.");
+    }
+
+    private static bool SequenceEqualPackageIds(IReadOnlyList<string> left, IReadOnlyList<string> right)
+    {
+        if (left == null || right == null || left.Count != right.Count)
+            return false;
+        for (int index = 0; index < left.Count; index++)
+        {
+            if (!string.Equals(left[index], right[index], StringComparison.OrdinalIgnoreCase))
+                return false;
+        }
+        return true;
+    }
+
+    private static bool IsSha256(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value) || value.Length != 64)
+            return false;
+        return value.All(character => Uri.IsHexDigit(character));
+    }
+
+    private static string Fingerprint(string mode, string baselineFingerprint, IReadOnlyList<string> aliases,
+        IReadOnlyList<string> projectIds, IReadOnlyList<string> resolvedMods)
+    {
+        string canonical = string.Join("\n", new[]
+        {
+            "mode=" + mode,
+            "baseline=" + baselineFingerprint.ToUpperInvariant(),
+            "projects=" + string.Join(",", aliases),
+            "projectPackageIds=" + string.Join(",", projectIds.Select(value => value.ToLowerInvariant())),
+            "mods=" + string.Join(",", resolvedMods.Select(value => value.ToLowerInvariant()))
+        });
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonical)));
+    }
+
+    private static Dictionary<string, List<InstalledModMetadata>> Discover(string coordinatorRoot,
+        IReadOnlyList<string> configuredRoots)
+    {
+        List<string> roots = new();
+        HashSet<string> seenRoots = new(StringComparer.OrdinalIgnoreCase);
+        void AddRoot(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+                return;
+            string full = Path.GetFullPath(path);
+            if (seenRoots.Add(full))
+                roots.Add(full);
+        }
+
+        foreach (string path in configuredRoots ?? Array.Empty<string>())
+            AddRoot(path);
+        AddRoot(coordinatorRoot);
+        AddRoot(Path.Combine(coordinatorRoot, ".."));
+        AddRoot(Path.Combine(coordinatorRoot, "..", "..", "Data"));
+        AddRoot(Path.Combine(coordinatorRoot, "..", "..", "Data", "Mods"));
+        string workshopOverride = Environment.GetEnvironmentVariable("RIMWORLD_WORKSHOP_PATH");
+        AddRoot(workshopOverride);
+
+        DirectoryInfo cursor = new(Path.GetFullPath(coordinatorRoot));
+        while (cursor != null)
+        {
+            if (string.Equals(cursor.Name, "steamapps", StringComparison.OrdinalIgnoreCase))
+                AddRoot(Path.Combine(cursor.FullName, "workshop", "content", "294100"));
+            cursor = cursor.Parent;
+        }
+
+        Dictionary<string, List<InstalledModMetadata>> result =
+            new(StringComparer.OrdinalIgnoreCase);
+        HashSet<string> seenAboutFiles = new(StringComparer.OrdinalIgnoreCase);
+        foreach (string root in roots)
+        {
+            foreach (string directory in EnumerateModDirectories(root))
+            {
+                string aboutPath = Path.Combine(directory, "About", "About.xml");
+                if (!seenAboutFiles.Add(aboutPath))
+                    continue;
+                try
+                {
+                    XDocument document = XDocument.Load(aboutPath, LoadOptions.PreserveWhitespace);
+                    string packageId = document.Descendants().FirstOrDefault(value =>
+                        string.Equals(value.Name.LocalName, "packageId", StringComparison.OrdinalIgnoreCase))?.Value.Trim();
+                    if (string.IsNullOrWhiteSpace(packageId))
+                        continue;
+                    InstalledModMetadata metadata = new()
+                    {
+                        PackageId = packageId,
+                        DirectoryPath = directory,
+                        Document = document
+                    };
+                    if (!result.TryGetValue(packageId, out List<InstalledModMetadata> candidates))
+                    {
+                        candidates = new List<InstalledModMetadata>();
+                        result[packageId] = candidates;
+                    }
+                    candidates.Add(metadata);
+                }
+                catch (Exception exception)
+                {
+                    // Keep a recoverable package ID when possible so a relevant malformed mod
+                    // reports malformed metadata rather than being mistaken for a missing mod.
+                    string raw = null;
+                    try { raw = File.ReadAllText(aboutPath); } catch { }
+                    string packageId = TryExtractPackageId(raw);
+                    if (string.IsNullOrWhiteSpace(packageId))
+                        continue;
+                    InstalledModMetadata metadata = new()
+                    {
+                        PackageId = packageId,
+                        DirectoryPath = directory,
+                        MetadataError = "About.xml could not be parsed: " + exception.Message
+                    };
+                    if (!result.TryGetValue(packageId, out List<InstalledModMetadata> candidates))
+                    {
+                        candidates = new List<InstalledModMetadata>();
+                        result[packageId] = candidates;
+                    }
+                    candidates.Add(metadata);
+                }
+            }
+        }
+
+        return result;
+    }
+
+    private static string TryExtractPackageId(string raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+            return null;
+        Match match = Regex.Match(raw,
+            @"<packageId\b[^>]*>\s*(?<id>[^<]+?)\s*</packageId\s*>",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        return match.Success ? match.Groups["id"].Value.Trim() : null;
+    }
+
+    private static IEnumerable<string> EnumerateModDirectories(string root)
+    {
+        if (!Directory.Exists(root))
+            yield break;
+
+        string directAbout = Path.Combine(root, "About", "About.xml");
+        if (File.Exists(directAbout))
+        {
+            yield return root;
+            yield break;
+        }
+
+        IEnumerable<string> children;
+        try { children = Directory.EnumerateDirectories(root).OrderBy(value => value, StringComparer.OrdinalIgnoreCase).ToList(); }
+        catch { yield break; }
+        foreach (string child in children)
+        {
+            if (File.Exists(Path.Combine(child, "About", "About.xml")))
+                yield return child;
+        }
+    }
+
+    private static InstalledModMetadata Find(Dictionary<string, List<InstalledModMetadata>> installed,
+        string packageId, string context)
+    {
+        if (string.Equals(packageId, ForbiddenPackageId, StringComparison.OrdinalIgnoreCase))
+            throw new ProfileException("PROFILE_FORBIDDEN_MOD",
+                "The profile must never include " + ForbiddenPackageId + " (required by " + context + ").");
+        if (!installed.TryGetValue(packageId, out List<InstalledModMetadata> candidates) || candidates.Count == 0)
+            throw new ProfileException("PROFILE_MISSING_PACKAGE",
+                "Missing installed package " + packageId + " required by " + context + ". Check the local Mods and Steam Workshop installations.");
+        if (candidates.Count > 1)
+            throw new ProfileException("PROFILE_AMBIGUOUS_PACKAGE",
+                "Package ID " + packageId + " is ambiguous; installed candidates are: " +
+                string.Join("; ", candidates.Select(value => value.DirectoryPath).OrderBy(value => value, StringComparer.OrdinalIgnoreCase)) + ".");
+        if (!string.IsNullOrWhiteSpace(candidates[0].MetadataError))
+            throw new ProfileException("PROFILE_MALFORMED_METADATA",
+                "Installed metadata for package " + packageId + " is malformed at " +
+                candidates[0].DirectoryPath + ": " + candidates[0].MetadataError);
+        return candidates[0];
+    }
+
+    private static void LoadReferences(InstalledModMetadata metadata)
+    {
+        if (metadata.ReferencesLoaded)
+            return;
+        metadata.ReferencesLoaded = true;
+        XElement root = metadata.Document.Root;
+        if (root == null)
+            throw new ProfileException("PROFILE_MALFORMED_METADATA", "Installed metadata has no XML root: " + metadata.DirectoryPath);
+
+        ReadReferences(root, "modDependencies", metadata.Dependencies, metadata, required: true);
+        ReadReferences(root, "loadBefore", metadata.LoadBefore, metadata, required: false);
+        ReadReferences(root, "loadAfter", metadata.LoadAfter, metadata, required: false);
+    }
+
+    private static void ReadReferences(XElement root, string sectionName, List<string> destination,
+        InstalledModMetadata metadata, bool required)
+    {
+        XElement section = root.Elements().FirstOrDefault(value =>
+            string.Equals(value.Name.LocalName, sectionName, StringComparison.OrdinalIgnoreCase));
+        if (section == null)
+            return;
+        if (section.Nodes().Any(node => node switch
+        {
+            XElement element => !string.Equals(element.Name.LocalName, "li", StringComparison.OrdinalIgnoreCase),
+            XText text => !string.IsNullOrWhiteSpace(text.Value),
+            _ => true
+        }))
+            throw new ProfileException("PROFILE_MALFORMED_METADATA",
+                "Installed metadata for " + metadata.PackageId + " has a malformed " + sectionName + " section.");
+
+        foreach (XElement child in section.Elements())
+        {
+            XElement li = child;
+            XElement package = li.Elements().FirstOrDefault(value =>
+                string.Equals(value.Name.LocalName, "packageId", StringComparison.OrdinalIgnoreCase));
+            string value = package?.Value.Trim();
+            if (package == null && !li.Elements().Any())
+                value = li.Value.Trim();
+            bool extraContent = li.Elements().Any(element => package == null || !ReferenceEquals(element, package)) ||
+                (package != null && li.Nodes().OfType<XText>().Any(text => !string.IsNullOrWhiteSpace(text.Value)));
+            if (extraContent || string.IsNullOrWhiteSpace(value) || value.Any(char.IsWhiteSpace))
+                throw new ProfileException("PROFILE_MALFORMED_METADATA",
+                    "Installed metadata for " + metadata.PackageId + " has a malformed " + sectionName + " entry.");
+            destination.Add(value);
+        }
     }
 }
 
@@ -1004,17 +1606,14 @@ internal sealed class SystemProcessAdapter : IProcessAdapter
 internal sealed class CoordinatorState
 {
     private const string DevBridgePackageId = "lan.devbridge2";
-    // CLI clients are intentionally short-lived, so client-process liveness cannot
-    // distinguish an active lease from a timed-out runner. Heartbeats keep long tests
-    // alive; the bounded default prevents one abandoned run from blocking a slot for
-    // the previous one-hour interval.
-    private static readonly TimeSpan LeaseStaleAfter = TimeSpan.FromMinutes(20);
     private static readonly TimeSpan ProgressInterval = TimeSpan.FromSeconds(5);
 
     private readonly string root;
     private readonly string runtimeRoot;
     private readonly string statePath;
     private readonly string readinessPath;
+    private readonly string baselinePath;
+    private readonly string generatedManifestPath;
     private readonly string rimWorldExe;
     private readonly string modsConfigPath;
     private readonly string coordinatorRoot;
@@ -1033,6 +1632,13 @@ internal sealed class CoordinatorState
         internal bool Safe { get; init; }
         internal string ErrorCode { get; init; }
         internal string Error { get; init; }
+    }
+
+    private sealed class RestartArguments
+    {
+        internal string LeaseId { get; init; }
+        internal bool HasProjects { get; init; }
+        internal List<string> Projects { get; init; } = new();
     }
 
     private sealed class ProcessStatusSnapshot
@@ -1061,6 +1667,8 @@ internal sealed class CoordinatorState
         runtimeRoot = Path.Combine(this.root, "Runtime");
         statePath = Path.Combine(runtimeRoot, "state.json");
         readinessPath = Path.Combine(runtimeRoot, "readiness.json");
+        baselinePath = Path.Combine(runtimeRoot, "ModsConfig.baseline.xml");
+        generatedManifestPath = Path.Combine(runtimeRoot, "ModsConfig.generated.json");
         rimWorldExe = Path.GetFullPath(this.options.RimWorldExecutablePath ??
             Path.Combine(this.root, "..", "..", "RimWorldWin64.exe"));
         modsConfigPath = this.options.ModsConfigPath ?? Path.Combine(
@@ -1113,6 +1721,7 @@ internal sealed class CoordinatorState
         return command switch
         {
             "status" => Status(request, emit),
+            "mods" => Mods(arguments, emit),
             "doctor" => Doctor(request, emit),
             "wait-ready" => WaitReady(request, emit),
             "restart" => Restart(request, emit),
@@ -1174,39 +1783,273 @@ internal sealed class CoordinatorState
     {
         if (arguments.Count == 0)
         {
-            emit("Usage: DevBridge.cmd test begin | test renew <lease-id> | test end <lease-id>");
+            emit("Usage: DevBridge.cmd test begin | test session | test renew <lease-id> | test end <lease-id>");
             return 2;
         }
 
         return arguments[0].Trim().ToLowerInvariant() switch
         {
             "begin" => BeginLease(request, emit, connected),
+            "session" => SessionLease(request, emit, connected),
             "renew" => RenewLease(request, arguments, emit),
-            "end" => EndLease(arguments, emit),
+            "end" => EndLease(request, arguments, emit),
             _ => Unknown("test " + arguments[0], emit)
         };
+    }
+
+    private int Mods(IReadOnlyList<string> arguments, Action<string> emit)
+    {
+        if (arguments.Count == 0)
+        {
+            emit("Usage: DevBridge.cmd mods status | mods capture-baseline | mods restore-baseline");
+            return 2;
+        }
+
+        return arguments[0].Trim().ToLowerInvariant() switch
+        {
+            "status" when arguments.Count == 1 => ModsStatus(emit),
+            "capture-baseline" when arguments.Count == 1 => CaptureBaseline(emit),
+            "restore-baseline" when arguments.Count == 1 => RestoreBaseline(emit),
+            _ => Unknown("mods " + string.Join(" ", arguments), emit)
+        };
+    }
+
+    private int ModsStatus(Action<string> emit)
+    {
+        PersistedState snapshot;
+        lock (gate)
+        {
+            snapshot = CloneStateLocked();
+            snapshot.BaselineFingerprint = ReadBaselineFingerprintLocked() ?? snapshot.BaselineFingerprint;
+            snapshot.ModsConfigOwnership = CurrentModsConfigOwnershipLocked();
+        }
+
+        emit("DevBridge2 mod profiles");
+        EmitProfile(snapshot, emit);
+        if (!string.IsNullOrWhiteSpace(snapshot.ProfileError))
+            emit("Profile error: " + snapshot.ProfileErrorCode + " - " + snapshot.ProfileError);
+        if (!string.IsNullOrWhiteSpace(snapshot.ProfileConflict))
+            emit("Profile conflict: " + snapshot.ProfileConflict);
+        return 0;
+    }
+
+    private int CaptureBaseline(Action<string> emit)
+    {
+        lock (lifecycleGate)
+        {
+            lock (gate)
+            {
+                if (!CanChangeModsConfigLocked(emit))
+                    return 4;
+                if (!File.Exists(modsConfigPath))
+                {
+                    emit("Baseline capture failed: ModsConfig.xml was not found at " + modsConfigPath + ".");
+                    return 4;
+                }
+
+                byte[] contents = File.ReadAllBytes(modsConfigPath);
+                string fingerprint = HashBytes(contents);
+                string ownership = CurrentModsConfigOwnershipLocked(contents, fingerprint);
+                if (ownership == "DEVBRIDGE_GENERATED" || ownership == "DEVBRIDGE_PENDING")
+                {
+                    RecordProfileErrorLocked("PROFILE_BASELINE_GENERATED",
+                        "The current ModsConfig.xml was generated by DevBridge; edit it intentionally, then capture the changed file.");
+                    emit("Baseline capture refused: the current ModsConfig.xml is DevBridge-generated.");
+                    emit("Error code: PROFILE_BASELINE_GENERATED");
+                    return 4;
+                }
+
+                options.BeforeModsConfigWrite?.Invoke();
+                byte[] latest;
+                try
+                {
+                    latest = File.ReadAllBytes(modsConfigPath);
+                }
+                catch
+                {
+                    RecordProfileErrorLocked("MODS_CONFIG_EXTERNAL_EDIT",
+                        "ModsConfig.xml changed or disappeared while preparing the baseline capture.");
+                    emit("Baseline capture refused: ModsConfig.xml changed while the capture was preparing.");
+                    emit("Error code: MODS_CONFIG_EXTERNAL_EDIT");
+                    return 4;
+                }
+                if (!string.Equals(HashBytes(latest), fingerprint, StringComparison.Ordinal))
+                {
+                    RecordProfileErrorLocked("MODS_CONFIG_EXTERNAL_EDIT",
+                        "ModsConfig.xml changed while preparing the baseline capture.");
+                    emit("Baseline capture refused: an unexpected edit would be captured as the baseline.");
+                    emit("Error code: MODS_CONFIG_EXTERNAL_EDIT");
+                    return 4;
+                }
+                try
+                {
+                    EnsureNoMatchingRimWorldProcess();
+                }
+                catch (ProfileException exception)
+                {
+                    RecordProfileErrorLocked(exception.Code, exception.Message);
+                    emit("Baseline capture refused: " + exception.Message);
+                    emit("Error code: " + exception.Code);
+                    return 4;
+                }
+                catch (ProcessInspectionException)
+                {
+                    RecordProfileErrorLocked(ProcessInspection.ErrorCode, ProcessInspection.Message);
+                    emit("Baseline capture refused: " + ProcessInspection.Message);
+                    emit("Error code: " + ProcessInspection.ErrorCode);
+                    return 4;
+                }
+
+                AtomicWriteFile(baselinePath, contents);
+                ClearGeneratedModsConfigManifestLocked();
+                state.BaselineFingerprint = fingerprint;
+                state.ModsConfigOwnership = "BASELINE";
+                state.ModsConfigGeneratedHash = null;
+                state.ModsConfigGeneratedProfileFingerprint = null;
+                state.ModsConfigGeneratedGeneration = 0;
+                ClearActiveProfileLocked();
+                state.ProfileErrorCode = null;
+                state.ProfileError = null;
+                state.ProfileConflict = null;
+                SaveStateLocked();
+                emit("Captured the user ModsConfig baseline byte-for-byte.");
+                emit("Baseline fingerprint: " + fingerprint);
+                emit("Next action: choose an opt-in profile with DevBridge.cmd restart --projects none or --projects <alias>.");
+                return 0;
+            }
+        }
+    }
+
+    private int RestoreBaseline(Action<string> emit)
+    {
+        lock (lifecycleGate)
+        {
+            lock (gate)
+            {
+                if (!CanChangeModsConfigLocked(emit))
+                    return 4;
+                if (!File.Exists(baselinePath))
+                {
+                    emit("Baseline restore failed: no captured baseline exists.");
+                    emit("Next action: DevBridge.cmd mods capture-baseline");
+                    return 4;
+                }
+
+                byte[] baseline = File.ReadAllBytes(baselinePath);
+                string baselineFingerprint = HashBytes(baseline);
+                if (!File.Exists(modsConfigPath))
+                {
+                    emit("Baseline restore failed: ModsConfig.xml was not found at " + modsConfigPath + ".");
+                    return 4;
+                }
+
+                byte[] current = File.ReadAllBytes(modsConfigPath);
+                string currentFingerprint = HashBytes(current);
+                string ownership = CurrentModsConfigOwnershipLocked(current, currentFingerprint);
+                if (currentFingerprint != baselineFingerprint && ownership != "DEVBRIDGE_GENERATED" &&
+                    ownership != "DEVBRIDGE_PENDING")
+                {
+                    RecordProfileErrorLocked("MODS_CONFIG_EXTERNAL_EDIT",
+                        "ModsConfig.xml differs from the captured baseline and is not a known DevBridge-generated file.");
+                    emit("Baseline restore refused: an unexpected user edit would be overwritten.");
+                    emit("Error code: MODS_CONFIG_EXTERNAL_EDIT");
+                    emit("Capture the intentional edit as the new baseline, or restore it manually before retrying.");
+                    return 4;
+                }
+
+                if (currentFingerprint != baselineFingerprint)
+                {
+                    options.BeforeModsConfigWrite?.Invoke();
+                    byte[] latest;
+                    try
+                    {
+                        latest = File.ReadAllBytes(modsConfigPath);
+                    }
+                    catch
+                    {
+                        RecordProfileErrorLocked("MODS_CONFIG_EXTERNAL_EDIT",
+                            "ModsConfig.xml changed or disappeared while preparing the baseline restore.");
+                        emit("Baseline restore refused: ModsConfig.xml changed while the restore was preparing.");
+                        emit("Error code: MODS_CONFIG_EXTERNAL_EDIT");
+                        return 4;
+                    }
+
+                    if (!string.Equals(HashBytes(latest), currentFingerprint, StringComparison.Ordinal))
+                    {
+                        RecordProfileErrorLocked("MODS_CONFIG_EXTERNAL_EDIT",
+                            "ModsConfig.xml changed while preparing the baseline restore.");
+                        emit("Baseline restore refused: an unexpected edit would be overwritten.");
+                        emit("Error code: MODS_CONFIG_EXTERNAL_EDIT");
+                        return 4;
+                    }
+
+                    try
+                    {
+                        EnsureNoMatchingRimWorldProcess();
+                    }
+                    catch (ProfileException exception)
+                    {
+                        RecordProfileErrorLocked(exception.Code, exception.Message);
+                        emit("Baseline restore refused: " + exception.Message);
+                        emit("Error code: " + exception.Code);
+                        return 4;
+                    }
+                    catch (ProcessInspectionException)
+                    {
+                        RecordProfileErrorLocked(ProcessInspection.ErrorCode, ProcessInspection.Message);
+                        emit("Baseline restore refused: " + ProcessInspection.Message);
+                        emit("Error code: " + ProcessInspection.ErrorCode);
+                        return 4;
+                    }
+
+                    AtomicWriteFile(modsConfigPath, baseline);
+                }
+                ClearGeneratedModsConfigManifestLocked();
+                state.BaselineFingerprint = baselineFingerprint;
+                state.ModsConfigOwnership = "BASELINE";
+                state.ModsConfigGeneratedHash = null;
+                state.ModsConfigGeneratedProfileFingerprint = null;
+                state.ModsConfigGeneratedGeneration = 0;
+                ClearActiveProfileLocked();
+                state.ProfileErrorCode = null;
+                state.ProfileError = null;
+                state.ProfileConflict = null;
+                SaveStateLocked();
+                emit(currentFingerprint == baselineFingerprint
+                    ? "ModsConfig.xml already matches the captured baseline."
+                    : "Restored ModsConfig.xml atomically from the captured byte-for-byte baseline.");
+                emit("Baseline fingerprint: " + baselineFingerprint);
+                emit("Restoration occurs only while no RimWorld process, lease, or pending restart is active.");
+                return 0;
+            }
+        }
     }
 
     private int Help(Action<string> emit)
     {
         emit("DevBridge commands:");
         emit("  DevBridge.cmd status");
+        emit("  DevBridge.cmd mods status");
+        emit("  DevBridge.cmd mods capture-baseline");
+        emit("  DevBridge.cmd mods restore-baseline");
         emit("  DevBridge.cmd test begin");
+        emit("  DevBridge.cmd test session");
         emit("  DevBridge.cmd test renew <lease-id>");
         emit("  DevBridge.cmd test end <lease-id>");
         emit("  DevBridge.cmd stop <lease-id>");
         emit("  DevBridge.cmd ensure-ready <lease-id>");
-        emit("  DevBridge.cmd restart");
+        emit("  DevBridge.cmd restart [--projects none|alias[,alias...]]");
         emit("  DevBridge.cmd wait-ready");
         emit("  DevBridge.cmd doctor");
-        emit("Append --json to a command for one machine-readable result.");
+        emit("Append --json to a non-session command for one machine-readable result.");
+        emit("test session is a connected streaming lease owner; keep it attached to the test owner.");
         return 0;
     }
 
     private static int Unknown(string command, Action<string> emit)
     {
         emit("Unknown DevBridge command: " + command);
-        emit("Use: status, test begin, test renew <lease-id>, test end <lease-id>, stop <lease-id>, ensure-ready <lease-id>, restart, wait-ready, doctor");
+        emit("Use: status, mods status, mods capture-baseline, mods restore-baseline, test begin, test session, test renew <lease-id>, test end <lease-id>, stop <lease-id>, ensure-ready <lease-id>, restart [--projects ...], wait-ready, doctor");
         EmitNextCommand(emit, "DevBridge.cmd help");
         return 2;
     }
@@ -1219,7 +2062,7 @@ internal sealed class CoordinatorState
 
     private static void EmitKeepWaiting(Action<string> emit)
     {
-        emit("Next action: Keep waiting. Do not launch, kill, or restart RimWorld yourself.");
+        emit("Next action: Keep waiting. DevBridge owns the accepted restart; reconnect with DevBridge.cmd wait-ready. Do not launch, kill, restart, or end your task because of lease contention.");
     }
 
     private int Status(BridgeRequest request, Action<string> emit)
@@ -1269,15 +2112,22 @@ internal sealed class CoordinatorState
         emit("Launch ID: " + (string.IsNullOrWhiteSpace(snapshot.LaunchId) ? "none" : snapshot.LaunchId));
         emit("Active tests: " + snapshot.Leases.Count);
         emit("Session dirty: " + snapshot.SessionDirty);
+        snapshot.BaselineFingerprint = ReadBaselineFingerprintLocked() ?? snapshot.BaselineFingerprint;
+        snapshot.ModsConfigOwnership = CurrentModsConfigOwnershipLocked();
+        EmitProfile(snapshot, emit);
         foreach (TestLease lease in snapshot.Leases.OrderBy(value => value.StartedUtc))
             emit("  " + lease.Id + " - " + lease.Agent + " - age " + FormatAge(lease.StartedUtc) +
-                " - stale in " + FormatStaleIn(lease));
+                " - lastHeartbeatUtc=" + FormatUtc(LeaseActivityUtc(lease)) +
+                " - expiresUtc=" + FormatUtc(LeaseExpiresUtc(lease)) +
+                " - retryAfterSeconds=" + RetryAfterSeconds(LeaseExpiresUtc(lease), clock.UtcNow));
 
         if (snapshot.RestartPending)
         {
-            emit("Restart is in progress.");
+            emit("Restart is queued and owned by DevBridge.");
             emit("Restart: pending for generation " + snapshot.TargetGeneration +
                 (snapshot.RestartRequestedUtc.HasValue ? " (requested " + FormatAge(snapshot.RestartRequestedUtc.Value) + " ago)" : string.Empty));
+            if (snapshot.Leases.Count > 0)
+                EmitLeaseWaitDetails(snapshot, emit);
             emit("New test requests are waiting for the new generation.");
         }
 
@@ -1285,6 +2135,10 @@ internal sealed class CoordinatorState
             emit("Error: " + snapshot.Error);
         if (!string.IsNullOrWhiteSpace(snapshot.ErrorCode))
             emit("Error code: " + snapshot.ErrorCode);
+        if (!string.IsNullOrWhiteSpace(snapshot.ProfileError))
+            emit("Profile error: " + snapshot.ProfileErrorCode + " - " + snapshot.ProfileError);
+        if (!string.IsNullOrWhiteSpace(snapshot.ProfileConflict))
+            emit("Profile conflict: " + snapshot.ProfileConflict);
 
         if (snapshot.MaintenanceReady)
         {
@@ -1364,6 +2218,8 @@ internal sealed class CoordinatorState
             : "WARN DevBridge2 is not active in the current ModsConfig.xml; the coordinator will enable it before launch.");
         emit("Coordinator state: " + snapshot.Phase + ", generation " + snapshot.Generation);
         emit("Coordinator-owned RimWorld process: " + (processRunning ? "yes (PID " + snapshot.ProcessId + ")" : "no"));
+        if (snapshot.RestartPending && snapshot.Leases.Count > 0)
+            EmitLeaseWaitDetails(snapshot, emit);
         if (processInspectionAmbiguous)
             emit("WARN RimWorld process inspection is ambiguous; no process-control or launch action was taken.");
         if (processInspectionRecovered)
@@ -1409,7 +2265,8 @@ internal sealed class CoordinatorState
 
     private static string Check(bool passed, string text) => (passed ? "PASS " : "FAIL ") + text;
 
-    private int BeginLease(BridgeRequest request, Action<string> emit, Func<bool> connected)
+    private int BeginLease(BridgeRequest request, Action<string> emit, Func<bool> connected,
+        Action<TestLease> acquired = null)
     {
         emit("Agent/session: " + request.Agent);
         bool startInitialLaunch;
@@ -1476,6 +2333,7 @@ internal sealed class CoordinatorState
                         LastHeartbeatUtc = clock.UtcNow
                     };
                     state.Leases.Add(lease);
+                    acquired?.Invoke(lease);
                     SaveStateLocked();
                     Monitor.PulseAll(gate);
                     break;
@@ -1501,13 +2359,106 @@ internal sealed class CoordinatorState
         }
         emit("Generation: " + lease.Generation);
         emit(string.Empty);
-        emit("Next action: Test your mod; for work longer than 20 minutes, renew the lease, then run:");
+        emit("Next action: Test your mod; this lease expires two minutes after its last heartbeat. Renew it before expiresUtc; for automatic renewal, start long-running work with test session, then run:");
         emit("DevBridge.cmd test end " + lease.Id);
         if (!connected())
         {
             ReleaseLeaseSilently(lease.Id);
             return 4;
         }
+        return 0;
+    }
+
+    private int SessionLease(BridgeRequest request, Action<string> emit, Func<bool> connected)
+    {
+        if (request.Json)
+        {
+            emit("Usage: DevBridge.cmd test session (streaming command; omit --json)");
+            return 2;
+        }
+
+        TestLease lease = null;
+        int result = BeginLease(request, emit, connected, acquired: value => lease = value);
+        if (result != 0 || lease == null)
+            return result;
+
+        emit("Connected lease session is active for " + lease.Id + ".");
+        emit("DevBridge will heartbeat this lease every " +
+            options.LeaseHeartbeatInterval.TotalSeconds.ToString("0", CultureInfo.InvariantCulture) +
+            " seconds while this command remains connected.");
+        emit("Keep this session attached to the test owner; cancellation or disconnect stops heartbeats.");
+        return RunLeaseSession(request, lease, emit, connected);
+    }
+
+    private int RunLeaseSession(BridgeRequest request, TestLease lease, Action<string> emit,
+        Func<bool> connected)
+    {
+        DateTime nextHeartbeatUtc = clock.UtcNow.Add(options.LeaseHeartbeatInterval);
+        DateTime nextProgressUtc = clock.UtcNow;
+
+        while (connected())
+        {
+            bool heartbeat = false;
+            bool missing = false;
+            string progress = null;
+            DateTime now = clock.UtcNow;
+            lock (gate)
+            {
+                PruneStaleLeasesLocked();
+                TestLease current = state.Leases.FirstOrDefault(value =>
+                    string.Equals(value.Id, lease.Id, StringComparison.OrdinalIgnoreCase));
+                if (current == null || !string.Equals(current.Agent, request.Agent, StringComparison.Ordinal))
+                {
+                    missing = true;
+                }
+                else
+                {
+                    if (now >= nextHeartbeatUtc)
+                    {
+                        current.LastHeartbeatUtc = now;
+                        SaveStateLocked();
+                        Monitor.PulseAll(gate);
+                        heartbeat = true;
+                        nextHeartbeatUtc = now.Add(options.LeaseHeartbeatInterval);
+                    }
+
+                    if (now >= nextProgressUtc)
+                    {
+                        progress = "Lease session active: " + current.Id +
+                            " expiresUtc=" + FormatUtc(LeaseExpiresUtc(current)) +
+                            " retryAfterSeconds=" + RetryAfterSeconds(LeaseExpiresUtc(current), now);
+                        nextProgressUtc = now.Add(options.LeaseProgressInterval);
+                    }
+                }
+            }
+
+            if (missing)
+            {
+                emit("Lease session ended; DevBridge will not renew " + lease.Id + ".");
+                return 0;
+            }
+
+            if (heartbeat)
+                emit("Test lease heartbeat: " + lease.Id);
+            if (progress != null)
+                emit(progress);
+
+            if (!connected())
+                break;
+
+            now = clock.UtcNow;
+            TimeSpan delay = options.LeaseSessionPollInterval;
+            TimeSpan untilHeartbeat = nextHeartbeatUtc - now;
+            TimeSpan untilProgress = nextProgressUtc - now;
+            if (untilHeartbeat < delay)
+                delay = untilHeartbeat;
+            if (untilProgress < delay)
+                delay = untilProgress;
+            if (delay <= TimeSpan.Zero)
+                continue;
+            clock.Sleep(delay);
+        }
+
         return 0;
     }
 
@@ -1534,12 +2485,12 @@ internal sealed class CoordinatorState
             SaveStateLocked();
             Monitor.PulseAll(gate);
             emit("Test lease renewed: " + lease.Id);
-            emit("Next action: Continue testing; renew the lease before its stale interval expires.");
+            emit("Next action: Continue testing; renew the lease before expiresUtc, or keep a connected test session.");
             return 0;
         }
     }
 
-    private int EndLease(IReadOnlyList<string> arguments, Action<string> emit)
+    private int EndLease(BridgeRequest request, IReadOnlyList<string> arguments, Action<string> emit)
     {
         if (arguments.Count < 2 || string.IsNullOrWhiteSpace(arguments[1]))
         {
@@ -1557,6 +2508,13 @@ internal sealed class CoordinatorState
             {
                 emit("Test lease " + leaseId + " was already released or expired.");
                 return 0;
+            }
+
+            if (!string.Equals(lease.Agent, request.Agent, StringComparison.Ordinal))
+            {
+                emit("Test lease release denied: lease " + leaseId +
+                    " is not held by this stable agent identity.");
+                return 4;
             }
 
             state.Leases.Remove(lease);
@@ -1801,12 +2759,88 @@ internal sealed class CoordinatorState
 
     private int Restart(BridgeRequest request, Action<string> emit)
     {
+        RestartArguments restartArguments;
+        try
+        {
+            restartArguments = ParseRestartArguments(request.Arguments);
+        }
+        catch (ProfileException exception)
+        {
+            RecordProfileError(exception.Code, exception.Message);
+            emit("Restart request denied: " + exception.Message);
+            emit("Error code: " + exception.Code);
+            return 2;
+        }
+
         int targetGeneration;
         int currentGeneration;
         bool alreadyPending;
         bool observedPending;
+        bool reuseAcceptedProfile = false;
         lock (gate)
+        {
             observedPending = state.RestartPending;
+            string requestOwner = LaunchOwnerFor(request);
+            if (observedPending && !string.Equals(state.LaunchOwner, requestOwner, StringComparison.Ordinal) &&
+                (!string.IsNullOrWhiteSpace(state.LaunchOwner) ||
+                 !string.Equals(state.LastLaunchOwner, requestOwner, StringComparison.Ordinal)))
+            {
+                emit("Restart denied: another owner already controls this runtime slot launch.");
+                emit("No launch was attempted.");
+                return 4;
+            }
+            if (!restartArguments.HasProjects && state.ProfileMode != ModProfile.LegacyMode)
+            {
+                string message = "an opt-in profile is already active; choose --projects with the accepted roots or run mods restore-baseline before an unprofiled restart";
+                state.ProfileConflict = message;
+                state.ProfileErrorCode = "PROFILE_CONFLICT";
+                state.ProfileError = message;
+                SaveStateLocked();
+                emit("Restart denied: " + message + ".");
+                emit("Error code: PROFILE_CONFLICT");
+                emit("No launch was attempted.");
+                return 4;
+            }
+            if (state.RestartPending && !ProfileRequestMatchesLocked(restartArguments, null))
+            {
+                string message = "a different profile is already accepted for generation " + state.TargetGeneration +
+                    "; the pending restart cannot be replaced silently";
+                state.ProfileConflict = message;
+                state.ProfileErrorCode = "PROFILE_CONFLICT";
+                state.ProfileError = message;
+                SaveStateLocked();
+                emit("Restart denied: " + message + ".");
+                emit("Error code: PROFILE_CONFLICT");
+                emit("No launch was attempted.");
+                return 4;
+            }
+            if (state.RestartPending)
+                reuseAcceptedProfile = true;
+
+            string completedRequestKey = "restart-" + state.Generation;
+            if (!state.RestartPending && state.Phase == BridgePhase.READY &&
+                string.Equals(state.LastLaunchOwner, requestOwner, StringComparison.Ordinal) &&
+                string.Equals(state.LastLaunchRequestKey, completedRequestKey, StringComparison.Ordinal) &&
+                ProfileRequestMatchesLocked(restartArguments, null))
+                reuseAcceptedProfile = true;
+        }
+
+        ModProfile requestedProfile = null;
+        if (restartArguments.HasProjects && !reuseAcceptedProfile)
+        {
+            try
+            {
+                requestedProfile = ResolveRequestedProfile(restartArguments.Projects);
+            }
+            catch (ProfileException exception)
+            {
+                RecordProfileError(exception.Code, exception.Message);
+                emit("Profile request denied: " + exception.Message);
+                emit("Error code: " + exception.Code);
+                return 4;
+            }
+        }
+
         lock (lifecycleGate)
         {
             lock (gate)
@@ -1820,14 +2854,6 @@ internal sealed class CoordinatorState
                     return 4;
                 }
                 string requestOwner = LaunchOwnerFor(request);
-                if (observedPending && !string.Equals(state.LaunchOwner, requestOwner, StringComparison.Ordinal) &&
-                    (!string.IsNullOrWhiteSpace(state.LaunchOwner) ||
-                     !string.Equals(state.LastLaunchOwner, requestOwner, StringComparison.Ordinal)))
-                {
-                    emit("Restart denied: another owner already controls this runtime slot launch.");
-                    emit("No launch was attempted.");
-                    return 4;
-                }
                 currentGeneration = state.Generation;
                 alreadyPending = state.RestartPending;
                 if (alreadyPending && !string.IsNullOrWhiteSpace(state.LaunchOwner) &&
@@ -1837,10 +2863,51 @@ internal sealed class CoordinatorState
                     emit("No launch was attempted.");
                     return 4;
                 }
+
+                if (alreadyPending && !ProfileRequestMatchesLocked(restartArguments, requestedProfile))
+                {
+                    string message = "a different profile is already accepted for generation " + state.TargetGeneration +
+                        "; the pending restart cannot be replaced silently";
+                    state.ProfileConflict = message;
+                    state.ProfileErrorCode = "PROFILE_CONFLICT";
+                    state.ProfileError = message;
+                    SaveStateLocked();
+                    emit("Restart denied: " + message + ".");
+                    emit("Error code: PROFILE_CONFLICT");
+                    emit("No launch was attempted.");
+                    return 4;
+                }
+
+                if (!alreadyPending && requestedProfile != null)
+                {
+                    try
+                    {
+                        ModProfileResolver.ValidateResolvedProfile(requestedProfile);
+                    }
+                    catch (ProfileException exception)
+                    {
+                        RecordProfileErrorLocked(exception.Code, exception.Message);
+                        emit("Profile request denied: " + exception.Message);
+                        emit("Error code: " + exception.Code);
+                        return 4;
+                    }
+
+                    string currentBaselineFingerprint = ReadBaselineFingerprintLocked();
+                    if (!string.Equals(currentBaselineFingerprint, requestedProfile.BaselineFingerprint,
+                            StringComparison.Ordinal))
+                    {
+                        string message = "the captured baseline changed while the profile request was resolving";
+                        RecordProfileErrorLocked("PROFILE_BASELINE_CHANGED", message);
+                        emit("Profile request denied: " + message + ".");
+                        emit("Error code: PROFILE_BASELINE_CHANGED");
+                        return 4;
+                    }
+                }
+
                 if (state.MaintenanceReady)
                 {
-                    if (request.Arguments.Count < 1 ||
-                        !TryGetLeaseHolderLocked(request.Arguments[0], request, out TestLease maintenanceLease))
+                    if (string.IsNullOrWhiteSpace(restartArguments.LeaseId) ||
+                        !TryGetLeaseHolderLocked(restartArguments.LeaseId, request, out TestLease maintenanceLease))
                     {
                         emit("Restart denied: a lease-holder token is required while maintenanceReady=true.");
                         emit("No launch was attempted.");
@@ -1882,7 +2949,8 @@ internal sealed class CoordinatorState
                 string completedRequestKey = "restart-" + state.Generation;
                 if (!alreadyPending && state.Phase == BridgePhase.READY &&
                     string.Equals(state.LastLaunchOwner, LaunchOwnerFor(request), StringComparison.Ordinal) &&
-                    string.Equals(state.LastLaunchRequestKey, completedRequestKey, StringComparison.Ordinal))
+                    string.Equals(state.LastLaunchRequestKey, completedRequestKey, StringComparison.Ordinal) &&
+                    ProfileRequestMatchesLocked(restartArguments, requestedProfile))
                 {
                     targetGeneration = state.Generation;
                     emit("Restart already completed for generation " + targetGeneration + ".");
@@ -1899,6 +2967,11 @@ internal sealed class CoordinatorState
                         emit("No launch was attempted.");
                         return 4;
                     }
+                    ModProfile acceptedProfile = restartArguments.HasProjects ? requestedProfile : null;
+                    SetActiveProfileLocked(acceptedProfile);
+                    state.ProfileErrorCode = null;
+                    state.ProfileError = null;
+                    state.ProfileConflict = null;
                     state.TargetGeneration = targetGeneration;
                     state.RestartPending = true;
                     state.RestartRequestedUtc = clock.UtcNow;
@@ -1925,6 +2998,8 @@ internal sealed class CoordinatorState
             emit("Restart accepted for generation " + currentGeneration + " -> " + targetGeneration + ".");
         emit("Agent/session: " + request.Agent);
         emit("DevBridge now owns this restart.");
+        lock (gate)
+            EmitProfile(state, emit);
         emit("If this command is interrupted or times out, do not request another restart.");
         EmitNextCommand(emit, "DevBridge.cmd wait-ready");
 
@@ -1955,6 +3030,80 @@ internal sealed class CoordinatorState
             WaitForStateChange(ProgressInterval);
             EmitRestartWait(emit);
         }
+    }
+
+    private RestartArguments ParseRestartArguments(IReadOnlyList<string> arguments)
+    {
+        string leaseId = null;
+        string projectValue = null;
+        bool hasProjects = false;
+        for (int index = 0; index < (arguments?.Count ?? 0); index++)
+        {
+            string argument = arguments[index]?.Trim() ?? string.Empty;
+            if (string.Equals(argument, "--projects", StringComparison.OrdinalIgnoreCase))
+            {
+                if (hasProjects || index + 1 >= arguments.Count || string.IsNullOrWhiteSpace(arguments[++index]))
+                    throw new ProfileException("PROFILE_INVALID_REQUEST", "restart --projects requires one value.");
+                projectValue = arguments[index].Trim();
+                hasProjects = true;
+                continue;
+            }
+            if (argument.StartsWith("--projects=", StringComparison.OrdinalIgnoreCase))
+            {
+                if (hasProjects)
+                    throw new ProfileException("PROFILE_INVALID_REQUEST", "restart accepts only one --projects option.");
+                projectValue = argument.Substring("--projects=".Length).Trim();
+                if (projectValue.Length == 0)
+                    throw new ProfileException("PROFILE_INVALID_REQUEST", "restart --projects requires one value.");
+                hasProjects = true;
+                continue;
+            }
+            if (argument.StartsWith("--", StringComparison.Ordinal))
+                throw new ProfileException("PROFILE_INVALID_REQUEST", "Unknown restart option '" + argument + "'.");
+            if (string.IsNullOrWhiteSpace(leaseId))
+                leaseId = argument;
+            else
+                throw new ProfileException("PROFILE_INVALID_REQUEST", "restart accepts at most one lease ID.");
+        }
+
+        if (!hasProjects)
+            return new RestartArguments { LeaseId = leaseId };
+        if (string.Equals(projectValue, "none", StringComparison.OrdinalIgnoreCase))
+            return new RestartArguments { LeaseId = leaseId, HasProjects = true };
+        string[] parts = projectValue.Split(',', StringSplitOptions.None);
+        if (parts.Length == 0 || parts.Any(value => string.IsNullOrWhiteSpace(value)))
+            throw new ProfileException("PROFILE_INVALID_REQUEST", "restart --projects requires none or one or more aliases.");
+        List<string> aliases = parts.Select(value => value.Trim()).ToList();
+        return new RestartArguments { LeaseId = leaseId, HasProjects = true, Projects = aliases };
+    }
+
+    private ModProfile ResolveRequestedProfile(IReadOnlyList<string> aliases)
+    {
+        string baselineFingerprint;
+        lock (gate)
+            baselineFingerprint = ReadBaselineFingerprintLocked();
+        return ModProfileResolver.Resolve(root, baselineFingerprint, aliases, options.InstalledModsRoots);
+    }
+
+    private bool ProfileRequestMatchesLocked(RestartArguments arguments, ModProfile requestedProfile)
+    {
+        if (arguments.HasProjects)
+        {
+            try
+            {
+                IReadOnlyList<string> canonical = ModProfileResolver.CanonicalAliases(arguments.Projects);
+                if (canonical.Count == 0)
+                    return state.ProfileMode == ModProfile.BaselineMode &&
+                        (state.RequestedProjects?.Count ?? 0) == 0;
+                return state.ProfileMode == ModProfile.ProjectsMode &&
+                    (state.RequestedProjects ?? new List<string>()).SequenceEqual(canonical, StringComparer.Ordinal);
+            }
+            catch (ProfileException)
+            {
+                return false;
+            }
+        }
+        return state.ProfileMode == ModProfile.LegacyMode;
     }
 
     private int WaitReady(BridgeRequest request, Action<string> emit)
@@ -2067,7 +3216,7 @@ internal sealed class CoordinatorState
 
         if (snapshot.Leases.Count == 0)
         {
-            emit("Restart is in progress.");
+            emit("Restart is queued and owned by DevBridge.");
             emit("No active tests remain.");
             emit("State: " + snapshot.Phase + ". Waiting for generation " + snapshot.TargetGeneration +
                 " quicktest map readiness.");
@@ -2075,12 +3224,28 @@ internal sealed class CoordinatorState
             return;
         }
 
-        emit("Restart is in progress.");
-        emit("Waiting for " + snapshot.Leases.Count + " active test" + (snapshot.Leases.Count == 1 ? "" : "s") + ":");
-        foreach (TestLease lease in snapshot.Leases.OrderBy(value => value.StartedUtc))
-            emit("  " + lease.Id + " - " + lease.Agent + " - active " + FormatAge(lease.StartedUtc) +
-                " - stale in " + FormatStaleIn(lease));
+        emit("Restart is queued and owned by DevBridge.");
+        emit("Waiting for " + snapshot.Leases.Count + " active test" + (snapshot.Leases.Count == 1 ? "" : "s") + ".");
+        EmitLeaseWaitDetails(snapshot, emit);
         EmitKeepWaiting(emit);
+    }
+
+    private void EmitLeaseWaitDetails(PersistedState snapshot, Action<string> emit)
+    {
+        TestLease next = snapshot.Leases
+            .OrderBy(value => LeaseExpiresUtc(value))
+            .FirstOrDefault();
+        if (next == null)
+            return;
+
+        DateTime now = clock.UtcNow;
+        emit("Next blocking lease can expire at " + FormatUtc(LeaseExpiresUtc(next)) +
+            " (retryAfterSeconds=" + RetryAfterSeconds(LeaseExpiresUtc(next), now) + ").");
+        foreach (TestLease lease in snapshot.Leases.OrderBy(value => value.StartedUtc))
+            emit("  " + lease.Id + " - " + lease.Agent +
+                " - lastHeartbeatUtc=" + FormatUtc(LeaseActivityUtc(lease)) +
+                " - expiresUtc=" + FormatUtc(LeaseExpiresUtc(lease)) +
+                " - retryAfterSeconds=" + RetryAfterSeconds(LeaseExpiresUtc(lease), now));
     }
 
     private void ReleaseLeaseSilently(string leaseId)
@@ -2312,19 +3477,33 @@ internal sealed class CoordinatorState
             if (!File.Exists(rimWorldExe))
                 throw new FileNotFoundException("RimWorld executable was not found", rimWorldExe);
 
-            EnsureDevBridgeModEnabled();
-
             lock (gate)
             {
-                // The ownership lock and lifecycleGate are held immediately before the
-                // only raw launch call. This snapshot cannot be overwritten by another owner.
+                // Check the census before changing ModsConfig. lifecycleGate serializes this
+                // launch with coordinator-owned lifecycle operations, so an unmanaged process
+                // fails closed without leaving a generated profile behind.
                 List<UnmanagedRimWorldProcess> unmanagedProcesses =
                     FindUnmanagedRimWorldProcesses(processIdToExclude: 0, startTicksToExclude: 0);
                 if (unmanagedProcesses.Count > 0)
                     throw new InvalidOperationException("an unmanaged RimWorld process is already running (PID " +
                         string.Join(", ", unmanagedProcesses.Select(value => value.ProcessId.ToString())) +
                         "); close it through Steam before retrying");
+            }
 
+            ModProfile profile;
+            lock (gate)
+                profile = state.ProfileMode == ModProfile.LegacyMode ? null : ProfileFromStateLocked();
+            if (profile == null)
+                EnsureDevBridgeModEnabled();
+            else
+                ApplyProfile(profile, targetGeneration);
+
+            // A process may have appeared after the pre-write census. Check again at the
+            // launch boundary so an external RimWorld start cannot become a duplicate launch.
+            EnsureNoMatchingRimWorldProcess();
+            lock (gate)
+            {
+                // Profile application is complete immediately before the only raw launch call.
                 state.LaunchAttemptCount++;
                 state.LaunchBudgetRemaining--;
                 SaveStateLocked();
@@ -2364,7 +3543,8 @@ internal sealed class CoordinatorState
         {
             FailLaunch(DescribeLaunchFailure(exception, process), exception is TimeoutException ?
                 "READINESS_TIMEOUT" : exception is ProcessInspectionException ?
-                    ProcessInspection.ErrorCode : "LAUNCH_FAILED");
+                    ProcessInspection.ErrorCode : exception is ProfileException profileException ?
+                        profileException.Code : "LAUNCH_FAILED");
         }
         finally
         {
@@ -2447,6 +3627,12 @@ internal sealed class CoordinatorState
             state.Phase = BridgePhase.ERROR;
             state.RestartPending = false;
             state.ErrorCode = errorCode;
+            if (errorCode.StartsWith("PROFILE_", StringComparison.Ordinal) ||
+                errorCode.StartsWith("MODS_CONFIG_", StringComparison.Ordinal))
+            {
+                state.ProfileErrorCode = errorCode;
+                state.ProfileError = detail;
+            }
             state.Error = errorCode == ProcessInspection.ErrorCode ? ProcessInspection.Message :
                 errorCode == "READINESS_TIMEOUT" ?
                 "READINESS_TIMEOUT: " + detail + ". The original process was retained; no replacement launch was attempted." :
@@ -2769,9 +3955,9 @@ internal sealed class CoordinatorState
 
     private void PruneStaleLeasesLocked()
     {
-        DateTime cutoff = clock.UtcNow - LeaseStaleAfter;
+        DateTime cutoff = clock.UtcNow - options.LeaseDuration;
         int before = state.Leases.Count;
-        state.Leases.RemoveAll(lease => lease == null || LeaseActivityUtc(lease) < cutoff);
+        state.Leases.RemoveAll(lease => lease == null || LeaseActivityUtc(lease) <= cutoff);
         if (state.Leases.Count != before)
         {
             SaveStateLocked();
@@ -3074,6 +4260,88 @@ internal sealed class CoordinatorState
 
         state.Leases ??= new List<TestLease>();
         state.ScopeTickets ??= new List<ScopeTicket>();
+        bool profileFieldsPresent = (state.RequestedProjects?.Count ?? 0) > 0 ||
+            (state.ResolvedProjectPackageIds?.Count ?? 0) > 0 ||
+            (state.ResolvedMods?.Count ?? 0) > 0 ||
+            !string.IsNullOrWhiteSpace(state.ProfileFingerprint);
+        string persistedProfileMode = state.ProfileMode;
+        if (string.IsNullOrWhiteSpace(persistedProfileMode))
+        {
+            if (profileFieldsPresent || state.RestartPending)
+                QuarantineInvalidProfileLocked(new ProfileException("PROFILE_INVALID_STATE",
+                    "Persisted profile mode is missing while profile or restart state is present."));
+            else
+            {
+                state.ProfileMode = ModProfile.LegacyMode;
+                changed = true;
+            }
+        }
+        else
+            state.ProfileMode = persistedProfileMode.Trim().ToLowerInvariant();
+
+        if (state.ProfileMode != ModProfile.LegacyMode && state.ProfileMode != ModProfile.BaselineMode &&
+            state.ProfileMode != ModProfile.ProjectsMode)
+        {
+            QuarantineInvalidProfileLocked(new ProfileException("PROFILE_INVALID_STATE",
+                "Persisted profile mode is invalid: " + persistedProfileMode + "."));
+        }
+        state.RequestedProjects ??= new List<string>();
+        state.ResolvedProjectPackageIds ??= new List<string>();
+        state.ResolvedMods ??= new List<string>();
+        if (state.ProfileMode == ModProfile.LegacyMode &&
+            (state.RequestedProjects.Count > 0 || state.ResolvedProjectPackageIds.Count > 0 ||
+             state.ResolvedMods.Count > 0 ||
+              !string.IsNullOrWhiteSpace(state.ProfileFingerprint)))
+        {
+            QuarantineInvalidProfileLocked(new ProfileException("PROFILE_INVALID_STATE",
+                "Persisted legacy state contains an accepted non-legacy profile."));
+        }
+        if (string.IsNullOrWhiteSpace(state.BaselineFingerprint))
+        {
+            string baselineFingerprint = ReadBaselineFingerprintLocked();
+            if (!string.IsNullOrWhiteSpace(baselineFingerprint))
+            {
+                state.BaselineFingerprint = baselineFingerprint;
+                changed = true;
+            }
+        }
+        else
+        {
+            string sidecarFingerprint = ReadBaselineFingerprintLocked();
+            if (state.ProfileMode != ModProfile.LegacyMode && string.IsNullOrWhiteSpace(sidecarFingerprint))
+            {
+                QuarantineInvalidProfileLocked(new ProfileException("PROFILE_BASELINE_MISSING",
+                    "The accepted profile has no durable baseline sidecar."));
+            }
+            else if (!string.IsNullOrWhiteSpace(sidecarFingerprint) &&
+                !string.Equals(sidecarFingerprint, state.BaselineFingerprint, StringComparison.Ordinal))
+            {
+                if (state.ProfileMode != ModProfile.LegacyMode || state.RestartPending)
+                    QuarantineInvalidProfileLocked(new ProfileException("PROFILE_BASELINE_CHANGED",
+                        "The captured baseline sidecar no longer matches its persisted fingerprint."));
+                else
+                {
+                    // A crash can occur after the durable baseline sidecar is replaced but
+                    // before state.json records its fingerprint. With no accepted profile,
+                    // the sidecar is the authoritative explicit baseline capture.
+                    state.BaselineFingerprint = sidecarFingerprint;
+                    changed = true;
+                }
+            }
+        }
+
+        if (state.ProfileMode != ModProfile.LegacyMode && state.ErrorCode != "PROFILE_INVALID_STATE" &&
+            state.ErrorCode != "PROFILE_BASELINE_CHANGED")
+        {
+            try
+            {
+                ModProfileResolver.ValidateResolvedProfile(ProfileFromStateLocked());
+            }
+            catch (ProfileException exception)
+            {
+                QuarantineInvalidProfileLocked(exception);
+            }
+        }
         foreach (TestLease lease in state.Leases.Where(value => value != null))
         {
             if (lease.LastHeartbeatUtc == default)
@@ -3134,9 +4402,384 @@ internal sealed class CoordinatorState
     private void SaveStateLocked()
     {
         Directory.CreateDirectory(runtimeRoot);
-        string temporary = statePath + ".tmp-" + Guid.NewGuid().ToString("N");
-        File.WriteAllText(temporary, JsonSerializer.Serialize(state, Program.JsonOptions), new UTF8Encoding(false));
-        File.Move(temporary, statePath, true);
+        AtomicWriteFile(statePath, Encoding.UTF8.GetBytes(JsonSerializer.Serialize(state, Program.JsonOptions)));
+    }
+
+    private ModProfile ProfileFromStateLocked()
+    {
+        if (state.ProfileMode == ModProfile.LegacyMode)
+            return null;
+        return new ModProfile
+        {
+            Mode = state.ProfileMode,
+            RequestedProjects = (state.RequestedProjects ?? new List<string>()).ToList(),
+            ResolvedProjectPackageIds = (state.ResolvedProjectPackageIds ?? new List<string>()).ToList(),
+            ResolvedMods = (state.ResolvedMods ?? new List<string>()).ToList(),
+            ProfileFingerprint = state.ProfileFingerprint,
+            BaselineFingerprint = state.BaselineFingerprint
+        };
+    }
+
+    private void SetActiveProfileLocked(ModProfile profile)
+    {
+        if (profile == null)
+        {
+            ClearActiveProfileLocked();
+            return;
+        }
+
+        state.ProfileMode = profile.Mode;
+        state.RequestedProjects = profile.RequestedProjects.ToList();
+        state.ResolvedProjectPackageIds = profile.ResolvedProjectPackageIds.ToList();
+        state.ResolvedMods = profile.ResolvedMods.ToList();
+        state.ProfileFingerprint = profile.ProfileFingerprint;
+        state.BaselineFingerprint = profile.BaselineFingerprint;
+    }
+
+    private void ClearActiveProfileLocked()
+    {
+        state.ProfileMode = ModProfile.LegacyMode;
+        state.RequestedProjects = new List<string>();
+        state.ResolvedProjectPackageIds = new List<string>();
+        state.ResolvedMods = new List<string>();
+        state.ProfileFingerprint = null;
+    }
+
+    private void RecordProfileError(string code, string message)
+    {
+        lock (gate)
+            RecordProfileErrorLocked(code, message);
+    }
+
+    private void RecordProfileErrorLocked(string code, string message)
+    {
+        state.ProfileErrorCode = code;
+        state.ProfileError = message;
+        SaveStateLocked();
+        Monitor.PulseAll(gate);
+    }
+
+    private void QuarantineInvalidProfileLocked(ProfileException exception)
+    {
+        state.ProfileErrorCode = exception.Code;
+        state.ProfileError = exception.Message;
+        state.ErrorCode = exception.Code;
+        state.Error = exception.Message;
+        state.Phase = BridgePhase.ERROR;
+        state.RestartPending = false;
+        state.LaunchOwner = null;
+        state.LaunchRequestKey = null;
+        state.WaitingForBridgeDeadlineUtc = null;
+        state.RequiresNewProcess = false;
+        SaveStateLocked();
+        Monitor.PulseAll(gate);
+    }
+
+    private void EmitProfile(PersistedState snapshot, Action<string> emit)
+    {
+        emit("Profile mode: " + (string.IsNullOrWhiteSpace(snapshot.ProfileMode) ? ModProfile.LegacyMode : snapshot.ProfileMode));
+        emit("Requested projects: " +
+            (snapshot.RequestedProjects == null || snapshot.RequestedProjects.Count == 0
+                ? "none" : string.Join(", ", snapshot.RequestedProjects)));
+        emit("Resolved project package IDs: " +
+            (snapshot.ResolvedProjectPackageIds == null || snapshot.ResolvedProjectPackageIds.Count == 0
+                ? "none" : string.Join(", ", snapshot.ResolvedProjectPackageIds)));
+        emit("Resolved mods (load order): " +
+            (snapshot.ResolvedMods == null || snapshot.ResolvedMods.Count == 0
+                ? "none" : string.Join(" -> ", snapshot.ResolvedMods)));
+        emit("Profile fingerprint: " + (snapshot.ProfileFingerprint ?? "none"));
+        emit("Baseline fingerprint: " + (snapshot.BaselineFingerprint ?? "none"));
+        emit("ModsConfig ownership: " + (snapshot.ModsConfigOwnership ?? "UNKNOWN"));
+    }
+
+    private bool CanChangeModsConfigLocked(Action<string> emit)
+    {
+        if (state.RestartPending || state.Phase == BridgePhase.DRAINING ||
+            state.Phase == BridgePhase.RESTARTING || state.Phase == BridgePhase.LOADING)
+        {
+            emit("ModsConfig change denied: a restart or launch is already pending.");
+            emit("Error code: PROFILE_RESTART_PENDING");
+            return false;
+        }
+        if (state.Leases.Count > 0)
+        {
+            emit("ModsConfig change denied: active test leases still exist.");
+            emit("Error code: PROFILE_LEASES_ACTIVE");
+            return false;
+        }
+
+        try
+        {
+            ProcessStatusSnapshot processes = EnumerateStatusProcessesLocked();
+            if (processes.MatchingProcessCount > 0)
+            {
+                emit("ModsConfig change denied: RimWorld is still running.");
+                emit("Error code: PROFILE_PROCESS_RUNNING");
+                return false;
+            }
+            return true;
+        }
+        catch (ProcessInspectionException)
+        {
+            RecordProfileErrorLocked(ProcessInspection.ErrorCode, ProcessInspection.Message);
+            emit("ModsConfig change denied: " + ProcessInspection.Message);
+            emit("Error code: " + ProcessInspection.ErrorCode);
+            return false;
+        }
+    }
+
+    private string ReadBaselineFingerprintLocked()
+    {
+        try
+        {
+            return File.Exists(baselinePath) ? HashBytes(File.ReadAllBytes(baselinePath)) : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private string CurrentModsConfigOwnershipLocked()
+    {
+        if (!File.Exists(modsConfigPath))
+            return "MISSING";
+        try
+        {
+            byte[] bytes = File.ReadAllBytes(modsConfigPath);
+            return CurrentModsConfigOwnershipLocked(bytes, HashBytes(bytes));
+        }
+        catch
+        {
+            return "UNKNOWN";
+        }
+    }
+
+    private string CurrentModsConfigOwnershipLocked(byte[] contents, string fingerprint)
+    {
+        GeneratedModsConfigManifest generatedManifest = ReadGeneratedModsConfigManifestLocked(out bool manifestPresent);
+        if (string.Equals(state.ModsConfigGeneratedHash, fingerprint, StringComparison.Ordinal) ||
+            string.Equals(generatedManifest?.Hash, fingerprint, StringComparison.OrdinalIgnoreCase))
+            return state.ModsConfigOwnership == "DEVBRIDGE_PENDING" ? "DEVBRIDGE_PENDING" : "DEVBRIDGE_GENERATED";
+        string baselineFingerprint = ReadBaselineFingerprintLocked() ?? state.BaselineFingerprint;
+        if (!string.IsNullOrWhiteSpace(baselineFingerprint) &&
+            string.Equals(baselineFingerprint, fingerprint, StringComparison.Ordinal))
+            return "BASELINE";
+        if (manifestPresent && generatedManifest == null)
+            return "UNKNOWN";
+        if (!string.IsNullOrWhiteSpace(state.ModsConfigGeneratedHash))
+            return "USER_EDIT";
+        return "USER";
+    }
+
+    private void ApplyProfile(ModProfile profile, int targetGeneration)
+    {
+        if (profile == null || profile.Mode == ModProfile.LegacyMode)
+            return;
+        ModProfileResolver.ValidateResolvedProfile(profile);
+        lock (gate)
+        {
+            string baselineFingerprint = ReadBaselineFingerprintLocked();
+            if (!string.Equals(baselineFingerprint, profile.BaselineFingerprint, StringComparison.Ordinal))
+                throw new ProfileException("PROFILE_BASELINE_CHANGED",
+                    "The captured baseline no longer matches the accepted profile; no ModsConfig change was made.");
+        }
+        if (!File.Exists(modsConfigPath))
+            throw new ProfileException("PROFILE_MODS_CONFIG_MISSING",
+                "ModsConfig.xml was not found at " + modsConfigPath + ".");
+
+        byte[] current = File.ReadAllBytes(modsConfigPath);
+        string currentFingerprint = HashBytes(current);
+        string ownership;
+        lock (gate)
+        {
+            ownership = CurrentModsConfigOwnershipLocked(current, currentFingerprint);
+            if (ownership == "USER_EDIT" || ownership == "USER" || ownership == "UNKNOWN" || ownership == "MISSING")
+                throw new ProfileException("MODS_CONFIG_EXTERNAL_EDIT",
+                    "ModsConfig.xml differs from the captured baseline or known DevBridge output; capture the intentional edit before using a reduced profile.");
+        }
+
+        byte[] updated = RenderProfileModsConfig(current, profile.ResolvedMods);
+        string updatedFingerprint = HashBytes(updated);
+        lock (gate)
+        {
+            state.ModsConfigOwnership = "DEVBRIDGE_PENDING";
+            state.ModsConfigGeneratedHash = updatedFingerprint;
+            state.ModsConfigGeneratedProfileFingerprint = profile.ProfileFingerprint;
+            state.ModsConfigGeneratedGeneration = targetGeneration;
+            SaveStateLocked();
+        }
+
+        try
+        {
+            WriteGeneratedModsConfigManifest(updatedFingerprint, profile.ProfileFingerprint, targetGeneration);
+        }
+        catch (Exception exception)
+        {
+            throw new ProfileException("MODS_CONFIG_OWNERSHIP_WRITE_FAILED",
+                "DevBridge could not durably record generated ModsConfig ownership: " + exception.Message);
+        }
+
+        options.BeforeModsConfigWrite?.Invoke();
+        byte[] latest;
+        try
+        {
+            latest = File.ReadAllBytes(modsConfigPath);
+        }
+        catch
+        {
+            throw new ProfileException("MODS_CONFIG_EXTERNAL_EDIT",
+                "ModsConfig.xml changed or disappeared while preparing the profile write.");
+        }
+        if (!string.Equals(HashBytes(latest), currentFingerprint, StringComparison.Ordinal))
+            throw new ProfileException("MODS_CONFIG_EXTERNAL_EDIT",
+                "ModsConfig.xml changed while preparing the profile write; no user edit was overwritten.");
+        EnsureNoMatchingRimWorldProcess();
+        AtomicWriteFile(modsConfigPath, updated);
+        lock (gate)
+        {
+            state.ModsConfigOwnership = "DEVBRIDGE_GENERATED";
+            state.ModsConfigGeneratedHash = updatedFingerprint;
+            state.ModsConfigGeneratedProfileFingerprint = profile.ProfileFingerprint;
+            state.ModsConfigGeneratedGeneration = targetGeneration;
+            state.BaselineFingerprint = profile.BaselineFingerprint;
+            SaveStateLocked();
+        }
+    }
+
+    private static byte[] RenderProfileModsConfig(byte[] contents, IReadOnlyList<string> packageIds)
+    {
+        XDocument document;
+        try
+        {
+            using MemoryStream stream = new(contents, writable: false);
+            document = XDocument.Load(stream, LoadOptions.PreserveWhitespace);
+        }
+        catch (Exception exception)
+        {
+            throw new ProfileException("PROFILE_MALFORMED_MODS_CONFIG",
+                "ModsConfig.xml could not be parsed before profile application: " + exception.Message);
+        }
+
+        List<XElement> activeSections = document.Descendants().Where(value =>
+            string.Equals(value.Name.LocalName, "activeMods", StringComparison.OrdinalIgnoreCase)).ToList();
+        if (activeSections.Count != 1)
+            throw new ProfileException("PROFILE_MALFORMED_MODS_CONFIG",
+                "ModsConfig.xml must contain exactly one activeMods section before profile application.");
+
+        XElement active = activeSections[0];
+        string newline = contents.AsSpan().IndexOf((byte)'\r') >= 0 ? "\r\n" : "\n";
+        active.RemoveNodes();
+        active.Add(new XText(newline));
+        foreach (string packageId in packageIds ?? Array.Empty<string>())
+        {
+            active.Add(new XElement("li", packageId));
+            active.Add(new XText(newline));
+        }
+
+        return Encoding.UTF8.GetBytes(document.ToString(SaveOptions.DisableFormatting));
+    }
+
+    private static string HashBytes(byte[] contents) =>
+        Convert.ToHexString(SHA256.HashData(contents ?? Array.Empty<byte>()));
+
+    private GeneratedModsConfigManifest ReadGeneratedModsConfigManifestLocked(out bool present)
+    {
+        present = false;
+        try
+        {
+            if (!File.Exists(generatedManifestPath))
+                return null;
+            present = true;
+            GeneratedModsConfigManifest manifest = JsonSerializer.Deserialize<GeneratedModsConfigManifest>(
+                File.ReadAllText(generatedManifestPath), Program.JsonOptions);
+            if (manifest == null || !IsValidHash(manifest.Hash))
+                return null;
+            return manifest;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private void WriteGeneratedModsConfigManifest(string hash, string profileFingerprint, int generation)
+    {
+        if (!IsValidHash(hash))
+            throw new InvalidDataException("the generated ModsConfig hash was invalid");
+        GeneratedModsConfigManifest manifest = new()
+        {
+            Hash = hash.ToUpperInvariant(),
+            ProfileFingerprint = profileFingerprint,
+            Generation = generation
+        };
+        AtomicWriteFile(generatedManifestPath,
+            Encoding.UTF8.GetBytes(JsonSerializer.Serialize(manifest, Program.JsonOptions)));
+    }
+
+    private void ClearGeneratedModsConfigManifestLocked()
+    {
+        try
+        {
+            if (File.Exists(generatedManifestPath))
+                File.Delete(generatedManifestPath);
+        }
+        catch
+        {
+            // A stale manifest cannot claim the new baseline unless its hash matches it.
+        }
+    }
+
+    private static bool IsValidHash(string value) =>
+        !string.IsNullOrWhiteSpace(value) && value.Length == 64 && value.All(Uri.IsHexDigit);
+
+    private void EnsureNoMatchingRimWorldProcess()
+    {
+        ProcessStatusSnapshot processes;
+        lock (gate)
+            processes = EnumerateStatusProcessesLocked();
+        if (processes.MatchingProcessCount > 0)
+            throw new ProfileException("MODS_CONFIG_PROCESS_RUNNING",
+                "a matching RimWorld process is running; ModsConfig.xml was not changed");
+    }
+
+    private static void AtomicWriteFile(string path, byte[] contents)
+    {
+        string directory = Path.GetDirectoryName(path);
+        if (!string.IsNullOrWhiteSpace(directory))
+            Directory.CreateDirectory(directory);
+        string temporary = path + ".tmp-" + Guid.NewGuid().ToString("N");
+        try
+        {
+            using (FileStream stream = new(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                stream.Write(contents ?? Array.Empty<byte>());
+                stream.Flush(true);
+            }
+
+            if (File.Exists(path))
+            {
+                try
+                {
+                    File.Replace(temporary, path, null, ignoreMetadataErrors: true);
+                }
+                catch (PlatformNotSupportedException)
+                {
+                    File.Move(temporary, path, true);
+                }
+                catch (IOException)
+                {
+                    File.Move(temporary, path, true);
+                }
+            }
+            else
+                File.Move(temporary, path);
+        }
+        finally
+        {
+            if (File.Exists(temporary))
+                File.Delete(temporary);
+        }
     }
 
     private bool IsDevBridgeModEnabled()
@@ -3163,12 +4806,14 @@ internal sealed class CoordinatorState
             throw new InvalidOperationException("ModsConfig.xml was not found at " + modsConfigPath +
                 "; enable lan.devbridge2 in RimWorld before using quicktest");
 
+        byte[] originalBytes = File.ReadAllBytes(modsConfigPath);
+        string originalFingerprint = HashBytes(originalBytes);
         string contents = File.ReadAllText(modsConfigPath);
         string normalized = contents.Replace("<li>Lan.DevBridge2</li>",
             "<li>" + DevBridgePackageId + "</li>", StringComparison.OrdinalIgnoreCase);
         if (!string.Equals(contents, normalized, StringComparison.Ordinal))
         {
-            WriteModsConfig(normalized);
+            WriteModsConfig(normalized, originalFingerprint);
             return;
         }
 
@@ -3178,29 +4823,50 @@ internal sealed class CoordinatorState
 
         string entry = Environment.NewLine + "    <li>" + DevBridgePackageId + "</li>";
         string updated = contents.Insert(activeModsEnd, entry);
-        WriteModsConfig(updated);
+        WriteModsConfig(updated, originalFingerprint);
     }
 
-    private void WriteModsConfig(string contents)
+    private void WriteModsConfig(string contents, string expectedSourceFingerprint)
     {
-        string temporary = modsConfigPath + ".devbridge2.tmp-" + Guid.NewGuid().ToString("N");
+        options.BeforeModsConfigWrite?.Invoke();
+        byte[] current;
         try
         {
-            File.WriteAllText(temporary, contents, new UTF8Encoding(false));
-            try
-            {
-                File.Replace(temporary, modsConfigPath, null);
-            }
-            catch
-            {
-                File.Delete(modsConfigPath);
-                File.Move(temporary, modsConfigPath);
-            }
+            current = File.ReadAllBytes(modsConfigPath);
         }
-        finally
+        catch
         {
-            if (File.Exists(temporary))
-                File.Delete(temporary);
+            throw new ProfileException("MODS_CONFIG_EXTERNAL_EDIT",
+                "ModsConfig.xml changed or disappeared while preparing the DevBridge activation write.");
+        }
+        if (!string.Equals(HashBytes(current), expectedSourceFingerprint, StringComparison.Ordinal))
+            throw new ProfileException("MODS_CONFIG_EXTERNAL_EDIT",
+                "ModsConfig.xml changed while preparing the DevBridge activation write; no user edit was overwritten.");
+        EnsureNoMatchingRimWorldProcess();
+        byte[] updated = new UTF8Encoding(false).GetBytes(contents);
+        string updatedFingerprint = HashBytes(updated);
+        int generation;
+        lock (gate)
+            generation = state.TargetGeneration > 0 ? state.TargetGeneration : state.Generation;
+        try
+        {
+            // Record the expected output before replacement so a crash after the config
+            // swap cannot make generated content look like a user baseline.
+            WriteGeneratedModsConfigManifest(updatedFingerprint, null, generation);
+        }
+        catch (Exception exception)
+        {
+            throw new ProfileException("MODS_CONFIG_OWNERSHIP_WRITE_FAILED",
+                "DevBridge could not durably record generated ModsConfig ownership: " + exception.Message);
+        }
+        AtomicWriteFile(modsConfigPath, updated);
+        lock (gate)
+        {
+            state.ModsConfigOwnership = "DEVBRIDGE_GENERATED";
+            state.ModsConfigGeneratedHash = updatedFingerprint;
+            state.ModsConfigGeneratedProfileFingerprint = null;
+            state.ModsConfigGeneratedGeneration = generation;
+            SaveStateLocked();
         }
     }
 
@@ -3216,7 +4882,11 @@ internal sealed class CoordinatorState
                 SynchronizeLocked();
                 RevalidateMaintenanceReadyLocked();
             }
+            else
+                PruneStaleLeasesLocked();
             snapshot = CloneStateLocked();
+            snapshot.BaselineFingerprint = ReadBaselineFingerprintLocked() ?? snapshot.BaselineFingerprint;
+            snapshot.ModsConfigOwnership = CurrentModsConfigOwnershipLocked();
         }
 
         string commandName = request.Command ?? string.Empty;
@@ -3254,12 +4924,27 @@ internal sealed class CoordinatorState
             SessionDirty = snapshot.SessionDirty,
             ActiveTests = snapshot.Leases.Count,
             RestartPending = snapshot.RestartPending,
+            RestartQueued = snapshot.RestartPending,
             TargetGeneration = snapshot.TargetGeneration,
             LaunchOwner = snapshot.LaunchOwner,
             LaunchAttemptCount = snapshot.LaunchAttemptCount,
             LaunchBudgetRemaining = snapshot.LaunchBudgetRemaining,
             WaitingForBridgeDeadlineUtc = snapshot.WaitingForBridgeDeadlineUtc,
+            NextLeaseExpirationUtc = snapshot.Leases.Count == 0
+                ? null
+                : snapshot.Leases.Min(value => LeaseExpiresUtc(value)),
+            RetryAfterSeconds = snapshot.Leases.Count == 0
+                ? null
+                : RetryAfterSeconds(snapshot.Leases.Min(value => LeaseExpiresUtc(value)), clock.UtcNow),
             RequiresNewProcess = snapshot.RequiresNewProcess,
+            ProfileMode = snapshot.ProfileMode,
+            RequestedProjects = snapshot.RequestedProjects ?? new List<string>(),
+            ResolvedProjectPackageIds = snapshot.ResolvedProjectPackageIds ?? new List<string>(),
+            ResolvedMods = snapshot.ResolvedMods ?? new List<string>(),
+            ProfileFingerprint = snapshot.ProfileFingerprint,
+            BaselineFingerprint = snapshot.BaselineFingerprint,
+            ModsConfigOwnership = snapshot.ModsConfigOwnership,
+            ProfileConflict = snapshot.ProfileConflict,
             Agent = request.Agent,
             Leases = snapshot.Leases
                 .OrderBy(value => value.StartedUtc)
@@ -3315,15 +5000,17 @@ internal sealed class CoordinatorState
 
         response.Error = !string.IsNullOrWhiteSpace(snapshot.Error)
             ? snapshot.Error
+            : !string.IsNullOrWhiteSpace(snapshot.ProfileError)
+                ? snapshot.ProfileError
             : effectiveExitCode == 0
                 ? null
                 : messages.LastOrDefault(value => !value.StartsWith("Next action:", StringComparison.Ordinal));
-        response.ErrorCode = snapshot.ErrorCode;
+        response.ErrorCode = snapshot.ErrorCode ?? snapshot.ProfileErrorCode;
         response.NextAction = JsonNextAction(request, snapshot, effectiveExitCode, response.LeaseId);
         return response;
     }
 
-    private static string JsonNextAction(BridgeRequest request, PersistedState snapshot,
+    private string JsonNextAction(BridgeRequest request, PersistedState snapshot,
         int exitCode, string leaseId)
     {
         string command = request.Command ?? string.Empty;
@@ -3335,19 +5022,19 @@ internal sealed class CoordinatorState
 
         if (string.Equals(command, "test", StringComparison.OrdinalIgnoreCase) &&
             string.Equals(subcommand, "begin", StringComparison.OrdinalIgnoreCase) && exitCode == 0)
-            return "Test your mod; renew before 20 minutes for long runs, then run: DevBridge.cmd test end " + leaseId;
+            return "Test your mod; this lease expires two minutes after its last heartbeat. Renew before expiresUtc, or start long-running work with test session, then run: DevBridge.cmd test end " + leaseId;
 
         if (string.Equals(command, "test", StringComparison.OrdinalIgnoreCase) &&
             string.Equals(subcommand, "end", StringComparison.OrdinalIgnoreCase) && exitCode == 0)
         {
             return snapshot.RestartPending
-                ? "Keep waiting. Do not launch, kill, or restart RimWorld yourself."
+                ? WaitingNextAction(snapshot)
                 : "Continue your workflow; run DevBridge.cmd restart only after a change requiring a fresh process.";
         }
 
         if (string.Equals(command, "test", StringComparison.OrdinalIgnoreCase) &&
             string.Equals(subcommand, "renew", StringComparison.OrdinalIgnoreCase) && exitCode == 0)
-            return "Continue testing; renew the lease before its stale interval expires.";
+            return "Continue testing; renew the lease before expiresUtc, or keep a connected test session.";
 
         if (string.Equals(command, "stop", StringComparison.OrdinalIgnoreCase) && exitCode == 0)
             return "Replace the assembly, verify its hash, then run: DevBridge.cmd ensure-ready " + leaseId;
@@ -3370,14 +5057,26 @@ internal sealed class CoordinatorState
             return "Run: DevBridge.cmd test begin";
         if (snapshot.RestartPending || snapshot.Phase == BridgePhase.DRAINING ||
             snapshot.Phase == BridgePhase.RESTARTING || snapshot.Phase == BridgePhase.LOADING)
-            return "Keep waiting. Do not launch, kill, or restart RimWorld yourself.";
+            return WaitingNextAction(snapshot);
         if (snapshot.Phase == BridgePhase.STOPPED && snapshot.Generation > 0)
             return "Run: DevBridge.cmd restart";
         return "Run: DevBridge.cmd wait-ready";
     }
 
-    private static JsonLeaseInfo ToJsonLease(TestLease lease)
+    private string WaitingNextAction(PersistedState snapshot)
     {
+        TestLease next = snapshot.Leases.OrderBy(value => LeaseExpiresUtc(value)).FirstOrDefault();
+        if (next == null)
+            return "Restart is queued and owned by DevBridge; reconnect with DevBridge.cmd wait-ready and keep waiting. Do not end the task.";
+
+        DateTime expiresUtc = LeaseExpiresUtc(next);
+        return "Restart is queued and owned by DevBridge; reconnect with DevBridge.cmd wait-ready and keep waiting. The next blocking lease can expire at " +
+            FormatUtc(expiresUtc) + " (retryAfterSeconds=" + RetryAfterSeconds(expiresUtc, clock.UtcNow) + "). Do not end the task.";
+    }
+
+    private JsonLeaseInfo ToJsonLease(TestLease lease)
+    {
+        DateTime expiresUtc = LeaseExpiresUtc(lease);
         return new JsonLeaseInfo
         {
             Id = lease.Id,
@@ -3385,31 +5084,29 @@ internal sealed class CoordinatorState
             Generation = lease.Generation,
             StartedUtc = lease.StartedUtc,
             LastHeartbeatUtc = LeaseActivityUtc(lease),
-            Age = FormatAge(lease.StartedUtc),
-            StaleIn = FormatStaleIn(lease)
+            ExpiresUtc = expiresUtc,
+            RetryAfterSeconds = RetryAfterSeconds(expiresUtc, clock.UtcNow),
+            Age = FormatAge(lease.StartedUtc)
         };
     }
 
-    private static string FormatStaleIn(TestLease lease)
+    private DateTime LeaseExpiresUtc(TestLease lease)
     {
-        return FormatStaleIn(LeaseActivityUtc(lease));
+        return LeaseActivityUtc(lease).Add(options.LeaseDuration);
+    }
+
+    private static int RetryAfterSeconds(DateTime expiresUtc, DateTime nowUtc)
+    {
+        double seconds = (expiresUtc.ToUniversalTime() - nowUtc.ToUniversalTime()).TotalSeconds;
+        if (seconds <= 0)
+            return 0;
+        return (int)Math.Min(int.MaxValue, Math.Ceiling(seconds));
     }
 
     private static DateTime LeaseActivityUtc(TestLease lease)
     {
         return (lease.LastHeartbeatUtc == default ? lease.StartedUtc : lease.LastHeartbeatUtc)
             .ToUniversalTime();
-    }
-
-    private static string FormatStaleIn(DateTime startedUtc)
-    {
-        TimeSpan age = DateTime.UtcNow - startedUtc.ToUniversalTime();
-        if (age < TimeSpan.Zero)
-            age = TimeSpan.Zero;
-        TimeSpan remaining = LeaseStaleAfter - age;
-        if (remaining < TimeSpan.Zero)
-            remaining = TimeSpan.Zero;
-        return FormatDuration(remaining);
     }
 
     private static string FormatDuration(TimeSpan duration)
@@ -3422,11 +5119,16 @@ internal sealed class CoordinatorState
         return duration.Minutes.ToString("00") + ":" + duration.Seconds.ToString("00");
     }
 
-    private static string FormatAge(DateTime startedUtc)
+    private string FormatAge(DateTime startedUtc)
     {
-        TimeSpan age = DateTime.UtcNow - startedUtc.ToUniversalTime();
+        TimeSpan age = clock.UtcNow - startedUtc.ToUniversalTime();
         if (age < TimeSpan.Zero)
             age = TimeSpan.Zero;
         return FormatDuration(age);
+    }
+
+    private static string FormatUtc(DateTime value)
+    {
+        return value.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture);
     }
 }

@@ -67,6 +67,8 @@ internal static class OfflineTests
         Run("legacy production is explicit and fail-closed with active intent", TestLegacyProductionSafety);
         Run("baseline profile excludes managed projects and load-them-last", TestBaselineProfile);
         Run("profile dependency closure is ordered, deduplicated, and case-insensitive", TestProfileDependencyClosure);
+        Run("structured dependency metadata accepts descriptive fields and preserves constraints", TestStructuredDependencyMetadata);
+        Run("structured dependency metadata permits comments and formatting whitespace", TestStructuredDependencyCommentsAndWhitespace);
         Run("package discovery uses the mod package ID rather than dependency IDs", TestPackageDiscoveryUsesOwnPackageId);
         Run("profile config write waits for leases and process shutdown", TestProfileWriteWaitsForDrain);
         Run("profile writes fail closed on config and process races", TestProfileWritePreconditions);
@@ -1534,6 +1536,96 @@ internal static class OfflineTests
             "a dependency package ID must not create a duplicate installed package candidate");
     }
 
+    private static void TestStructuredDependencyMetadata()
+    {
+        using ProfileSetup setup = ProfileSetup.Create();
+        File.WriteAllText(Path.Combine(setup.MetadataRoot, "ilyvion.loadingprogress", "About", "About.xml"),
+            @"<ModMetaData>
+  <packageId>ilyvion.loadingprogress</packageId>
+  <modDependencies>
+    <li>
+      <packageId>brrainz.harmony</packageId>
+      <displayName>Harmony</displayName>
+      <downloadUrl>https://steamcommunity.com/workshop/filedetails/?id=2009463077</downloadUrl>
+      <steamWorkshopUrl>steam://url/CommunityFilePage/2009463077</steamWorkshopUrl>
+    </li>
+  </modDependencies>
+  <loadAfter>
+    <li>brrainz.harmony</li>
+  </loadAfter>
+  <loadBefore>
+    <li>ludeon.rimworld</li>
+  </loadBefore>
+</ModMetaData>", new UTF8Encoding(false));
+        Assert(setup.CaptureBaseline(), "structured metadata: baseline capture must succeed");
+        setup.Fixture.Adapter.ReadyOnLaunch = true;
+        int exitCode = setup.Fixture.State.Execute(
+            Request("restart", "agent", 1, "--projects", "aquaculture"), _ => { }, () => true);
+        Assert(exitCode == 0, "structured metadata profile must resolve and launch successfully");
+
+        List<string> active = ActiveMods(setup.Fixture.Root);
+        List<string> lower = active.Select(value => value.ToLowerInvariant()).ToList();
+        Assert(lower.Count(value => value == "brrainz.harmony") == 1,
+            "structured dependency metadata must keep Harmony exactly once");
+        Assert(IndexOf(lower, "brrainz.harmony") < IndexOf(lower, "ilyvion.loadingprogress") &&
+               IndexOf(lower, "ilyvion.loadingprogress") < IndexOf(lower, "ludeon.rimworld"),
+            "loadAfter Harmony and loadBefore RimWorld constraints must remain valid");
+
+        JsonCommandResponse response = setup.Fixture.State.CreateJsonResponse(
+            Request("mods", "agent", 1, "status"), 0, Array.Empty<string>());
+        Assert(active.SequenceEqual(response.ResolvedMods, StringComparer.OrdinalIgnoreCase),
+            "the launched active mod order must equal the resolved profile order");
+        Assert(response.ResolvedMods.Count(value =>
+                   string.Equals(value, "brrainz.harmony", StringComparison.OrdinalIgnoreCase)) == 1,
+            "the resolved profile must contain Harmony exactly once");
+    }
+
+    private static void TestStructuredDependencyCommentsAndWhitespace()
+    {
+        using ProfileSetup setup = ProfileSetup.Create();
+        File.WriteAllText(Path.Combine(setup.MetadataRoot, "ilyvion.loadingprogress", "About", "About.xml"),
+            @"<ModMetaData>
+  <!-- metadata comment -->
+  <packageId>
+    ilyvion.loadingprogress
+  </packageId>
+  <modDependencies>
+    <!-- section comment -->
+    <li>
+      <!-- entry comment -->
+      <packageId>
+        brrainz.harmony
+      </packageId>
+      <!-- descriptive comments are harmless -->
+      <displayName>
+        Harmony
+      </displayName>
+    </li>
+  </modDependencies>
+  <loadAfter>
+    <!-- load-order comment -->
+    <li>
+      brrainz.harmony
+    </li>
+  </loadAfter>
+  <loadBefore>
+    <li>
+      ludeon.rimworld
+    </li>
+  </loadBefore>
+</ModMetaData>", new UTF8Encoding(false));
+        Assert(setup.CaptureBaseline(), "commented metadata: baseline capture must succeed");
+        JsonCommandResponse baseline = setup.Fixture.State.CreateJsonResponse(
+            Request("status"), 0, Array.Empty<string>());
+        ModProfile profile = ModProfileResolver.Resolve(setup.Fixture.Root, baseline.BaselineFingerprint,
+            new[] { "aquaculture" }, setup.Fixture.InstalledModsRoots);
+        List<string> lower = profile.ResolvedMods.Select(value => value.ToLowerInvariant()).ToList();
+        Assert(lower.Count(value => value == "brrainz.harmony") == 1 &&
+               IndexOf(lower, "brrainz.harmony") < IndexOf(lower, "ilyvion.loadingprogress") &&
+               IndexOf(lower, "ilyvion.loadingprogress") < IndexOf(lower, "ludeon.rimworld"),
+            "comments and formatting whitespace must not change dependency or load-order resolution");
+    }
+
     private static void TestProfileWriteWaitsForDrain()
     {
         using ProfileSetup setup = ProfileSetup.Create();
@@ -1685,6 +1777,59 @@ internal static class OfflineTests
                 "lan.horticulture.novelseeds", "<modDependencies>unparseable dependency text</modDependencies>");
         }, "PROFILE_MALFORMED_METADATA");
 
+        AssertInvalidProfile("duplicate direct package IDs", setup =>
+        {
+            WriteInstalledMetadata(setup.MetadataRoot, "horticulture", "lan.horticulture.novelseeds",
+                "<modDependencies><li><packageId>ferny.progressionagriculture</packageId>" +
+                "<packageId>ferny.replacelib</packageId></li></modDependencies>");
+        }, "PROFILE_MALFORMED_METADATA");
+
+        AssertInvalidProfile("missing direct package ID", setup =>
+        {
+            WriteInstalledMetadata(setup.MetadataRoot, "horticulture", "lan.horticulture.novelseeds",
+                "<modDependencies><li><displayName>Harmony</displayName></li></modDependencies>");
+        }, "PROFILE_MALFORMED_METADATA");
+
+        AssertInvalidProfile("nested-only package ID", setup =>
+        {
+            WriteInstalledMetadata(setup.MetadataRoot, "horticulture", "lan.horticulture.novelseeds",
+                "<modDependencies><li><displayName><packageId>ferny.progressionagriculture</packageId>" +
+                "</displayName></li></modDependencies>");
+        }, "PROFILE_MALFORMED_METADATA");
+
+        AssertInvalidProfile("empty dependency package ID", setup =>
+        {
+            WriteInstalledMetadata(setup.MetadataRoot, "horticulture", "lan.horticulture.novelseeds",
+                "<modDependencies><li><packageId> </packageId></li></modDependencies>");
+        }, "PROFILE_MALFORMED_METADATA");
+
+        AssertInvalidProfile("malformed dependency package ID", setup =>
+        {
+            WriteInstalledMetadata(setup.MetadataRoot, "horticulture", "lan.horticulture.novelseeds",
+                "<modDependencies><li><packageId>ferny.progressionagriculture!</packageId></li></modDependencies>");
+        }, "PROFILE_MALFORMED_METADATA");
+
+        AssertInvalidProfile("ambiguous structured mixed text", setup =>
+        {
+            WriteInstalledMetadata(setup.MetadataRoot, "horticulture", "lan.horticulture.novelseeds",
+                "<modDependencies><li>unexpected text<packageId>ferny.progressionagriculture</packageId>" +
+                "</li></modDependencies>");
+        }, "PROFILE_MALFORMED_METADATA");
+
+        AssertInvalidProfile("malformed non-li dependency entry", setup =>
+        {
+            WriteInstalledMetadata(setup.MetadataRoot, "horticulture", "lan.horticulture.novelseeds",
+                "<modDependencies><displayName>Harmony</displayName></modDependencies>");
+        }, "PROFILE_MALFORMED_METADATA");
+
+        AssertInvalidProfile("malformed XML metadata", setup =>
+        {
+            File.WriteAllText(Path.Combine(setup.MetadataRoot, "horticulture", "About", "About.xml"),
+                "<ModMetaData><packageId>lan.horticulture.novelseeds</packageId>" +
+                "<modDependencies><li>ferny.progressionagriculture</modDependencies></ModMetaData>",
+                new UTF8Encoding(false));
+        }, "PROFILE_MALFORMED_METADATA");
+
         AssertInvalidProfile("dependency cycle", setup =>
         {
             WriteInstalledMetadata(setup.MetadataRoot, "horticulture",
@@ -1699,6 +1844,10 @@ internal static class OfflineTests
         using ProfileSetup setup = ProfileSetup.Create();
         Assert(setup.CaptureBaseline(), name + ": baseline capture must succeed");
         byte[] before = File.ReadAllBytes(Path.Combine(setup.Fixture.Root, "ModsConfig.xml"));
+        FakeProcess existingProcess = PrepareReadyProcess(setup);
+        int modsConfigWrites = 0;
+        setup.Fixture.BeforeModsConfigWrite = () => modsConfigWrites++;
+        setup.Fixture.State = setup.Fixture.Reload();
         mutate(setup);
         int exitCode = setup.Fixture.State.Execute(
             Request("restart", "agent", 1, "--projects", "horticulture"), _ => { }, () => true);
@@ -1707,10 +1856,33 @@ internal static class OfflineTests
         Assert(exitCode != 0 && response.ErrorCode == expectedCode,
             name + " must fail with " + expectedCode + " (actual " + response.ErrorCode + ")");
         Assert(setup.Fixture.Adapter.LaunchCalls == 0 &&
+               setup.Fixture.Adapter.TerminationRequests == 0 && !existingProcess.HasExited &&
+               modsConfigWrites == 0 &&
                File.ReadAllBytes(Path.Combine(setup.Fixture.Root, "ModsConfig.xml")).SequenceEqual(before),
-            name + " must fail before launch or ModsConfig mutation");
+            name + " must fail before process stop, launch, or ModsConfig mutation");
         Assert(!setup.Fixture.State.CreateJsonResponse(Request("status"), exitCode, Array.Empty<string>()).RestartPending,
             name + " must not leave a pending restart");
+    }
+
+    private static FakeProcess PrepareReadyProcess(ProfileSetup setup)
+    {
+        PersistedState ready = JsonSerializer.Deserialize<PersistedState>(
+            File.ReadAllText(Path.Combine(setup.Fixture.Root, "Runtime", "state.json")), Program.JsonOptions);
+        ready.Generation = 1;
+        ready.Phase = BridgePhase.READY;
+        ready.LaunchId = "launch-ready";
+        ready.LaunchGeneration = 1;
+        ready.ProcessId = 101;
+        ready.ProcessStartUtcTicks = 1001;
+        ready.LaunchStartedUtc = ClockStart;
+        ready.RestartPending = false;
+        ready.TargetGeneration = 0;
+        ready.RequiresNewProcess = false;
+        setup.Fixture.WriteState(ready);
+        FakeProcess process = new(101, 1001, setup.Fixture.RimWorldPath);
+        setup.Fixture.Adapter.Add(process);
+        setup.Fixture.State = setup.Fixture.Reload();
+        return process;
     }
 
     private static void TestProfileRecoveryAndConflict()

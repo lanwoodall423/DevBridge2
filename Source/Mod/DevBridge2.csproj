@@ -4,20 +4,21 @@
     <TargetFramework>net472</TargetFramework>
     <RootNamespace>DevBridge2</RootNamespace>
     <AssemblyName>DevBridge2</AssemblyName>
-    <Version>1.2.2</Version>
-    <AssemblyVersion>1.2.2.0</AssemblyVersion>
-    <FileVersion>1.2.2.0</FileVersion>
-    <InformationalVersion>1.2.2</InformationalVersion>
+    <Version>$(DevBridgeProductVersion)</Version>
+    <AssemblyVersion>$(DevBridgeAssemblyVersion)</AssemblyVersion>
+    <FileVersion>$(DevBridgeAssemblyVersion)</FileVersion>
+    <InformationalVersion>$(DevBridgeProductVersion)</InformationalVersion>
     <LangVersion>latest</LangVersion>
     <Nullable>disable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
     <Deterministic>true</Deterministic>
-    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <RimWorldManagedDir Condition="'$(RimWorldManagedDir)' == ''">$(MSBuildThisFileDirectory)..\..\..\..\RimWorldWin64_Data\Managed</RimWorldManagedDir>
     <OutputPath Condition="'$(OutputPath)' == ''">$(MSBuildThisFileDirectory)..\..\1.6\Assemblies\</OutputPath>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="..\Coordinator\State\DevBridgeSchemaVersions.cs" Link="DevBridgeSchemaVersions.cs" />
     <Compile Include="..\Coordinator\QuicktestActivationCore.cs" Link="QuicktestActivationCore.cs" />
     <Compile Include="..\Coordinator\QuicktestFailureArtifact.cs" Link="QuicktestFailureArtifact.cs" />
     <Reference Include="Assembly-CSharp">

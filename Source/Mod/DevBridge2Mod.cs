@@ -39,7 +39,9 @@ namespace DevBridge2
 
     internal static class DevBridgeQuicktestActivation
     {
-        private const long ActivationTimeoutMilliseconds = 60000;
+        private const int DefaultActivationTimeoutSeconds = 60;
+        private const int MinActivationTimeoutSeconds = 5;
+        private const int MaxActivationTimeoutSeconds = 120;
         private static readonly object FailureGate = new object();
         private static QuicktestActivationController controller;
         private static bool failureArtifactAttempted;
@@ -58,6 +60,12 @@ namespace DevBridge2
             configuredProfileFingerprint = Environment.GetEnvironmentVariable("DEVBRIDGE_PROFILE_FINGERPRINT");
             configuredBaselineFingerprint = Environment.GetEnvironmentVariable("DEVBRIDGE_BASELINE_FINGERPRINT");
             configuredProfileMode = Environment.GetEnvironmentVariable("DEVBRIDGE_PROFILE_MODE");
+            int activationTimeoutSeconds = DefaultActivationTimeoutSeconds;
+            string timeoutValue = Environment.GetEnvironmentVariable("DEVBRIDGE_QUICKTEST_TIMEOUT_SECONDS");
+            if (int.TryParse(timeoutValue, NumberStyles.Integer, CultureInfo.InvariantCulture,
+                    out int parsedTimeout) && parsedTimeout >= MinActivationTimeoutSeconds &&
+                parsedTimeout <= MaxActivationTimeoutSeconds)
+                activationTimeoutSeconds = parsedTimeout;
 
             bool requested = string.Equals(Environment.GetEnvironmentVariable("DEVBRIDGE_QUICKTEST_REQUESTED"), "1",
                 StringComparison.Ordinal);
@@ -67,7 +75,7 @@ namespace DevBridge2
                     DevBridgeQuicktestMenuAdapter.IsGenuineMainMenuReady,
                     () => DevBridgeQuicktestMenuAdapter.QueueBuiltInDevQuicktest(
                         ReportActivationFailure), MonotonicMilliseconds,
-                    ActivationTimeoutMilliseconds);
+                    activationTimeoutSeconds * 1000L);
                 LongEventHandler.ExecuteWhenFinished(DevBridgeQuicktestActivationDriver.EnsureCreated);
             }
         }
@@ -145,7 +153,7 @@ namespace DevBridge2
             if (result == QuicktestActivationResult.Requested)
             {
                 Log.Message("[DevBridge2] quicktestMainMenu=true; genuine main-menu UI is ready.");
-                Log.Message("[DevBridge2] quicktestRequested=true; built-in Dev Quicktest button activation queued.");
+                Log.Message("[DevBridge2] quicktestRequested=true; built-in Dev Quicktest callback queued; no UI button click was performed.");
             }
             else
             {
@@ -260,6 +268,7 @@ namespace DevBridge2
             DateTime timestamp = DateTime.UtcNow;
             int processId = Process.GetCurrentProcess().Id;
             string json = "{\n" +
+                "  \"schemaVersion\": " + DevBridgeSchemaVersions.Readiness.ToString(CultureInfo.InvariantCulture) + ",\n" +
                 "  \"launchId\": \"" + EscapeJson(configuredLaunchId) + "\",\n" +
                 "  \"generation\": " + configuredGeneration.ToString(CultureInfo.InvariantCulture) + ",\n" +
                 "  \"processId\": " + processId.ToString(CultureInfo.InvariantCulture) + ",\n" +

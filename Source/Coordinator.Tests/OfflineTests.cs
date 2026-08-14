@@ -58,6 +58,10 @@ internal static class OfflineTests
         Run("quicktest readiness expiry is terminal", TestQuicktestReadinessExpiry);
         Run("quicktest source boundary and lifecycle predicates are structural", TestQuicktestStructuralBoundary);
         Run("quicktest path has no fallback activation mechanism", TestQuicktestNoFallback);
+        Run("quicktest failure artifact is bounded and atomically replaced", TestQuicktestFailureArtifactContract);
+        Run("matching quicktest failure enters isolation before timeout", TestQuicktestFailureIsolation);
+        Run("mismatched or malformed quicktest failure is quarantined", TestQuicktestFailureRejectsInvalidRecords);
+        Run("quicktest failure/readiness conflict fails closed", TestQuicktestFailureReadinessConflict);
         Run("coordinator-root argument forms are accepted", TestCoordinatorRootArgumentForms);
         Run("plain restart launches the aggregate minimal control profile", TestPlainRestartUsesAggregateControlProfile);
         Run("project intent registration deduplicates and freezes all requesters", TestProjectIntentAggregationAndFreeze);
@@ -1068,6 +1072,162 @@ internal static class OfflineTests
             Assert(!quicktestSource.Contains(forbidden, StringComparison.Ordinal),
                 "Quicktest path must not contain fallback mechanism: " + forbidden);
         }
+    }
+
+    private static void TestQuicktestFailureArtifactContract()
+    {
+        using Fixture fixture = new(new PersistedState { Generation = 1, Phase = BridgePhase.STOPPED });
+        QuicktestFailureRecord record = new()
+        {
+            SchemaVersion = QuicktestFailureArtifact.CurrentSchemaVersion,
+            LaunchId = new string('l', 300),
+            Generation = 2,
+            ProcessId = 123,
+            ProcessStartUtcTicks = 456,
+            ProfileFingerprint = new string('p', 300),
+            BaselineFingerprint = new string('b', 300),
+            ProfileMode = new string('m', 100),
+            TimestampUtc = fixture.Clock.UtcNow,
+            FailurePhase = new string('f', 300),
+            FailureCode = QuicktestFailureArtifact.StableFailureCode,
+            ExceptionType = new string('t', 400),
+            ExceptionMessage = new string('e', 800),
+            DiagnosticDetail = new string('d', 4000)
+        };
+
+        Assert(QuicktestFailureArtifact.TryWrite(fixture.Root, record, out string error) &&
+               string.IsNullOrWhiteSpace(error), "failure artifact must be written atomically");
+        string path = QuicktestFailureArtifact.PathFor(fixture.Root);
+        QuicktestFailureRecord bounded = JsonSerializer.Deserialize<QuicktestFailureRecord>(
+            File.ReadAllText(path), Program.JsonOptions);
+        Assert(bounded.LaunchId.Length == QuicktestFailureArtifact.MaxLaunchIdLength &&
+               bounded.DiagnosticDetail.Length == QuicktestFailureArtifact.MaxDiagnosticDetailLength,
+            "failure diagnostics must be bounded before persistence");
+
+        record.LaunchId = "replacement";
+        Assert(QuicktestFailureArtifact.TryWrite(fixture.Root, record, out error),
+            "a second generation-specific artifact write must replace the first atomically");
+        QuicktestFailureRecord replaced = JsonSerializer.Deserialize<QuicktestFailureRecord>(
+            File.ReadAllText(path), Program.JsonOptions);
+        Assert(replaced.LaunchId == "replacement" &&
+               !Directory.GetFiles(Path.Combine(fixture.Root, "Runtime"), "quicktest-failure.json.tmp-*").Any(),
+            "only the complete replacement artifact may remain visible");
+        QuicktestFailureArtifact.Invalidate(fixture.Root);
+        Assert(!File.Exists(path), "launch cleanup must invalidate the prior failure artifact");
+    }
+
+    private static void TestQuicktestFailureIsolation()
+    {
+        using ProfileSetup setup = ProfileSetup.Create();
+        Assert(setup.CaptureBaseline(), "quicktest failure: baseline capture must succeed");
+        PersistedState dirty = JsonSerializer.Deserialize<PersistedState>(
+            File.ReadAllText(Path.Combine(setup.Fixture.Root, "Runtime", "state.json")), Program.JsonOptions);
+        dirty.SessionDirty = true;
+        setup.Fixture.WriteState(dirty);
+        setup.Fixture.State = setup.Fixture.Reload();
+        setup.Fixture.Adapter.ReadyOnLaunchPredicate = () => setup.Fixture.Adapter.LaunchCalls > 1;
+        setup.Fixture.Adapter.QuicktestFailureOnLaunch = (request, process) =>
+            setup.Fixture.Adapter.LaunchCalls == 1 ? MatchingFailure(setup.Fixture, request, process) : null;
+
+        DateTime started = DateTime.UtcNow;
+        int exitCode = setup.Fixture.State.Execute(
+            Request("restart", "agent", 1, "--projects", "wildlife"), _ => { }, () => true);
+        JsonCommandResponse response = setup.Fixture.State.CreateJsonResponse(
+            Request("status"), exitCode, Array.Empty<string>());
+
+        Assert((DateTime.UtcNow - started) < TimeSpan.FromSeconds(10),
+            "a durable callback failure must be detected without the readiness timeout");
+        Assert(exitCode == 0 && response.State == "READY" &&
+               response.CrashIsolation?.Status == "COMPLETED" &&
+               response.CrashIsolation.OriginalFailureCode == QuicktestFailureArtifact.StableFailureCode &&
+               response.CrashIsolation.OriginalFailurePhase == "Root_Play.SetupForQuickTestPlay" &&
+               response.CrashIsolation.OriginalFailureExceptionType == "System.NullReferenceException" &&
+               response.CrashIsolation.OriginalFailureDiagnosticDetail.Contains("world generation", StringComparison.Ordinal) &&
+               setup.Fixture.Adapter.TerminationRequests > 0,
+            "matching quicktest failure must preserve immutable evidence and stop the exact failed process for isolation: " +
+            JsonSerializer.Serialize(response, Program.JsonOptions) +
+            "; launches=" + setup.Fixture.Adapter.LaunchCalls +
+            "; terminations=" + setup.Fixture.Adapter.TerminationRequests);
+        Assert(response.SessionDirty == false,
+            "a verified fresh accepted project launch must clear historical session dirtiness after readiness");
+    }
+
+    private static void TestQuicktestFailureRejectsInvalidRecords()
+    {
+        Action<string, Action<QuicktestFailureRecord>, string> runCase = (name, mutate, raw) =>
+        {
+            using ProfileSetup setup = ProfileSetup.Create();
+            Assert(setup.CaptureBaseline(), name + ": baseline capture must succeed");
+            setup.Fixture.Adapter.QuicktestFailureOnLaunch = (request, process) =>
+            {
+                QuicktestFailureRecord record = MatchingFailure(setup.Fixture, request, process);
+                mutate?.Invoke(record);
+                return record;
+            };
+            setup.Fixture.Adapter.RawQuicktestFailureJsonOnLaunch = raw;
+            int exitCode = setup.Fixture.State.Execute(
+                Request("restart", "agent", 1, "--projects", "none"), _ => { }, () => true);
+            JsonCommandResponse response = setup.Fixture.State.CreateJsonResponse(
+                Request("status"), exitCode, Array.Empty<string>());
+            string runtime = Path.Combine(setup.Fixture.Root, "Runtime");
+            Assert(exitCode != 0 && response.ErrorCode == "READINESS_TIMEOUT" &&
+                   response.CrashIsolation == null && setup.Fixture.Adapter.LaunchCalls == 1 &&
+                   setup.Fixture.Adapter.TerminationRequests == 0 &&
+                   Directory.GetFiles(runtime, "quicktest-failure.rejected-*.json").Length == 1,
+                name + ": invalid evidence must not trigger attribution, stopping, or a replacement launch");
+        };
+
+        runCase("wrong PID", record => record.ProcessId++, null);
+        runCase("wrong launch ID", record => record.LaunchId = "stale-launch", null);
+        runCase("wrong generation", record => record.Generation++, null);
+        runCase("wrong start identity", record => record.ProcessStartUtcTicks++, null);
+        runCase("wrong fingerprint", record => record.ProfileFingerprint = "wrong-profile", null);
+        runCase("stale timestamp", record => record.TimestampUtc = ClockStart.AddMinutes(-10), null);
+        runCase("future timestamp", record => record.TimestampUtc = ClockStart.AddMinutes(10), null);
+        runCase("malformed JSON", null, "{not-json");
+    }
+
+    private static void TestQuicktestFailureReadinessConflict()
+    {
+        using ProfileSetup setup = ProfileSetup.Create();
+        Assert(setup.CaptureBaseline(), "readiness conflict: baseline capture must succeed");
+        setup.Fixture.Adapter.ReadyOnLaunch = true;
+        setup.Fixture.Adapter.QuicktestFailureOnLaunch = (request, process) =>
+            MatchingFailure(setup.Fixture, request, process);
+
+        int exitCode = setup.Fixture.State.Execute(
+            Request("restart", "agent", 1, "--projects", "none"), _ => { }, () => true);
+        JsonCommandResponse response = setup.Fixture.State.CreateJsonResponse(
+            Request("status"), exitCode, Array.Empty<string>());
+        Assert(exitCode != 0 && response.ErrorCode == "QUICKTEST_READINESS_CONFLICT" &&
+               response.CrashIsolation == null &&
+               response.TerminalFailureCode == QuicktestFailureArtifact.StableFailureCode &&
+               response.TerminalFailurePhase == "Root_Play.SetupForQuickTestPlay" &&
+               response.TerminalFailureDetail.Contains("ambiguous", StringComparison.OrdinalIgnoreCase),
+            "matching success and terminal failure artifacts must fail closed as an environmental conflict");
+    }
+
+    private static QuicktestFailureRecord MatchingFailure(Fixture fixture,
+        ProcessLaunchRequest request, FakeProcess process)
+    {
+        IReadOnlyDictionary<string, string> environment = request.Environment;
+        return new QuicktestFailureRecord
+        {
+            SchemaVersion = QuicktestFailureArtifact.CurrentSchemaVersion,
+            LaunchId = environment["DEVBRIDGE_LAUNCH_ID"],
+            Generation = int.Parse(environment["DEVBRIDGE_GENERATION"]),
+            ProcessId = process.Id,
+            ProcessStartUtcTicks = process.StartIdentity,
+            ProfileFingerprint = environment["DEVBRIDGE_PROFILE_FINGERPRINT"],
+            BaselineFingerprint = environment["DEVBRIDGE_BASELINE_FINGERPRINT"],
+            ProfileMode = environment["DEVBRIDGE_PROFILE_MODE"],
+            TimestampUtc = fixture.Clock.UtcNow,
+            FailurePhase = "Root_Play.SetupForQuickTestPlay",
+            FailureCode = QuicktestFailureArtifact.StableFailureCode,
+            ExceptionType = "System.NullReferenceException",
+            ExceptionMessage = "world generation object was null",
+            DiagnosticDetail = "NullReferenceException: world generation failed before playable readiness."
+        };
     }
 
     private static void TestDoctorRecoversInspectionQuarantine()
@@ -3025,6 +3185,8 @@ internal static class OfflineTests
         internal bool ReadyOnLaunch { get; set; }
         internal Func<bool> ReadyOnLaunchPredicate { get; set; }
         internal Func<bool> ExitOnLaunchPredicate { get; set; }
+        internal Func<ProcessLaunchRequest, FakeProcess, QuicktestFailureRecord> QuicktestFailureOnLaunch { get; set; }
+        internal string RawQuicktestFailureJsonOnLaunch { get; set; }
         internal bool ThrowOnLaunch { get; set; }
         internal Func<bool> ThrowOnLaunchedProcessHasExitedPredicate { get; set; }
         internal bool ExtraMatchingProcess { get; set; }
@@ -3109,6 +3271,15 @@ internal static class OfflineTests
                 process.ThrowOnHasExited = true;
             if (ExitOnLaunchPredicate?.Invoke() == true)
                 process.ForceTerminate();
+            if (RawQuicktestFailureJsonOnLaunch != null)
+            {
+                File.WriteAllText(QuicktestFailureArtifact.PathFor(root), RawQuicktestFailureJsonOnLaunch);
+            }
+            else if (QuicktestFailureOnLaunch != null)
+            {
+                QuicktestFailureArtifact.TryWrite(root, QuicktestFailureOnLaunch(request, process),
+                    out _);
+            }
             if (ReadyOnLaunch || ReadyOnLaunchPredicate?.Invoke() == true)
             {
                 File.WriteAllText(Path.Combine(root, "Runtime", "readiness.json"), JsonSerializer.Serialize(new ReadinessRecord

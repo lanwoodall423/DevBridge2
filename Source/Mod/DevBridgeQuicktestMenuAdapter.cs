@@ -36,7 +36,7 @@ namespace DevBridge2
             }
         }
 
-        internal static void QueueBuiltInDevQuicktest(Action<Exception> reportFailure)
+        internal static void QueueBuiltInDevQuicktest(Action<Exception, string> reportFailure)
         {
             if (reportFailure == null)
                 throw new ArgumentNullException(nameof(reportFailure));
@@ -54,7 +54,15 @@ namespace DevBridge2
                     }
                     catch (Exception exception)
                     {
-                        reportFailure(exception);
+                        try
+                        {
+                            reportFailure(exception, "ROOT_PLAY_SETUP_FOR_QUICKTEST_PLAY_OR_INIT_GAME_START");
+                        }
+                        catch
+                        {
+                            // The game's original exception must remain the
+                            // exception delivered to RimWorld's handler.
+                        }
                         throw;
                     }
                 },

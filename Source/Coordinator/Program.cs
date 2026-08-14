@@ -8,6 +8,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using System.Xml.Linq;
+using DevBridge2;
 
 namespace DevBridge.Coordinator;
 
@@ -523,6 +524,13 @@ internal sealed class PersistedState
     public int Generation { get; set; }
     public BridgePhase Phase { get; set; } = BridgePhase.STOPPED;
     public string Error { get; set; }
+    public int TerminalFailureSchemaVersion { get; set; }
+    public string TerminalFailurePhase { get; set; }
+    public string TerminalFailureCode { get; set; }
+    public string TerminalFailureDetail { get; set; }
+    public string TerminalFailureExceptionType { get; set; }
+    public string TerminalFailureExceptionMessage { get; set; }
+    public string TerminalFailureDiagnosticDetail { get; set; }
     public string LaunchId { get; set; }
     public int LaunchGeneration { get; set; }
     public int ProcessId { get; set; }
@@ -709,6 +717,10 @@ internal sealed class CrashIsolationIncident
     public string OriginalFailurePhase { get; set; }
     public string OriginalFailureCode { get; set; }
     public string OriginalFailureDetail { get; set; }
+    public int OriginalFailureSchemaVersion { get; set; }
+    public string OriginalFailureExceptionType { get; set; }
+    public string OriginalFailureExceptionMessage { get; set; }
+    public string OriginalFailureDiagnosticDetail { get; set; }
     public bool OriginalProcessExitObserved { get; set; }
     public string OriginalExitInformation { get; set; }
     public Dictionary<string, string> OriginalDiagnosticMetadata { get; set; } = new();
@@ -891,6 +903,24 @@ internal sealed class JsonCommandResponse
 
     [JsonPropertyName("profileConflict")]
     public string ProfileConflict { get; set; }
+
+    [JsonPropertyName("terminalFailurePhase")]
+    public string TerminalFailurePhase { get; set; }
+
+    [JsonPropertyName("terminalFailureCode")]
+    public string TerminalFailureCode { get; set; }
+
+    [JsonPropertyName("terminalFailureDetail")]
+    public string TerminalFailureDetail { get; set; }
+
+    [JsonPropertyName("terminalFailureExceptionType")]
+    public string TerminalFailureExceptionType { get; set; }
+
+    [JsonPropertyName("terminalFailureExceptionMessage")]
+    public string TerminalFailureExceptionMessage { get; set; }
+
+    [JsonPropertyName("terminalFailureDiagnosticDetail")]
+    public string TerminalFailureDiagnosticDetail { get; set; }
 
     [JsonPropertyName("runtimeProfileFingerprint")]
     public string RuntimeProfileFingerprint { get; set; }
@@ -1961,6 +1991,7 @@ internal sealed class CoordinatorState
     private readonly string runtimeRoot;
     private readonly string statePath;
     private readonly string readinessPath;
+    private readonly string quicktestFailurePath;
     private readonly string baselinePath;
     private readonly string generatedManifestPath;
     private readonly string rimWorldExe;
@@ -2018,6 +2049,7 @@ internal sealed class CoordinatorState
         runtimeRoot = Path.Combine(this.root, "Runtime");
         statePath = Path.Combine(runtimeRoot, "state.json");
         readinessPath = Path.Combine(runtimeRoot, "readiness.json");
+        quicktestFailurePath = QuicktestFailureArtifact.PathFor(this.root);
         baselinePath = Path.Combine(runtimeRoot, "ModsConfig.baseline.xml");
         generatedManifestPath = Path.Combine(runtimeRoot, "ModsConfig.generated.json");
         rimWorldExe = Path.GetFullPath(this.options.RimWorldExecutablePath ??
@@ -3408,6 +3440,7 @@ internal sealed class CoordinatorState
                 state.LaunchRequestKey = null;
                 state.WaitingForBridgeDeadlineUtc = null;
                 DeleteReadinessLocked();
+                DeleteQuicktestFailureArtifactLocked();
                 SaveStateLocked();
                 Monitor.PulseAll(gate);
                 emit("RimWorld stopped and confirmed absent from the configured installation.");
@@ -3482,6 +3515,7 @@ internal sealed class CoordinatorState
                     state.ErrorCode = null;
                     state.Phase = BridgePhase.RESTARTING;
                     DeleteReadinessLocked();
+                    DeleteQuicktestFailureArtifactLocked();
                     SaveStateLocked();
                     shouldLaunch = true;
                 }
@@ -3780,6 +3814,7 @@ internal sealed class CoordinatorState
                     state.ErrorCode = null;
                     state.Phase = BridgePhase.DRAINING;
                     DeleteReadinessLocked();
+                    DeleteQuicktestFailureArtifactLocked();
                     if (restartArguments.LegacyProduction)
                     {
                         state.AggregateGenerations ??= new List<AggregateGenerationEvidence>();
@@ -4334,6 +4369,7 @@ internal sealed class CoordinatorState
         state.RequiresNewProcess = true;
         state.WaitingForBridgeDeadlineUtc = null;
         DeleteReadinessLocked();
+        DeleteQuicktestFailureArtifactLocked();
         FreezeAggregateLocked(profile, registrations, target, owner, "initial-" + target);
         launchTask = Task.Run(() =>
         {
@@ -4425,6 +4461,7 @@ internal sealed class CoordinatorState
                         oldProcessId = state.ProcessId;
                         oldStartTicks = state.ProcessStartUtcTicks;
                         DeleteReadinessLocked();
+                        DeleteQuicktestFailureArtifactLocked();
                         SaveStateLocked();
                         break;
                     }
@@ -4512,12 +4549,20 @@ internal sealed class CoordinatorState
                 state.ProcessStartUtcTicks = 0;
                 state.Error = null;
                 state.ErrorCode = null;
+                state.TerminalFailureSchemaVersion = 0;
+                state.TerminalFailurePhase = null;
+                state.TerminalFailureCode = null;
+                state.TerminalFailureDetail = null;
+                state.TerminalFailureExceptionType = null;
+                state.TerminalFailureExceptionMessage = null;
+                state.TerminalFailureDiagnosticDetail = null;
                 state.MaintenanceReady = false;
                 state.LaunchProfileInstalled = false;
                 state.LaunchAttemptStarted = false;
                 state.LaunchProfileFingerprint = isolationProfile?.ProfileFingerprint ??
                     (state.ProfileMode == ModProfile.LegacyMode ? null : state.ProfileFingerprint);
                 DeleteReadinessLocked();
+                DeleteQuicktestFailureArtifactLocked();
                 SaveStateLocked();
             }
 
@@ -4612,7 +4657,10 @@ internal sealed class CoordinatorState
                     ["DEVBRIDGE_ROOT"] = root,
                     ["DEVBRIDGE_LAUNCH_ID"] = launchId,
                     ["DEVBRIDGE_GENERATION"] = targetGeneration.ToString(),
-                    ["DEVBRIDGE_QUICKTEST_REQUESTED"] = "1"
+                    ["DEVBRIDGE_QUICKTEST_REQUESTED"] = "1",
+                    ["DEVBRIDGE_PROFILE_FINGERPRINT"] = state.LaunchProfileFingerprint ?? string.Empty,
+                    ["DEVBRIDGE_BASELINE_FINGERPRINT"] = state.BaselineFingerprint ?? string.Empty,
+                    ["DEVBRIDGE_PROFILE_MODE"] = isolationProfile?.Mode ?? state.ProfileMode ?? string.Empty
                 }
             });
             if (process == null)
@@ -4663,6 +4711,15 @@ internal sealed class CoordinatorState
             using IManagedProcess process = processAdapter.Open(processId);
             if (process == null)
             {
+                QuicktestFailureRecord failure = TryReadMatchingQuicktestFailure(
+                    launchId, targetGeneration, processId, startTicks,
+                    state.LaunchStartedUtc.ToUniversalTime());
+                if (failure != null)
+                {
+                    FailLaunch(DescribeQuicktestFailure(failure),
+                        QuicktestFailureArtifact.StableFailureCode, failure);
+                    return;
+                }
                 FailLaunch("RimWorld exited before the quicktest map became ready", "PROCESS_EXITED");
                 return;
             }
@@ -4685,20 +4742,37 @@ internal sealed class CoordinatorState
 
         while (clock.UtcNow < deadline)
         {
-            if (process == null || process.HasExited)
-            {
-                FailLaunch("RimWorld exited before the quicktest map became ready", "PROCESS_EXITED");
-                return;
-            }
-
-            if (!IsOwnedProcess(process, processStartTicks))
+            if (process == null || !IsExactProcessIdentity(process, processStartTicks))
             {
                 FailLaunch("the RimWorld process identity changed before readiness", "PROCESS_IDENTITY_CHANGED");
                 return;
             }
 
             DateTime launchStarted = deadline - options.ReadinessTimeout;
-            if (IsReadinessMatch(launchId, processId, targetGeneration, launchStarted))
+            QuicktestFailureRecord failure = TryReadMatchingQuicktestFailure(
+                launchId, targetGeneration, processId, processStartTicks, launchStarted);
+            bool readiness = IsReadinessMatch(launchId, processId, targetGeneration, launchStarted);
+            if (failure != null && readiness)
+            {
+                FailLaunch("a terminal quicktest failure and a matching readiness signal were both written; the launch is ambiguous",
+                    "QUICKTEST_READINESS_CONFLICT", failure);
+                return;
+            }
+
+            if (failure != null)
+            {
+                FailLaunch(DescribeQuicktestFailure(failure),
+                    QuicktestFailureArtifact.StableFailureCode, failure);
+                return;
+            }
+
+            if (process.HasExited)
+            {
+                FailLaunch("RimWorld exited before the quicktest map became ready", "PROCESS_EXITED");
+                return;
+            }
+
+            if (readiness)
             {
                 lock (gate)
                 {
@@ -4712,6 +4786,112 @@ internal sealed class CoordinatorState
 
         FailLaunch("no matching readiness signal was written within " +
             options.ReadinessTimeout.TotalSeconds.ToString("0") + " seconds", "READINESS_TIMEOUT");
+    }
+
+    private QuicktestFailureRecord TryReadMatchingQuicktestFailure(
+        string launchId, int targetGeneration, int processId, long processStartTicks,
+        DateTime launchStartedUtc)
+    {
+        try
+        {
+            if (!File.Exists(quicktestFailurePath))
+                return null;
+
+            FileInfo file = new(quicktestFailurePath);
+            if (file.Length <= 0 || file.Length > 16 * 1024)
+                return RejectQuicktestFailureArtifact();
+
+            QuicktestFailureRecord record = JsonSerializer.Deserialize<QuicktestFailureRecord>(
+                File.ReadAllText(quicktestFailurePath), Program.JsonOptions);
+            string rejection = ValidateQuicktestFailure(record, launchId, targetGeneration,
+                processId, processStartTicks, launchStartedUtc);
+            if (rejection != null)
+                return RejectQuicktestFailureArtifact();
+            return record;
+        }
+        catch
+        {
+            return RejectQuicktestFailureArtifact();
+        }
+    }
+
+    private QuicktestFailureRecord RejectQuicktestFailureArtifact()
+    {
+        QuicktestFailureArtifact.TryQuarantine(root, out _);
+        return null;
+    }
+
+    private string ValidateQuicktestFailure(QuicktestFailureRecord record, string launchId,
+        int targetGeneration, int processId, long processStartTicks, DateTime launchStartedUtc)
+    {
+        if (record == null || record.SchemaVersion != QuicktestFailureArtifact.CurrentSchemaVersion)
+            return "schema";
+        if (record.LaunchId == null || record.LaunchId.Length == 0 ||
+            record.LaunchId.Length > QuicktestFailureArtifact.MaxLaunchIdLength ||
+            !string.Equals(record.LaunchId, launchId, StringComparison.Ordinal))
+            return "launch";
+        if ((record.ProfileFingerprint?.Length ?? 0) > QuicktestFailureArtifact.MaxFingerprintLength ||
+            (record.BaselineFingerprint?.Length ?? 0) > QuicktestFailureArtifact.MaxFingerprintLength ||
+            (record.ProfileMode?.Length ?? 0) > QuicktestFailureArtifact.MaxProfileModeLength)
+            return "profile-bounds";
+        if (record.Generation != targetGeneration || record.Generation <= 0 ||
+            record.ProcessId != processId || record.ProcessId <= 0 ||
+            record.ProcessStartUtcTicks != processStartTicks || processStartTicks <= 0)
+            return "identity";
+
+        string expectedFingerprint;
+        string expectedBaseline;
+        string expectedProfileMode;
+        lock (gate)
+        {
+            expectedFingerprint = state.LaunchProfileFingerprint ??
+                (state.ProfileMode == ModProfile.LegacyMode ? null : state.ProfileFingerprint);
+            expectedBaseline = state.BaselineFingerprint;
+            expectedProfileMode = state.CrashIsolation?.CurrentAttemptProfile?.Mode ?? state.ProfileMode;
+        }
+
+        if (!NullableStringEquals(record.ProfileFingerprint, expectedFingerprint) ||
+            !NullableStringEquals(record.BaselineFingerprint, expectedBaseline) ||
+            !NullableStringEquals(record.ProfileMode, expectedProfileMode))
+            return "profile";
+        if (record.TimestampUtc == default || record.TimestampUtc.Kind != DateTimeKind.Utc)
+            return "timestamp";
+
+        DateTime timestamp = record.TimestampUtc.ToUniversalTime();
+        DateTime now = clock.UtcNow.ToUniversalTime();
+        if (timestamp < launchStartedUtc.ToUniversalTime().AddSeconds(-2) ||
+            timestamp > now.AddSeconds(2))
+            return "timestamp";
+        if (record.FailurePhase == null || record.FailurePhase.Length == 0 ||
+            record.FailurePhase.Length > QuicktestFailureArtifact.MaxPhaseLength ||
+            !string.Equals(record.FailureCode, QuicktestFailureArtifact.StableFailureCode,
+                StringComparison.Ordinal))
+            return "failure";
+        if (record.FailureCode.Length > QuicktestFailureArtifact.MaxCodeLength ||
+            string.IsNullOrWhiteSpace(record.ExceptionType) ||
+            (record.ExceptionType?.Length ?? 0) > QuicktestFailureArtifact.MaxExceptionTypeLength ||
+            (record.ExceptionMessage?.Length ?? 0) > QuicktestFailureArtifact.MaxExceptionMessageLength ||
+            string.IsNullOrWhiteSpace(record.DiagnosticDetail) ||
+            (record.DiagnosticDetail?.Length ?? 0) > QuicktestFailureArtifact.MaxDiagnosticDetailLength)
+            return "bounds";
+        return null;
+    }
+
+    private static bool NullableStringEquals(string left, string right)
+    {
+        return string.Equals(left ?? string.Empty, right ?? string.Empty, StringComparison.Ordinal);
+    }
+
+    private static string DescribeQuicktestFailure(QuicktestFailureRecord failure)
+    {
+        string phase = string.IsNullOrWhiteSpace(failure.FailurePhase) ? "unknown phase" : failure.FailurePhase;
+        string type = string.IsNullOrWhiteSpace(failure.ExceptionType) ? "unknown exception" : failure.ExceptionType;
+        string message = string.IsNullOrWhiteSpace(failure.ExceptionMessage) ?
+            "no exception message" : failure.ExceptionMessage;
+        string detail = string.IsNullOrWhiteSpace(failure.DiagnosticDetail) ?
+            type + ": " + message : failure.DiagnosticDetail;
+        return "terminal quicktest failure during " + phase + ": " +
+            QuicktestFailureArtifact.Bounded(detail, QuicktestFailureArtifact.MaxDiagnosticDetailLength);
     }
 
     private static string LaunchFailureCode(Exception exception, IManagedProcess process)
@@ -4813,7 +4993,14 @@ internal sealed class CoordinatorState
                 StringComparison.Ordinal) ||
             state.ProcessId <= 0 || state.ProcessStartUtcTicks <= 0 ||
             state.CrashIsolation != null || state.Leases.Count != 0 ||
-            state.MaintenanceReady || state.SessionDirty)
+            state.MaintenanceReady)
+            return false;
+
+        // SessionDirty describes the preceding stopped/maintenance session. It
+        // is not evidence against the freshly installed, accepted project
+        // launch when all of the authoritative launch-boundary checks below
+        // have succeeded. Active maintenance remains rejected above.
+        if (state.SessionDirty && !IsVerifiedFreshProjectLaunchLocked())
             return false;
 
         if (errorCode == ProcessInspection.ErrorCode ||
@@ -4841,9 +5028,28 @@ internal sealed class CoordinatorState
 
     private static bool IsIsolationEvidenceFailure(string errorCode) =>
         string.Equals(errorCode, "PROCESS_EXITED", StringComparison.Ordinal) ||
-        string.Equals(errorCode, "READINESS_TIMEOUT", StringComparison.Ordinal);
+        string.Equals(errorCode, "READINESS_TIMEOUT", StringComparison.Ordinal) ||
+        string.Equals(errorCode, QuicktestFailureArtifact.StableFailureCode, StringComparison.Ordinal);
 
-    private void BeginCrashIsolationLocked(string detail, string errorCode)
+    private bool IsVerifiedFreshProjectLaunchLocked()
+    {
+        if (state.ProfileMode != ModProfile.ProjectsMode ||
+            string.IsNullOrWhiteSpace(state.ProfileFingerprint) ||
+            !state.LaunchProfileInstalled || !state.LaunchAttemptStarted ||
+            !string.Equals(state.LaunchProfileFingerprint, state.ProfileFingerprint,
+                StringComparison.Ordinal) || string.IsNullOrWhiteSpace(state.LaunchId) ||
+            state.LaunchGeneration <= 0 || state.ProcessId <= 0 ||
+            state.ProcessStartUtcTicks <= 0 || state.ModsConfigGeneratedGeneration != state.LaunchGeneration ||
+            !string.Equals(state.ModsConfigGeneratedProfileFingerprint, state.ProfileFingerprint,
+                StringComparison.Ordinal))
+            return false;
+
+        return string.Equals(CurrentModsConfigOwnershipLocked(), "DEVBRIDGE_GENERATED",
+            StringComparison.Ordinal);
+    }
+
+    private void BeginCrashIsolationLocked(string detail, string errorCode,
+        QuicktestFailureRecord failure = null)
     {
         ModProfile accepted = ProfileFromStateLocked();
         if (accepted == null)
@@ -4871,9 +5077,13 @@ internal sealed class CoordinatorState
             OriginalProcessId = state.ProcessId,
             OriginalProcessStartUtcTicks = state.ProcessStartUtcTicks,
             OriginalFailureUtc = clock.UtcNow,
-            OriginalFailurePhase = state.Phase.ToString(),
+            OriginalFailurePhase = failure?.FailurePhase ?? state.Phase.ToString(),
             OriginalFailureCode = errorCode,
             OriginalFailureDetail = detail,
+            OriginalFailureSchemaVersion = failure?.SchemaVersion ?? 0,
+            OriginalFailureExceptionType = failure?.ExceptionType,
+            OriginalFailureExceptionMessage = failure?.ExceptionMessage,
+            OriginalFailureDiagnosticDetail = failure?.DiagnosticDetail,
             OriginalProcessExitObserved = errorCode == "PROCESS_EXITED",
             OriginalExitInformation = detail,
             SearchPoolProjects = projects,
@@ -5279,6 +5489,7 @@ internal sealed class CoordinatorState
             state.Error = null;
             state.ErrorCode = null;
             DeleteReadinessLocked();
+            DeleteQuicktestFailureArtifactLocked();
             SaveStateLocked();
         }
         errorCode = null;
@@ -5835,11 +6046,27 @@ internal sealed class CoordinatorState
         Monitor.PulseAll(gate);
     }
 
-    private void FailLaunch(string detail, string errorCode = "LAUNCH_FAILED")
+    private void FailLaunch(string detail, string errorCode = "LAUNCH_FAILED",
+        QuicktestFailureRecord failure = null)
     {
         lock (gate)
         {
             string failurePhase = state.Phase.ToString();
+            if (failure != null)
+            {
+                state.TerminalFailureSchemaVersion = failure.SchemaVersion;
+                state.TerminalFailurePhase = failure.FailurePhase;
+                state.TerminalFailureCode = failure.FailureCode;
+                state.TerminalFailureDetail = detail;
+                state.TerminalFailureExceptionType = failure.ExceptionType;
+                state.TerminalFailureExceptionMessage = failure.ExceptionMessage;
+                state.TerminalFailureDiagnosticDetail = failure.DiagnosticDetail;
+            }
+            if (IsolationActiveLocked() && state.CrashIsolation.CurrentAttemptId == null &&
+                string.Equals(state.CrashIsolation.OriginalLaunchId, state.LaunchId, StringComparison.Ordinal) &&
+                state.CrashIsolation.OriginalGeneration == state.LaunchGeneration &&
+                string.Equals(state.CrashIsolation.OriginalFailureCode, errorCode, StringComparison.Ordinal))
+                return;
             if (IsolationActiveLocked() && state.CrashIsolation.CurrentAttemptId != null)
             {
                 CrashIsolationIncident incident = state.CrashIsolation;
@@ -5877,7 +6104,7 @@ internal sealed class CoordinatorState
 
             if (IsEligibleForCrashIsolationLocked(errorCode))
             {
-                BeginCrashIsolationLocked(detail, errorCode);
+                BeginCrashIsolationLocked(detail, errorCode, failure);
                 return;
             }
 
@@ -6042,6 +6269,7 @@ internal sealed class CoordinatorState
             !string.IsNullOrWhiteSpace(state.CrashIsolation.CurrentAttemptId))
         {
             CrashIsolationIncident incident = state.CrashIsolation;
+            bool verifiedIsolationProjectLaunch = IsVerifiedFreshProjectLaunchLocked();
             incident.CurrentAttemptResult = "PASS";
             incident.CurrentAttemptFailurePhase = null;
             incident.CurrentAttemptFailureCode = null;
@@ -6055,6 +6283,8 @@ internal sealed class CoordinatorState
             state.TargetGeneration = targetGeneration;
             state.RequiresNewProcess = true;
             state.MaintenanceReady = false;
+            if (verifiedIsolationProjectLaunch)
+                state.SessionDirty = false;
             SaveStateLocked();
             QueueIsolationContinuationLocked();
             Monitor.PulseAll(gate);
@@ -6082,9 +6312,19 @@ internal sealed class CoordinatorState
             ? (state.RuntimeProfile ?? (state.ProfileMode == ModProfile.LegacyMode ? null :
                 PersistedProfileSnapshot.FromModProfile(ProfileFromStateLocked())))
             : state.RuntimeProfile;
+        bool verifiedFreshProjectLaunch = IsVerifiedFreshProjectLaunchLocked();
         state.LaunchProfileFingerprint = null;
         state.LaunchProfileInstalled = false;
         state.LaunchAttemptStarted = false;
+        if (verifiedFreshProjectLaunch)
+            state.SessionDirty = false;
+        state.TerminalFailureSchemaVersion = 0;
+        state.TerminalFailurePhase = null;
+        state.TerminalFailureCode = null;
+        state.TerminalFailureDetail = null;
+        state.TerminalFailureExceptionType = null;
+        state.TerminalFailureExceptionMessage = null;
+        state.TerminalFailureDiagnosticDetail = null;
         foreach (TestLease lease in state.Leases)
             lease.Generation = targetGeneration;
         SaveStateLocked();
@@ -6156,7 +6396,24 @@ internal sealed class CoordinatorState
                 return false;
 
             DateTime launchStarted = state.LaunchStartedUtc.ToUniversalTime();
-            if (!IsReadinessMatch(state.LaunchId, state.ProcessId, state.LaunchGeneration, launchStarted))
+            QuicktestFailureRecord failure = TryReadMatchingQuicktestFailure(
+                state.LaunchId, state.LaunchGeneration, state.ProcessId,
+                state.ProcessStartUtcTicks, launchStarted);
+            bool readiness = IsReadinessMatch(state.LaunchId, state.ProcessId,
+                state.LaunchGeneration, launchStarted);
+            if (failure != null && readiness)
+            {
+                FailLaunch("a terminal quicktest failure and a matching readiness signal were both written; the launch is ambiguous",
+                    "QUICKTEST_READINESS_CONFLICT", failure);
+                return false;
+            }
+            if (failure != null)
+            {
+                FailLaunch(DescribeQuicktestFailure(failure),
+                    QuicktestFailureArtifact.StableFailureCode, failure);
+                return false;
+            }
+            if (!readiness)
                 return false;
 
             MarkReadyLocked(state.LaunchId, state.LaunchGeneration, state.ProcessId, state.ProcessStartUtcTicks);
@@ -6186,6 +6443,7 @@ internal sealed class CoordinatorState
         state.WaitingForBridgeDeadlineUtc = null;
         state.RequiresNewProcess = true;
         DeleteReadinessLocked();
+        DeleteQuicktestFailureArtifactLocked();
         SaveStateLocked();
         Monitor.PulseAll(gate);
     }
@@ -6521,6 +6779,11 @@ internal sealed class CoordinatorState
         {
             // A stale readiness file is ignored unless it matches the new launch ID.
         }
+    }
+
+    private void DeleteQuicktestFailureArtifactLocked()
+    {
+        QuicktestFailureArtifact.Invalidate(root);
     }
 
     private string NewLeaseIdLocked()
@@ -7435,6 +7698,12 @@ internal sealed class CoordinatorState
             BaselineFingerprint = snapshot.BaselineFingerprint,
             ModsConfigOwnership = snapshot.ModsConfigOwnership,
             ProfileConflict = snapshot.ProfileConflict,
+            TerminalFailurePhase = snapshot.CrashIsolation?.OriginalFailurePhase ?? snapshot.TerminalFailurePhase,
+            TerminalFailureCode = snapshot.CrashIsolation?.OriginalFailureCode ?? snapshot.TerminalFailureCode,
+            TerminalFailureDetail = snapshot.CrashIsolation?.OriginalFailureDetail ?? snapshot.TerminalFailureDetail,
+            TerminalFailureExceptionType = snapshot.CrashIsolation?.OriginalFailureExceptionType ?? snapshot.TerminalFailureExceptionType,
+            TerminalFailureExceptionMessage = snapshot.CrashIsolation?.OriginalFailureExceptionMessage ?? snapshot.TerminalFailureExceptionMessage,
+            TerminalFailureDiagnosticDetail = snapshot.CrashIsolation?.OriginalFailureDiagnosticDetail ?? snapshot.TerminalFailureDiagnosticDetail,
             RuntimeProfileFingerprint = snapshot.RuntimeProfile?.ProfileFingerprint,
             CrashIsolation = snapshot.CrashIsolation,
             FrozenGeneration = snapshot.FrozenTargetGeneration,
@@ -7573,7 +7842,7 @@ internal sealed class CoordinatorState
             (snapshot.CrashIsolation != null &&
              !IsTerminalIsolationStatus(snapshot.CrashIsolation.Status)))
         {
-            return "Crash isolation is running; Do not retry or change ModsConfig.xml. Run: DevBridge.cmd status and keep waiting.";
+            return "Crash isolation is running; Do not retry, restart, or kill RimWorld, and do not change ModsConfig.xml. Run: DevBridge.cmd status and keep waiting.";
         }
 
         List<string> missingProjects = MissingProjectsFor(snapshot, request);

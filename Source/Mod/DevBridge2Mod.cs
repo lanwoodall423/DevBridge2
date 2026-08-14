@@ -40,10 +40,25 @@ namespace DevBridge2
     internal static class DevBridgeQuicktestActivation
     {
         private const long ActivationTimeoutMilliseconds = 60000;
+        private static readonly object FailureGate = new object();
         private static QuicktestActivationController controller;
+        private static bool failureArtifactAttempted;
+        private static string configuredRoot;
+        private static string configuredLaunchId;
+        private static int configuredGeneration;
+        private static string configuredProfileFingerprint;
+        private static string configuredBaselineFingerprint;
+        private static string configuredProfileMode;
 
         internal static void Configure()
         {
+            configuredRoot = Environment.GetEnvironmentVariable("DEVBRIDGE_ROOT");
+            configuredLaunchId = Environment.GetEnvironmentVariable("DEVBRIDGE_LAUNCH_ID");
+            int.TryParse(Environment.GetEnvironmentVariable("DEVBRIDGE_GENERATION"), out configuredGeneration);
+            configuredProfileFingerprint = Environment.GetEnvironmentVariable("DEVBRIDGE_PROFILE_FINGERPRINT");
+            configuredBaselineFingerprint = Environment.GetEnvironmentVariable("DEVBRIDGE_BASELINE_FINGERPRINT");
+            configuredProfileMode = Environment.GetEnvironmentVariable("DEVBRIDGE_PROFILE_MODE");
+
             bool requested = string.Equals(Environment.GetEnvironmentVariable("DEVBRIDGE_QUICKTEST_REQUESTED"), "1",
                 StringComparison.Ordinal);
             if (requested)
@@ -51,10 +66,71 @@ namespace DevBridge2
                 controller = new QuicktestActivationController(requested,
                     DevBridgeQuicktestMenuAdapter.IsGenuineMainMenuReady,
                     () => DevBridgeQuicktestMenuAdapter.QueueBuiltInDevQuicktest(
-                        controller.ReportActivationFailure), MonotonicMilliseconds,
+                        ReportActivationFailure), MonotonicMilliseconds,
                     ActivationTimeoutMilliseconds);
                 LongEventHandler.ExecuteWhenFinished(DevBridgeQuicktestActivationDriver.EnsureCreated);
             }
+        }
+
+        private static void ReportActivationFailure(Exception exception, string phase)
+        {
+            bool writeArtifact;
+            lock (FailureGate)
+            {
+                writeArtifact = !failureArtifactAttempted;
+                failureArtifactAttempted = true;
+            }
+
+            if (writeArtifact)
+            {
+                try
+                {
+                    int processId = 0;
+                    long processStartUtcTicks = 0;
+                    try
+                    {
+                        using (Process process = Process.GetCurrentProcess())
+                        {
+                            processId = process.Id;
+                            processStartUtcTicks = process.StartTime.ToUniversalTime().Ticks;
+                        }
+                    }
+                    catch
+                    {
+                        // The callback still reports its in-memory failure and
+                        // rethrows if process identity cannot be inspected.
+                    }
+
+                    QuicktestFailureArtifact.TryWrite(configuredRoot, new QuicktestFailureRecord
+                    {
+                        SchemaVersion = QuicktestFailureArtifact.CurrentSchemaVersion,
+                        LaunchId = configuredLaunchId,
+                        Generation = configuredGeneration,
+                        ProcessId = processId,
+                        ProcessStartUtcTicks = processStartUtcTicks,
+                        ProfileFingerprint = configuredProfileFingerprint,
+                        BaselineFingerprint = configuredBaselineFingerprint,
+                        ProfileMode = configuredProfileMode,
+                        TimestampUtc = DateTime.UtcNow,
+                        FailurePhase = phase,
+                        FailureCode = QuicktestFailureArtifact.StableFailureCode,
+                        ExceptionType = exception?.GetType().FullName,
+                        ExceptionMessage = exception?.Message,
+                        DiagnosticDetail = exception?.ToString()
+                    }, out string writeError);
+                    if (!string.IsNullOrWhiteSpace(writeError))
+                        Log.Warning("[DevBridge2] Could not persist quicktest failure artifact: " + writeError);
+                }
+                catch (Exception artifactException)
+                {
+                    // Artifact persistence is diagnostic. It must never mask
+                    // the original exception being rethrown to RimWorld.
+                    Log.Warning("[DevBridge2] Could not persist quicktest failure artifact: " +
+                        artifactException.Message);
+                }
+            }
+
+            controller?.ReportActivationFailure(exception);
         }
 
         internal static bool Tick()

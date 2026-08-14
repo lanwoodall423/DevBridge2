@@ -1,4 +1,8 @@
 @echo off
+rem Plain restart is the durable aggregate launch contract: minimal control or the union of active
+rem project registrations. Production ModsConfig is available only via explicit --legacy-production;
+rem this wrapper never falls back to it. Use project register/status/renew/release and status --json
+rem to verify frozen inclusion before test begin. During crash isolation, poll status only.
 setlocal
 set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"

@@ -15,12 +15,24 @@ Use `DevBridge.cmd` from the installed mod root.
   last heartbeat; use `DevBridge.cmd test renew <lease-id>` before `expiresUtc` if a connected session
   is not practical. Release a completed test with the exact `DevBridge.cmd test end <lease-id>` command.
 - Maintenance ownership is exclusive: acquire a lease first, then use `stop <lease-id>` and keep that lease until `ensure-ready <lease-id>` completes.
-- Use `DevBridge.cmd restart` after a build requires a fresh RimWorld process.
-- Reduced mod profiles are strictly opt-in. Existing `restart` calls preserve the current mod-list
-  behavior; use `restart --projects ...` only when you want DevBridge to write a managed profile.
-- Before the first profile launch, explicitly run `DevBridge.cmd mods capture-baseline` while RimWorld
-  is stopped and no leases or restart are active. DevBridge keeps the exact bytes in
-  `Runtime/ModsConfig.baseline.xml` and will not silently recapture a generated reduced profile.
+- Register managed project intent before testing: `DevBridge.cmd project register <alias[,alias...]>`.
+  Registrations are durable, owner/session-bound, renewed by heartbeat, and expire safely when the
+  owner stops renewing. Use `project status` to inspect active, frozen, and queued registrations.
+- Plain `DevBridge.cmd restart` is an aggregate launch. It uses the minimal control profile when there
+  are no active project registrations, or the deterministic union and full dependency closure of all
+  active registrations. It never preserves or implicitly launches a production ModsConfig.
+- Explicit `restart --projects ...` remains compatibility syntax and adds the caller's request to the
+  aggregate. Verify `status --json` before testing: it must show the frozen registration IDs/owners,
+  project union, ordered package closure, and baseline/profile fingerprints that will run.
+- `restart --legacy-production` is the unmistakable, human-only production compatibility path. It is
+  never an automatic fallback, never used for project attribution, and cannot be combined with active
+  project intent. Resolution, ownership, lease, maintenance, process-identity, or safety failures
+  fail closed with no ModsConfig write and no launch.
+- Release completed intent with `DevBridge.cmd project release <registration-id>`; release and expiry
+  affect future generations only. A generation already frozen remains immutable.
+- Before the first aggregate profile launch, DevBridge adopts the exact current ModsConfig bytes as a
+  durable baseline only after successful metadata resolution. Explicit `mods capture-baseline` remains
+  available for intentional baseline changes while RimWorld is stopped and no leases or restart are active.
 - Waiting is normal. Do not abort a command just because another agent is testing.
 - `restart` waits for active tests, restarts once, and continues automatically.
 - Once `restart` is accepted, DevBridge owns it even if the requesting shell times out or disconnects; do not request it again. Use `DevBridge.cmd wait-ready` or `DevBridge.cmd status` to reconnect.
@@ -43,6 +55,8 @@ Use `DevBridge.cmd` from the installed mod root.
 - If `status` reports `PROCESS_INSPECTION_AMBIGUOUS`, close RimWorld through Steam and run
   `DevBridge.cmd doctor`. A complete census proving zero matching processes clears the stale quarantine
   to `STOPPED` without launching anything; then run the separately printed `DevBridge.cmd restart`.
+- While crash isolation is active, poll `DevBridge.cmd status` (or `status --json`) only. Do not retry
+  restart, edit ModsConfig.xml, or register, renew, or release project intent until isolation is terminal.
 - Diagnostics show the agent/session identity beside leases. Set `DEVBRIDGE_AGENT` to choose an explicit identity; otherwise each CLI session gets a short automatic ID.
 - Use the same stable `DEVBRIDGE_AGENT` value for `test session`, `test renew`, `test end`, `stop`, and
   `ensure-ready` commands that manage a lease acquired by an earlier CLI invocation.
@@ -54,15 +68,21 @@ Use `DevBridge.cmd` from the installed mod root.
 
 ```text
 set DEVBRIDGE_AGENT=agent-a
+set DEVBRIDGE_SESSION=agent-a-session
+DevBridge.cmd project register horticulture,aquaculture
+DevBridge.cmd project status
 DevBridge.cmd test session # keep this connected in a second terminal/background task
 # interact with RimWorld and test the mod
 DevBridge.cmd test end <lease-id> # from another command with the same DEVBRIDGE_AGENT; this ends the session
 
 # after rebuilding a mod:
 DevBridge.cmd restart
+DevBridge.cmd wait-ready
+DevBridge.cmd status --json # verify frozen registrations, closure, order, and fingerprints
 DevBridge.cmd test begin
 # test the rebuilt mod
 DevBridge.cmd test end <printed-id>
+DevBridge.cmd project release <registration-id>
 ```
 
 `test session`, `test begin`, and `restart` may stay running while they wait. A caller timeout does not
@@ -93,17 +113,26 @@ owner, and the coordinator heartbeats only while that connection is alive. Cance
 crashing that owner stops heartbeats; no detached heartbeat process remains. For short-lived clients,
 `test renew <lease-id>` resets the timer without changing the lease generation.
 
-### Opt-in mod profiles
+While crash isolation is active, poll `DevBridge.cmd status` or `status --json` only. Do not retry,
+edit ModsConfig.xml, or mutate project registrations until the incident is terminal. A failed
+resolution, metadata graph, ownership check, lease/maintenance check, process identity check, or
+launch safety check is fail-closed: DevBridge makes no ModsConfig write and no launch.
 
-Capture the user baseline once, then select projects per accepted restart:
+### Aggregate project launches
+
+Register project intent, restart or await the accepted generation, verify inclusion, then begin a test:
 
 ```text
-DevBridge.cmd mods capture-baseline
-DevBridge.cmd restart --projects none
-DevBridge.cmd restart --projects horticulture
-DevBridge.cmd restart --projects horticulture,aquaculture
-DevBridge.cmd mods status --json
-DevBridge.cmd mods restore-baseline
+set DEVBRIDGE_AGENT=agent-a
+set DEVBRIDGE_SESSION=agent-a-session
+DevBridge.cmd project register horticulture,aquaculture
+DevBridge.cmd project status
+DevBridge.cmd restart
+DevBridge.cmd wait-ready
+DevBridge.cmd status --json
+DevBridge.cmd test begin
+DevBridge.cmd test end <lease-id>
+DevBridge.cmd project release <registration-id>
 ```
 
 Supported aliases are `deferred-reality`, `insight-canvas`, `knowledge-framework`, `frontier`,
@@ -116,8 +145,9 @@ RimWorld launches. `ferny.loadthemlast` is never injected.
 Baseline capture and restore are allowed only with no active lease, pending restart, or RimWorld
 process. Restore reproduces the captured bytes atomically. If `ModsConfig.xml` has an unexpected user
 edit, DevBridge refuses to overwrite it; intentionally changed lists must be captured explicitly after
-the edit. A conflicting profile request is rejected with `PROFILE_CONFLICT` and cannot replace the
-accepted profile for that generation.
+the edit. A request arriving after the freeze is reported as queued for the next aggregate
+generation and cannot replace the accepted profile for that generation. A conflicting owner or
+unsafe pending request is rejected with `PROFILE_CONFLICT`.
 
 ### Machine-readable lease contract
 
@@ -162,9 +192,11 @@ Profile status also exposes the exact accepted profile:
 }
 ```
 
-`profileMode` is `legacy` for an unprofiled command, `baseline` for `--projects none`, and
-`projects` for one or more aliases. The `resolvedMods` example is abbreviated; status returns the
-complete activeMods order.
+`launchProfileMode` is `aggregate-minimal-control` for a no-project aggregate, `aggregate-projects`
+for an aggregate with project intent, and `explicit-human-legacy` only for `--legacy-production`.
+`profileMode` remains the resolver mode (`baseline`, `projects`, or explicit `legacy`). The
+`resolvedMods` example is abbreviated; status returns the complete activeMods order. The response also
+exposes `frozenRegistrations` and `queuedProjectIntents` so agents can verify inclusion before testing.
 
 ## Maintenance workflow
 

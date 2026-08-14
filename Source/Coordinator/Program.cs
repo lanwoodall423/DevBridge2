@@ -51,7 +51,7 @@ internal static class Program
 
     private static void PrintUsage()
     {
-        Console.WriteLine("DevBridge commands: status | mods status | mods capture-baseline | mods restore-baseline | test begin | test session | test renew <lease-id> | test end <lease-id> | stop <lease-id> | ensure-ready <lease-id> | restart [--projects none|alias[,alias...]] | wait-ready | doctor");
+        Console.WriteLine("DevBridge commands: status | project register <alias[,alias...]> | project status | project renew <registration-id> | project release <registration-id> | mods status | mods capture-baseline | mods restore-baseline | test begin | test session | test renew <lease-id> | test end <lease-id> | stop <lease-id> | ensure-ready <lease-id> | restart [--projects none|alias[,alias...]] [--legacy-production] | wait-ready | doctor");
         Console.WriteLine("Append --json to a non-session command for machine-readable output.");
     }
 }
@@ -205,6 +205,7 @@ internal sealed class BridgeRequest
     public string GoalId { get; set; }
     public string WakeId { get; set; }
     public string McpRequestId { get; set; }
+    public string SessionId { get; set; }
 }
 
 internal static class CoordinatorClient
@@ -273,7 +274,8 @@ internal static class CoordinatorClient
                     Environment.GetEnvironmentVariable("DEVBRIDGE_TICKET") : ticketId,
                 GoalId = Environment.GetEnvironmentVariable("DEVBRIDGE_GOAL"),
                 WakeId = Environment.GetEnvironmentVariable("DEVBRIDGE_WAKE"),
-                McpRequestId = Environment.GetEnvironmentVariable("DEVBRIDGE_MCP_REQUEST")
+                McpRequestId = Environment.GetEnvironmentVariable("DEVBRIDGE_MCP_REQUEST"),
+                SessionId = Environment.GetEnvironmentVariable("DEVBRIDGE_SESSION")
             };
             writer.WriteLine(JsonSerializer.Serialize(request, Program.JsonOptions));
 
@@ -541,6 +543,10 @@ internal sealed class PersistedState
     public DateTime? WaitingForBridgeDeadlineUtc { get; set; }
     public bool RequiresNewProcess { get; set; }
     public string ProfileMode { get; set; } = ModProfile.LegacyMode;
+    // ProfileMode is the resolver's legacy/baseline/projects value. LaunchProfileMode
+    // is the operator-facing contract and deliberately distinguishes the aggregate
+    // control profile from explicit human legacy mode.
+    public string LaunchProfileMode { get; set; } = "explicit-human-legacy";
     public List<string> RequestedProjects { get; set; } = new();
     public List<string> ResolvedProjectPackageIds { get; set; } = new();
     public List<string> ResolvedMods { get; set; } = new();
@@ -563,6 +569,58 @@ internal sealed class PersistedState
     public int IsolationLaunchesRemaining { get; set; }
     public List<ScopeTicket> ScopeTickets { get; set; } = new();
     public List<TestLease> Leases { get; set; } = new();
+    public List<ProjectIntentRegistration> ProjectIntents { get; set; } = new();
+    public bool AggregateFreezePending { get; set; }
+    public DateTime? AggregateFreezeRequestedUtc { get; set; }
+    public DateTime? AggregateFrozenUtc { get; set; }
+    public int FrozenTargetGeneration { get; set; }
+    public string FrozenLaunchOwner { get; set; }
+    public string FrozenLaunchRequestKey { get; set; }
+    public List<ProjectIntentSnapshot> FrozenRegistrations { get; set; } = new();
+    public List<string> FrozenRequestedProjects { get; set; } = new();
+    public List<string> FrozenResolvedProjectPackageIds { get; set; } = new();
+    public List<string> FrozenResolvedMods { get; set; } = new();
+    public string FrozenProfileFingerprint { get; set; }
+    public string FrozenBaselineFingerprint { get; set; }
+    public List<AggregateGenerationEvidence> AggregateGenerations { get; set; } = new();
+}
+
+internal sealed class ProjectIntentRegistration
+{
+    public string Id { get; set; }
+    public string Owner { get; set; }
+    public string SessionId { get; set; }
+    public int ClientProcessId { get; set; }
+    public List<string> RequestedProjects { get; set; } = new();
+    public DateTime CreatedUtc { get; set; }
+    public DateTime LastHeartbeatUtc { get; set; }
+    public DateTime ExpiresUtc { get; set; }
+    public string Status { get; set; } = "ACTIVE";
+    public DateTime? ReleasedUtc { get; set; }
+    public string ReleaseReason { get; set; }
+}
+
+internal sealed class ProjectIntentSnapshot
+{
+    public string Id { get; set; }
+    public string Owner { get; set; }
+    public string SessionId { get; set; }
+    public List<string> RequestedProjects { get; set; } = new();
+}
+
+internal sealed class AggregateGenerationEvidence
+{
+    public int Generation { get; set; }
+    public DateTime FrozenUtc { get; set; }
+    public string LaunchOwner { get; set; }
+    public string LaunchRequestKey { get; set; }
+    public string ProfileMode { get; set; }
+    public List<ProjectIntentSnapshot> Registrations { get; set; } = new();
+    public List<string> RequestedProjects { get; set; } = new();
+    public List<string> ResolvedProjectPackageIds { get; set; } = new();
+    public List<string> ResolvedMods { get; set; } = new();
+    public string ProfileFingerprint { get; set; }
+    public string BaselineFingerprint { get; set; }
 }
 
 internal sealed class PersistedProfileSnapshot
@@ -654,6 +712,8 @@ internal sealed class CrashIsolationIncident
     public bool OriginalProcessExitObserved { get; set; }
     public string OriginalExitInformation { get; set; }
     public Dictionary<string, string> OriginalDiagnosticMetadata { get; set; } = new();
+    public List<ProjectIntentSnapshot> OriginalRegistrations { get; set; } = new();
+    public Dictionary<string, List<ProjectIntentRequester>> ProjectRequesters { get; set; } = new();
 
     public string DiagnosisCode { get; set; }
     public string Diagnosis { get; set; }
@@ -683,6 +743,13 @@ internal sealed class CrashIsolationIncident
     public string CurrentAttemptFailureDetail { get; set; }
     public bool CurrentAttemptProfileInstalled { get; set; }
     public int IsolationLaunchesRemaining { get; set; }
+}
+
+internal sealed class ProjectIntentRequester
+{
+    public string RegistrationId { get; set; }
+    public string Owner { get; set; }
+    public string SessionId { get; set; }
 }
 
 internal sealed class GeneratedModsConfigManifest
@@ -798,6 +865,12 @@ internal sealed class JsonCommandResponse
     [JsonPropertyName("profileMode")]
     public string ProfileMode { get; set; }
 
+    [JsonPropertyName("launchProfileMode")]
+    public string LaunchProfileMode { get; set; }
+
+    [JsonPropertyName("resolverProfileMode")]
+    public string ResolverProfileMode { get; set; }
+
     [JsonPropertyName("requestedProjects")]
     public List<string> RequestedProjects { get; set; } = new();
 
@@ -824,6 +897,51 @@ internal sealed class JsonCommandResponse
 
     [JsonPropertyName("crashIsolation")]
     public CrashIsolationIncident CrashIsolation { get; set; }
+
+    [JsonPropertyName("frozenGeneration")]
+    public int FrozenGeneration { get; set; }
+
+    [JsonPropertyName("frozenRequestedProjects")]
+    public List<string> FrozenRequestedProjects { get; set; } = new();
+
+    [JsonPropertyName("frozenResolvedProjectPackageIds")]
+    public List<string> FrozenResolvedProjectPackageIds { get; set; } = new();
+
+    [JsonPropertyName("frozenResolvedMods")]
+    public List<string> FrozenResolvedMods { get; set; } = new();
+
+    [JsonPropertyName("frozenProfileFingerprint")]
+    public string FrozenProfileFingerprint { get; set; }
+
+    [JsonPropertyName("frozenBaselineFingerprint")]
+    public string FrozenBaselineFingerprint { get; set; }
+
+    [JsonPropertyName("aggregateFreezePending")]
+    public bool AggregateFreezePending { get; set; }
+
+    [JsonPropertyName("frozenLaunchOwner")]
+    public string FrozenLaunchOwner { get; set; }
+
+    [JsonPropertyName("frozenLaunchRequestKey")]
+    public string FrozenLaunchRequestKey { get; set; }
+
+    [JsonPropertyName("frozenRegistrationIds")]
+    public List<string> FrozenRegistrationIds { get; set; } = new();
+
+    [JsonPropertyName("frozenRegistrations")]
+    public List<ProjectIntentSnapshot> FrozenRegistrations { get; set; } = new();
+
+    [JsonPropertyName("activeProjectIntents")]
+    public List<ProjectIntentRegistrationInfo> ActiveProjectIntents { get; set; } = new();
+
+    [JsonPropertyName("queuedProjectIntents")]
+    public List<ProjectIntentRegistrationInfo> QueuedProjectIntents { get; set; } = new();
+
+    [JsonPropertyName("aggregateGenerations")]
+    public List<AggregateGenerationEvidence> AggregateGenerations { get; set; } = new();
+
+    [JsonPropertyName("missingProjects")]
+    public List<string> MissingProjects { get; set; } = new();
 
     [JsonPropertyName("accepted")]
     public bool? Accepted { get; set; }
@@ -889,6 +1007,42 @@ internal sealed class JsonLeaseInfo
     [JsonPropertyName("age")]
     public string Age { get; set; }
 
+}
+
+internal sealed class ProjectIntentRegistrationInfo
+{
+    [JsonPropertyName("id")]
+    public string Id { get; set; }
+
+    [JsonPropertyName("owner")]
+    public string Owner { get; set; }
+
+    [JsonPropertyName("sessionId")]
+    public string SessionId { get; set; }
+
+    [JsonPropertyName("requestedProjects")]
+    public List<string> RequestedProjects { get; set; } = new();
+
+    [JsonPropertyName("status")]
+    public string Status { get; set; }
+
+    [JsonPropertyName("createdUtc")]
+    public DateTime CreatedUtc { get; set; }
+
+    [JsonPropertyName("lastHeartbeatUtc")]
+    public DateTime LastHeartbeatUtc { get; set; }
+
+    [JsonPropertyName("expiresUtc")]
+    public DateTime ExpiresUtc { get; set; }
+
+    [JsonPropertyName("releasedUtc")]
+    public DateTime? ReleasedUtc { get; set; }
+
+    [JsonPropertyName("releaseReason")]
+    public string ReleaseReason { get; set; }
+
+    [JsonPropertyName("clientProcessId")]
+    public int ClientProcessId { get; set; }
 }
 
 internal sealed class ReadinessRecord
@@ -978,6 +1132,7 @@ internal sealed class CoordinatorOptions
     internal TimeSpan LeaseDuration { get; init; } = TimeSpan.FromMinutes(2);
     internal TimeSpan LeaseHeartbeatInterval { get; init; } = TimeSpan.FromSeconds(30);
     internal TimeSpan LeaseSessionPollInterval { get; init; } = TimeSpan.FromSeconds(1);
+    internal TimeSpan ProjectIntentDuration { get; init; } = TimeSpan.FromMinutes(10);
     internal TimeSpan LeaseProgressInterval { get; init; } = TimeSpan.FromSeconds(5);
     internal IProcessAdapter ProcessAdapter { get; init; } = new SystemProcessAdapter();
     internal ICoordinatorClock Clock { get; init; } = SystemCoordinatorClock.Instance;
@@ -1805,6 +1960,7 @@ internal sealed class CoordinatorState
     private sealed class RestartArguments
     {
         internal string LeaseId { get; init; }
+        internal bool LegacyProduction { get; init; }
         internal bool HasProjects { get; init; }
         internal List<string> Projects { get; init; } = new();
     }
@@ -1910,6 +2066,7 @@ internal sealed class CoordinatorState
             "restart" => Restart(request, emit),
             "stop" => Stop(request, emit),
             "ensure-ready" => EnsureReady(request, emit),
+            "project" or "projects" or "intent" => ProjectIntent(arguments, request, emit),
             "test" => Test(arguments, request, emit, connected),
             "help" => Help(emit),
             _ => Unknown(command, emit)
@@ -2104,11 +2261,365 @@ internal sealed class CoordinatorState
                 SaveStateLocked();
                 emit("Captured the user ModsConfig baseline byte-for-byte.");
                 emit("Baseline fingerprint: " + fingerprint);
-                emit("Next action: choose an opt-in profile with DevBridge.cmd restart --projects none or --projects <alias>.");
+                emit("Next action: register project intent if needed, then run DevBridge.cmd restart and verify status --json before testing.");
                 return 0;
             }
         }
     }
+
+    private int ProjectIntent(IReadOnlyList<string> arguments, BridgeRequest request, Action<string> emit)
+    {
+        if (arguments.Count == 0)
+        {
+            emit("Usage: DevBridge.cmd project register <alias[,alias...]> | project status | project renew <registration-id> | project release <registration-id>");
+            return 2;
+        }
+
+        string operation = arguments[0]?.Trim().ToLowerInvariant();
+        return operation switch
+        {
+            "register" => RegisterProjectIntent(arguments, request, emit),
+            "status" => ProjectIntentStatus(emit),
+            "renew" or "heartbeat" => RenewProjectIntent(arguments, request, emit),
+            "release" or "end" => ReleaseProjectIntent(arguments, request, emit),
+            _ => Unknown("project " + string.Join(" ", arguments), emit)
+        };
+    }
+
+    private int RegisterProjectIntent(IReadOnlyList<string> arguments, BridgeRequest request, Action<string> emit)
+    {
+        string value = null;
+        string requestedId = null;
+        for (int index = 1; index < arguments.Count; index++)
+        {
+            string argument = arguments[index]?.Trim() ?? string.Empty;
+            if (argument.StartsWith("--id=", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!string.IsNullOrWhiteSpace(requestedId))
+                    return ProjectIntentUsage(emit, "project register accepts only one --id option");
+                requestedId = argument.Substring("--id=".Length).Trim();
+                continue;
+            }
+            if (string.Equals(argument, "--id", StringComparison.OrdinalIgnoreCase))
+            {
+                if (index + 1 >= arguments.Count || string.IsNullOrWhiteSpace(arguments[++index]))
+                    return ProjectIntentUsage(emit, "project register --id requires a stable registration ID");
+                if (!string.IsNullOrWhiteSpace(requestedId))
+                    return ProjectIntentUsage(emit, "project register accepts only one --id option");
+                requestedId = arguments[index].Trim();
+                continue;
+            }
+            if (argument.StartsWith("--", StringComparison.Ordinal))
+                return ProjectIntentUsage(emit, "unknown project registration option '" + argument + "'");
+            if (value != null)
+                return ProjectIntentUsage(emit, "project register accepts one comma-separated alias value");
+            value = argument;
+        }
+
+        if (string.IsNullOrWhiteSpace(value))
+            return ProjectIntentUsage(emit, "project register requires one or more managed project aliases");
+
+        IReadOnlyList<string> aliases;
+        try
+        {
+            aliases = ModProfileResolver.CanonicalAliases(value.Split(',', StringSplitOptions.None));
+            if (aliases.Count == 0)
+                throw new ProfileException("PROJECT_INTENT_INVALID", "a project intent must contain at least one managed project alias");
+        }
+        catch (ProfileException exception)
+        {
+            RecordProfileError(exception.Code, exception.Message);
+            emit("Project registration denied: " + exception.Message);
+            emit("Error code: " + exception.Code);
+            return 2;
+        }
+
+        lock (gate)
+        {
+            SynchronizeLocked();
+            if (IsolationActiveLocked())
+                return ProjectIntentIsolationDenied(emit);
+
+            string owner = StableProjectOwner(request);
+            string session = StableProjectSession(request);
+            ProjectIntentRegistration existing = state.ProjectIntents.FirstOrDefault(value =>
+                string.Equals(value.Status, "ACTIVE", StringComparison.Ordinal) &&
+                string.Equals(value.Owner, owner, StringComparison.Ordinal) &&
+                string.Equals(value.SessionId, session, StringComparison.Ordinal) &&
+                SequenceEqualAliases(value.RequestedProjects, aliases));
+            if (existing != null)
+            {
+                TouchProjectIntentLocked(existing);
+                SaveStateLocked();
+                EmitProjectRegistration(existing, emit, "Project intent renewed: ");
+                return 0;
+            }
+
+            string id = string.IsNullOrWhiteSpace(requestedId) ?
+                NewProjectIntentIdLocked(owner, session, aliases) : requestedId.Trim();
+            if (id.Length < 4 || id.Length > 128 || id.Any(char.IsWhiteSpace))
+                return ProjectIntentUsage(emit, "registration ID must be 4-128 non-whitespace characters");
+            ProjectIntentRegistration byId = state.ProjectIntents.FirstOrDefault(value =>
+                string.Equals(value.Id, id, StringComparison.OrdinalIgnoreCase));
+            if (byId != null && (!string.Equals(byId.Owner, owner, StringComparison.Ordinal) ||
+                                 !string.Equals(byId.SessionId, session, StringComparison.Ordinal)))
+            {
+                emit("Project registration denied: registration ID " + id + " belongs to another owner/session.");
+                emit("Error code: PROJECT_INTENT_OWNERSHIP");
+                return 4;
+            }
+            if (byId != null && !string.Equals(byId.Status, "ACTIVE", StringComparison.Ordinal))
+            {
+                emit("Project registration denied: registration ID " + id +
+                    " is terminal and cannot be reused; choose a new stable ID.");
+                emit("Error code: PROJECT_INTENT_ID_REUSED");
+                return 4;
+            }
+
+            DateTime now = clock.UtcNow;
+            ProjectIntentRegistration registration = byId ?? new ProjectIntentRegistration { Id = id };
+            registration.Owner = owner;
+            registration.SessionId = session;
+            registration.ClientProcessId = request.ClientProcessId;
+            registration.RequestedProjects = aliases.ToList();
+            registration.CreatedUtc = registration.CreatedUtc == default ? now : registration.CreatedUtc;
+            registration.LastHeartbeatUtc = now;
+            registration.ExpiresUtc = now.Add(options.ProjectIntentDuration);
+            registration.Status = "ACTIVE";
+            registration.ReleasedUtc = null;
+            registration.ReleaseReason = null;
+            if (byId == null)
+                state.ProjectIntents.Add(registration);
+            SaveStateLocked();
+            Monitor.PulseAll(gate);
+            EmitProjectRegistration(registration, emit, "Project intent registered: ");
+            if (state.RestartPending && !state.FrozenRegistrations.Any(value =>
+                    string.Equals(value.Id, registration.Id, StringComparison.Ordinal)))
+            {
+                emit("This registration is queued for the next generation; the frozen generation is immutable.");
+            }
+            emit("Next action: DevBridge.cmd restart, then verify project inclusion with DevBridge.cmd status --json.");
+            return 0;
+        }
+    }
+
+    private int ProjectIntentStatus(Action<string> emit)
+    {
+        lock (gate)
+        {
+            SynchronizeLocked();
+            EmitAggregateIntentStatusLocked(CloneStateLocked(), null, emit);
+        }
+        emit("Next action: Run DevBridge.cmd restart, then verify the frozen generation and included registrations with DevBridge.cmd status --json before testing.");
+        return 0;
+    }
+
+    private int RenewProjectIntent(IReadOnlyList<string> arguments, BridgeRequest request, Action<string> emit)
+    {
+        if (arguments.Count != 2 || string.IsNullOrWhiteSpace(arguments[1]))
+            return ProjectIntentUsage(emit, "project renew requires one registration ID");
+        lock (gate)
+        {
+            SynchronizeLocked();
+            if (IsolationActiveLocked())
+                return ProjectIntentIsolationDenied(emit);
+            ProjectIntentRegistration registration = FindProjectIntentLocked(arguments[1]);
+            if (!ProjectIntentOwnedBy(registration, request))
+            {
+                emit("Project intent renewal denied: registration is not owned by this agent/session or has expired.");
+                emit("Error code: PROJECT_INTENT_OWNERSHIP");
+                return 4;
+            }
+            TouchProjectIntentLocked(registration);
+            SaveStateLocked();
+            EmitProjectRegistration(registration, emit, "Project intent renewed: ");
+            return 0;
+        }
+    }
+
+    private int ReleaseProjectIntent(IReadOnlyList<string> arguments, BridgeRequest request, Action<string> emit)
+    {
+        if (arguments.Count != 2 || string.IsNullOrWhiteSpace(arguments[1]))
+            return ProjectIntentUsage(emit, "project release requires one registration ID");
+        lock (gate)
+        {
+            SynchronizeLocked();
+            if (IsolationActiveLocked())
+                return ProjectIntentIsolationDenied(emit);
+            ProjectIntentRegistration registration = FindProjectIntentLocked(arguments[1]);
+            if (registration == null)
+            {
+                emit("Project intent " + arguments[1] + " was already released or expired.");
+                return 0;
+            }
+            if (!ProjectIntentOwnedBy(registration, request))
+            {
+                emit("Project intent release denied: registration is not owned by this agent/session.");
+                emit("Error code: PROJECT_INTENT_OWNERSHIP");
+                return 4;
+            }
+            if (string.Equals(registration.Status, "ACTIVE", StringComparison.Ordinal))
+            {
+                registration.Status = "RELEASED";
+                registration.ReleasedUtc = clock.UtcNow;
+                registration.ReleaseReason = "explicit release";
+                SaveStateLocked();
+                Monitor.PulseAll(gate);
+            }
+            emit("Project intent released: " + registration.Id);
+            emit("The release affects future generations only; frozen generation evidence is unchanged.");
+            emit("Next action: Run DevBridge.cmd status --json; restart when the next aggregate generation should omit this registration.");
+            return 0;
+        }
+    }
+
+    private static int ProjectIntentUsage(Action<string> emit, string detail)
+    {
+        emit("Project registration denied: " + detail + ".");
+        emit("Usage: DevBridge.cmd project register <alias[,alias...]> [--id <registration-id>]");
+        emit("Error code: PROJECT_INTENT_INVALID");
+        return 2;
+    }
+
+    private int ProjectIntentIsolationDenied(Action<string> emit)
+    {
+        emit("Project intent change denied while crash isolation is active; the in-flight incident is immutable.");
+        emit("Error code: CRASH_ISOLATION_RUNNING");
+        emit("Next action: Run DevBridge.cmd status and keep polling. Do not restart, edit ModsConfig.xml, or mutate registrations.");
+        return 4;
+    }
+
+    private void EmitProjectRegistration(ProjectIntentRegistration registration, Action<string> emit, string prefix)
+    {
+        emit(prefix + registration.Id);
+        emit("Owner/session: " + registration.Owner + "/" + registration.SessionId);
+        emit("Projects: " + string.Join(", ", registration.RequestedProjects));
+        emit("Status: " + registration.Status + " expiresUtc=" + FormatUtc(registration.ExpiresUtc));
+    }
+
+    private static string StableProjectOwner(BridgeRequest request) =>
+        string.IsNullOrWhiteSpace(request?.Agent) ? "unknown-agent" : request.Agent.Trim();
+
+    private static string StableProjectSession(BridgeRequest request) =>
+        string.IsNullOrWhiteSpace(request?.SessionId) ? StableProjectOwner(request) : request.SessionId.Trim();
+
+    private static bool SequenceEqualAliases(IEnumerable<string> left, IEnumerable<string> right) =>
+        (left ?? Array.Empty<string>()).SequenceEqual(right ?? Array.Empty<string>(), StringComparer.Ordinal);
+
+    private ProjectIntentRegistration FindProjectIntentLocked(string id) => state.ProjectIntents.FirstOrDefault(value =>
+        string.Equals(value?.Id, id?.Trim(), StringComparison.OrdinalIgnoreCase));
+
+    private static bool ProjectIntentOwnedBy(ProjectIntentRegistration registration, BridgeRequest request)
+    {
+        if (registration == null || !string.Equals(registration.Status, "ACTIVE", StringComparison.Ordinal))
+            return false;
+        string owner = StableProjectOwner(request);
+        string session = StableProjectSession(request);
+        return string.Equals(registration.Owner, owner, StringComparison.Ordinal) &&
+            string.Equals(registration.SessionId, session, StringComparison.Ordinal);
+    }
+
+    private void TouchProjectIntentLocked(ProjectIntentRegistration registration)
+    {
+        DateTime now = clock.UtcNow;
+        registration.LastHeartbeatUtc = now;
+        registration.ExpiresUtc = now.Add(options.ProjectIntentDuration);
+        registration.Status = "ACTIVE";
+    }
+
+    private string NewProjectIntentIdLocked(string owner, string session, IReadOnlyList<string> aliases)
+    {
+        string seed = owner + "\n" + session + "\n" + string.Join(",", aliases ?? Array.Empty<string>()) +
+            "\n" + clock.UtcNow.Ticks.ToString(CultureInfo.InvariantCulture);
+        string id = "pi-" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(seed))).ToLowerInvariant()[..16];
+        int suffix = 1;
+        string candidate = id;
+        while (state.ProjectIntents.Any(value => string.Equals(value.Id, candidate, StringComparison.OrdinalIgnoreCase)))
+            candidate = id + "-" + suffix++.ToString(CultureInfo.InvariantCulture);
+        return candidate;
+    }
+
+    private void EmitAggregateIntentStatusLocked(PersistedState snapshot, BridgeRequest request, Action<string> emit)
+    {
+        emit("Project intent registrations:");
+        foreach (ProjectIntentRegistration registration in (snapshot.ProjectIntents ?? new List<ProjectIntentRegistration>())
+                     .OrderBy(value => value.Status == "ACTIVE" ? 0 : 1).ThenBy(value => value.Id, StringComparer.Ordinal))
+            emit("  " + registration.Id + " owner=" + registration.Owner + " session=" + registration.SessionId +
+                " status=" + registration.Status + " projects=" + string.Join(",", registration.RequestedProjects) +
+                " expiresUtc=" + FormatUtc(registration.ExpiresUtc));
+        emit("Frozen generation: " + (snapshot.FrozenTargetGeneration > 0 ? snapshot.FrozenTargetGeneration.ToString(CultureInfo.InvariantCulture) : "none"));
+        emit("Frozen launch owner/request: " + (snapshot.FrozenLaunchOwner ?? "none") + "/" +
+            (snapshot.FrozenLaunchRequestKey ?? "none"));
+        emit("Frozen projects: " + (snapshot.FrozenRequestedProjects.Count == 0 ? "none" : string.Join(", ", snapshot.FrozenRequestedProjects)));
+        emit("Frozen package order: " + (snapshot.FrozenResolvedMods.Count == 0 ? "none" :
+            string.Join(" -> ", snapshot.FrozenResolvedMods)));
+        emit("Frozen profile/baseline fingerprints: " + (snapshot.FrozenProfileFingerprint ?? "none") + "/" +
+            (snapshot.FrozenBaselineFingerprint ?? "none"));
+        emit("Frozen registrations: " + (snapshot.FrozenRegistrations.Count == 0 ? "none" :
+            string.Join(", ", snapshot.FrozenRegistrations.OrderBy(value => value.Id, StringComparer.Ordinal)
+                .Select(value => value.Id + "=" + value.Owner + "/" + value.SessionId))));
+        List<ProjectIntentRegistration> queued = ActiveProjectIntentsLocked(snapshot)
+            .Where(value => snapshot.FrozenRegistrations.All(frozen => !string.Equals(frozen.Id, value.Id, StringComparison.Ordinal)))
+            .ToList();
+        emit("Queued next-generation registrations: " + (queued.Count == 0 ? "none" :
+            string.Join(", ", queued.OrderBy(value => value.Id, StringComparer.Ordinal)
+                .Select(value => value.Id + "=" + value.Owner + "/" + value.SessionId))));
+        emit("Queued next-generation projects: " + (queued.Count == 0 ? "none" :
+            string.Join(", ", CanonicalProjectUnion(queued.SelectMany(value => value.RequestedProjects)))));
+    }
+
+    private static List<ProjectIntentRegistration> ActiveProjectIntentsLocked(PersistedState snapshot) =>
+        (snapshot.ProjectIntents ?? new List<ProjectIntentRegistration>()).Where(value =>
+            value != null && string.Equals(value.Status, "ACTIVE", StringComparison.Ordinal)).ToList();
+
+    private void PruneProjectIntentsLocked()
+    {
+        state.ProjectIntents ??= new List<ProjectIntentRegistration>();
+        bool changed = false;
+        DateTime now = clock.UtcNow;
+        foreach (ProjectIntentRegistration registration in state.ProjectIntents)
+        {
+            if (registration == null || !string.Equals(registration.Status, "ACTIVE", StringComparison.Ordinal))
+                continue;
+            if (registration.ExpiresUtc == default)
+                registration.ExpiresUtc = (registration.LastHeartbeatUtc == default ? now : registration.LastHeartbeatUtc)
+                    .Add(options.ProjectIntentDuration);
+            if (registration.ExpiresUtc <= now)
+            {
+                registration.Status = "EXPIRED";
+                registration.ReleasedUtc = now;
+                registration.ReleaseReason = "owner heartbeat expired";
+                changed = true;
+            }
+        }
+        if (changed)
+        {
+            SaveStateLocked();
+            Monitor.PulseAll(gate);
+        }
+    }
+
+    private static List<string> CanonicalProjectUnion(IEnumerable<string> aliases)
+    {
+        HashSet<string> distinct = new(StringComparer.OrdinalIgnoreCase);
+        foreach (string alias in aliases ?? Array.Empty<string>())
+            if (!string.IsNullOrWhiteSpace(alias))
+                distinct.Add(alias.Trim());
+        return ModProfileResolver.CanonicalAliases(distinct).ToList();
+    }
+
+    private List<ProjectIntentRegistration> ActiveProjectIntentsLocked()
+    {
+        return ActiveProjectIntentsLocked(state).OrderBy(value => value.Id, StringComparer.Ordinal).ToList();
+    }
+
+    private static ProjectIntentSnapshot SnapshotProjectIntent(ProjectIntentRegistration registration) => new()
+    {
+        Id = registration.Id,
+        Owner = registration.Owner,
+        SessionId = registration.SessionId,
+        RequestedProjects = (registration.RequestedProjects ?? new List<string>()).ToList()
+    };
 
     private int RestoreBaseline(Action<string> emit)
     {
@@ -2226,6 +2737,10 @@ internal sealed class CoordinatorState
     {
         emit("DevBridge commands:");
         emit("  DevBridge.cmd status");
+        emit("  DevBridge.cmd project register <alias[,alias...]> [--id <stable-registration-id>]");
+        emit("  DevBridge.cmd project status");
+        emit("  DevBridge.cmd project renew <registration-id>");
+        emit("  DevBridge.cmd project release <registration-id>");
         emit("  DevBridge.cmd mods status");
         emit("  DevBridge.cmd mods capture-baseline");
         emit("  DevBridge.cmd mods restore-baseline");
@@ -2236,9 +2751,13 @@ internal sealed class CoordinatorState
         emit("  DevBridge.cmd stop <lease-id>");
         emit("  DevBridge.cmd ensure-ready <lease-id>");
         emit("  DevBridge.cmd restart [--projects none|alias[,alias...]]");
+        emit("  DevBridge.cmd restart --legacy-production  (explicit human production compatibility; never an automatic fallback)");
         emit("  DevBridge.cmd wait-ready");
         emit("  DevBridge.cmd doctor");
         emit("Append --json to a non-session command for one machine-readable result.");
+        emit("Register project intent before testing: project register <alias[,alias...]>; renew it while active and release it when finished.");
+        emit("Restart or await: restart, then verify status --json reports the frozen registration, project union, ordered closure, and fingerprints before test begin.");
+        emit("During crash isolation, poll status only; do not restart, edit ModsConfig.xml, or mutate registrations.");
         emit("test session is a connected streaming lease owner; keep it attached to the test owner.");
         return 0;
     }
@@ -2246,7 +2765,7 @@ internal sealed class CoordinatorState
     private static int Unknown(string command, Action<string> emit)
     {
         emit("Unknown DevBridge command: " + command);
-        emit("Use: status, mods status, mods capture-baseline, mods restore-baseline, test begin, test session, test renew <lease-id>, test end <lease-id>, stop <lease-id>, ensure-ready <lease-id>, restart [--projects ...], wait-ready, doctor");
+        emit("Use: status, project register/status/renew/release, mods status/capture-baseline/restore-baseline, test begin/session/renew/end, stop <lease-id>, ensure-ready <lease-id>, restart [--projects ...|--legacy-production], wait-ready, doctor");
         EmitNextCommand(emit, "DevBridge.cmd help");
         return 2;
     }
@@ -2312,6 +2831,7 @@ internal sealed class CoordinatorState
         snapshot.BaselineFingerprint = ReadBaselineFingerprintLocked() ?? snapshot.BaselineFingerprint;
         snapshot.ModsConfigOwnership = CurrentModsConfigOwnershipLocked();
         EmitProfile(snapshot, emit);
+        EmitAggregateIntentStatusLocked(snapshot, request, emit);
         foreach (TestLease lease in snapshot.Leases.OrderBy(value => value.StartedUtc))
             emit("  " + lease.Id + " - " + lease.Agent + " - age " + FormatAge(lease.StartedUtc) +
                 " - lastHeartbeatUtc=" + FormatUtc(LeaseActivityUtc(lease)) +
@@ -2348,8 +2868,18 @@ internal sealed class CoordinatorState
         }
         else if (snapshot.Phase == BridgePhase.READY && !snapshot.RestartPending)
         {
-            emit("Test leases are shared; multiple agents may test this generation concurrently.");
-            EmitNextCommand(emit, "DevBridge.cmd test begin");
+            List<string> missingProjects = MissingProjectsFor(snapshot, request);
+            if (missingProjects.Count > 0)
+            {
+                emit("Your active project intents are not in the READY profile: " +
+                    string.Join(", ", missingProjects) + ".");
+                EmitNextCommand(emit, "DevBridge.cmd restart");
+            }
+            else
+            {
+                emit("Test leases are shared; multiple agents may test this generation concurrently.");
+                EmitNextCommand(emit, "DevBridge.cmd test begin");
+            }
         }
         else if (snapshot.Phase == BridgePhase.ERROR ||
                  snapshot.ErrorCode == ProcessInspection.ErrorCode ||
@@ -2447,7 +2977,13 @@ internal sealed class CoordinatorState
         if (exitCode != 0)
             emit("Next action: Fix the failing check, then run:");
         else if (snapshot.Phase == BridgePhase.READY && !snapshot.RestartPending)
-            EmitNextCommand(emit, "DevBridge.cmd test begin");
+        {
+            List<string> missingProjects = MissingProjectsFor(snapshot, request);
+            if (missingProjects.Count > 0)
+                EmitNextCommand(emit, "DevBridge.cmd restart");
+            else
+                EmitNextCommand(emit, "DevBridge.cmd test begin");
+        }
         else if (snapshot.RestartPending || snapshot.Phase == BridgePhase.DRAINING ||
                  snapshot.Phase == BridgePhase.RESTARTING || snapshot.Phase == BridgePhase.LOADING)
             EmitKeepWaiting(emit);
@@ -2502,6 +3038,13 @@ internal sealed class CoordinatorState
 
         if (!connected())
             return 4;
+
+        lock (gate)
+        {
+            SynchronizeLocked();
+            if (!TestProfileIncludesRegisteredProjectsLocked(request, emit))
+                return 4;
+        }
 
         TestLease lease;
         while (true)
@@ -2564,6 +3107,31 @@ internal sealed class CoordinatorState
             return 4;
         }
         return 0;
+    }
+
+    private bool TestProfileIncludesRegisteredProjectsLocked(BridgeRequest request, Action<string> emit)
+    {
+        List<ProjectIntentRegistration> owned = ActiveProjectIntentsLocked()
+            .Where(value => ProjectIntentOwnedBy(value, request))
+            .ToList();
+        List<string> requested = CanonicalProjectUnion(owned.SelectMany(value => value.RequestedProjects));
+        if (requested.Count == 0)
+            return true;
+
+        List<string> included = CanonicalProjectUnion(state.RequestedProjects ?? new List<string>());
+        List<string> missing = requested.Where(value => !included.Contains(value, StringComparer.Ordinal)).ToList();
+        if (missing.Count == 0 && state.ProfileMode != ModProfile.LegacyMode &&
+            state.LaunchProfileMode != "explicit-human-legacy")
+            return true;
+
+        RecordProfileErrorLocked("PROJECT_PROFILE_MISSING",
+            "the READY profile does not include every project registered by this agent/session: " +
+            string.Join(", ", missing.Count == 0 ? requested : missing));
+        emit("Test begin denied: the READY profile does not include every project registered by this agent/session.");
+        emit("Missing projects: " + string.Join(", ", missing.Count == 0 ? requested : missing));
+        emit("Error code: PROJECT_PROFILE_MISSING");
+        emit("Next action: Run DevBridge.cmd status --json, then DevBridge.cmd restart to request the aggregate profile; begin only after includedProjects contains every registered alias.");
+        return false;
     }
 
     private int SessionLease(BridgeRequest request, Action<string> emit, Func<bool> connected)
@@ -2973,69 +3541,42 @@ internal sealed class CoordinatorState
         int currentGeneration;
         bool alreadyPending;
         bool observedPending;
-        bool reuseAcceptedProfile = false;
+        int observedTargetGeneration;
+        string observedLaunchOwner;
+        ModProfile requestedProfile = null;
+        IReadOnlyList<string> compatibilityAliases = null;
         lock (gate)
         {
-            observedPending = state.RestartPending;
-            string requestOwner = LaunchOwnerFor(request);
-            if (observedPending && !string.Equals(state.LaunchOwner, requestOwner, StringComparison.Ordinal) &&
-                (!string.IsNullOrWhiteSpace(state.LaunchOwner) ||
-                 !string.Equals(state.LastLaunchOwner, requestOwner, StringComparison.Ordinal)))
+            SynchronizeLocked();
+            if (IsolationActiveLocked())
+            {
+                emit("Restart is unavailable while crash isolation is active; the in-flight incident is immutable.");
+                emit("Error code: CRASH_ISOLATION_RUNNING");
+                emit("Next action: Run DevBridge.cmd status and keep polling.");
+                return 4;
+            }
+            if (restartArguments.LegacyProduction && ActiveProjectIntentsLocked().Count > 0)
+            {
+                RecordProfileErrorLocked("PROFILE_LEGACY_CONFLICT",
+                    "active project registrations require an aggregate launch; release them before explicit human legacy mode.");
+                emit("Legacy production restart denied: active project registrations require an aggregate launch.");
+                emit("Error code: PROFILE_LEGACY_CONFLICT");
+                emit("No launch was attempted.");
+                return 4;
+            }
+            if (state.RestartPending && !string.IsNullOrWhiteSpace(state.LaunchOwner) &&
+                !string.Equals(state.LaunchOwner, LaunchOwnerFor(request), StringComparison.Ordinal))
             {
                 emit("Restart denied: another owner already controls this runtime slot launch.");
                 emit("No launch was attempted.");
                 return 4;
             }
-            if (!restartArguments.HasProjects && state.ProfileMode != ModProfile.LegacyMode)
-            {
-                string message = "an opt-in profile is already active; choose --projects with the accepted roots or run mods restore-baseline before an unprofiled restart";
-                state.ProfileConflict = message;
-                state.ProfileErrorCode = "PROFILE_CONFLICT";
-                state.ProfileError = message;
-                SaveStateLocked();
-                emit("Restart denied: " + message + ".");
-                emit("Error code: PROFILE_CONFLICT");
-                emit("No launch was attempted.");
-                return 4;
-            }
-            if (state.RestartPending && !ProfileRequestMatchesLocked(restartArguments, null))
-            {
-                string message = "a different profile is already accepted for generation " + state.TargetGeneration +
-                    "; the pending restart cannot be replaced silently";
-                state.ProfileConflict = message;
-                state.ProfileErrorCode = "PROFILE_CONFLICT";
-                state.ProfileError = message;
-                SaveStateLocked();
-                emit("Restart denied: " + message + ".");
-                emit("Error code: PROFILE_CONFLICT");
-                emit("No launch was attempted.");
-                return 4;
-            }
-            if (state.RestartPending)
-                reuseAcceptedProfile = true;
-
-            string completedRequestKey = "restart-" + state.Generation;
-            if (!state.RestartPending && state.Phase == BridgePhase.READY &&
-                string.Equals(state.LastLaunchOwner, requestOwner, StringComparison.Ordinal) &&
-                string.Equals(state.LastLaunchRequestKey, completedRequestKey, StringComparison.Ordinal) &&
-                ProfileRequestMatchesLocked(restartArguments, null))
-                reuseAcceptedProfile = true;
-        }
-
-        ModProfile requestedProfile = null;
-        if (restartArguments.HasProjects && !reuseAcceptedProfile)
-        {
-            try
-            {
-                requestedProfile = ResolveRequestedProfile(restartArguments.Projects);
-            }
-            catch (ProfileException exception)
-            {
-                RecordProfileError(exception.Code, exception.Message);
-                emit("Profile request denied: " + exception.Message);
-                emit("Error code: " + exception.Code);
-                return 4;
-            }
+            currentGeneration = state.Generation;
+            alreadyPending = state.RestartPending;
+            targetGeneration = state.TargetGeneration;
+            observedPending = state.RestartPending;
+            observedTargetGeneration = state.TargetGeneration;
+            observedLaunchOwner = state.LaunchOwner;
         }
 
         lock (lifecycleGate)
@@ -3050,58 +3591,30 @@ internal sealed class CoordinatorState
                     EmitNextCommand(emit, "DevBridge.cmd doctor");
                     return 4;
                 }
-                string requestOwner = LaunchOwnerFor(request);
+
                 currentGeneration = state.Generation;
                 alreadyPending = state.RestartPending;
-                if (alreadyPending && !string.IsNullOrWhiteSpace(state.LaunchOwner) &&
-                    !string.Equals(state.LaunchOwner, requestOwner, StringComparison.Ordinal))
+                if (!alreadyPending && observedPending && observedTargetGeneration > 0 &&
+                    state.Phase == BridgePhase.READY && state.Generation >= observedTargetGeneration &&
+                    string.Equals(observedLaunchOwner, LaunchOwnerFor(request), StringComparison.Ordinal))
                 {
-                    emit("Restart denied: another owner already controls this runtime slot launch.");
-                    emit("No launch was attempted.");
-                    return 4;
+                    emit("Restart already completed for generation " + observedTargetGeneration + ".");
+                    emit("The duplicate request did not launch another RimWorld process.");
+                    return 0;
                 }
-
-                if (alreadyPending && !ProfileRequestMatchesLocked(restartArguments, requestedProfile))
+                if (alreadyPending)
                 {
-                    string message = "a different profile is already accepted for generation " + state.TargetGeneration +
-                        "; the pending restart cannot be replaced silently";
-                    state.ProfileConflict = message;
-                    state.ProfileErrorCode = "PROFILE_CONFLICT";
-                    state.ProfileError = message;
-                    SaveStateLocked();
-                    emit("Restart denied: " + message + ".");
-                    emit("Error code: PROFILE_CONFLICT");
-                    emit("No launch was attempted.");
-                    return 4;
-                }
-
-                if (!alreadyPending && requestedProfile != null)
-                {
-                    try
+                    targetGeneration = state.TargetGeneration;
+                    if (restartArguments.LegacyProduction && state.LaunchProfileMode != "explicit-human-legacy")
                     {
-                        ModProfileResolver.ValidateResolvedProfile(requestedProfile);
-                    }
-                    catch (ProfileException exception)
-                    {
-                        RecordProfileErrorLocked(exception.Code, exception.Message);
-                        emit("Profile request denied: " + exception.Message);
-                        emit("Error code: " + exception.Code);
-                        return 4;
-                    }
-
-                    string currentBaselineFingerprint = ReadBaselineFingerprintLocked();
-                    if (!string.Equals(currentBaselineFingerprint, requestedProfile.BaselineFingerprint,
-                            StringComparison.Ordinal))
-                    {
-                        string message = "the captured baseline changed while the profile request was resolving";
-                        RecordProfileErrorLocked("PROFILE_BASELINE_CHANGED", message);
-                        emit("Profile request denied: " + message + ".");
-                        emit("Error code: PROFILE_BASELINE_CHANGED");
+                        emit("Restart denied: the frozen generation is an aggregate profile and cannot be replaced by legacy production mode.");
+                        emit("Error code: PROFILE_CONFLICT");
+                        emit("No launch was attempted.");
                         return 4;
                     }
                 }
 
-                if (state.MaintenanceReady)
+                if (state.MaintenanceReady && !alreadyPending)
                 {
                     if (string.IsNullOrWhiteSpace(restartArguments.LeaseId) ||
                         !TryGetLeaseHolderLocked(restartArguments.LeaseId, request, out TestLease maintenanceLease))
@@ -3120,22 +3633,12 @@ internal sealed class CoordinatorState
                         EmitNextCommand(emit, "DevBridge.cmd doctor");
                         return 4;
                     }
-
-                    if (!TryAcquireLaunchOwnerLocked(LaunchOwnerFor(request),
-                            "restart-" + Math.Max(1, state.Generation + 1), resetBudget: true))
-                    {
-                        emit("Restart denied: another owner already controls this runtime slot launch.");
-                        emit("No launch was attempted.");
-                        return 4;
-                    }
                     state.Leases.Remove(maintenanceLease);
                     state.MaintenanceReady = false;
                     state.SessionDirty = true;
-                    alreadyPending = false;
                 }
-                else if (state.Phase == BridgePhase.STOPPED && state.SessionDirty &&
-                         (state.ErrorCode == ProcessInspection.ErrorCode ||
-                          state.ErrorCode == "MAINTENANCE_PROCESS_PRESENT"))
+                else if (!alreadyPending && state.Phase == BridgePhase.STOPPED && state.SessionDirty &&
+                         (state.ErrorCode == ProcessInspection.ErrorCode || state.ErrorCode == "MAINTENANCE_PROCESS_PRESENT"))
                 {
                     emit("Restart denied: the maintenance window is not safe to leave without a fresh process check.");
                     emit("No launch was attempted.");
@@ -3143,31 +3646,99 @@ internal sealed class CoordinatorState
                     return 4;
                 }
 
-                string completedRequestKey = "restart-" + state.Generation;
-                if (!alreadyPending && state.Phase == BridgePhase.READY &&
-                    string.Equals(state.LastLaunchOwner, LaunchOwnerFor(request), StringComparison.Ordinal) &&
-                    string.Equals(state.LastLaunchRequestKey, completedRequestKey, StringComparison.Ordinal) &&
-                    ProfileRequestMatchesLocked(restartArguments, requestedProfile))
+                if (alreadyPending)
                 {
-                    targetGeneration = state.Generation;
-                    emit("Restart already completed for generation " + targetGeneration + ".");
-                    return 0;
+                    if (!restartArguments.LegacyProduction && restartArguments.HasProjects &&
+                        restartArguments.Projects.Count > 0)
+                    {
+                        IReadOnlyList<string> lateAliases;
+                        try
+                        {
+                            lateAliases = ModProfileResolver.CanonicalAliases(restartArguments.Projects);
+                        }
+                        catch (ProfileException exception)
+                        {
+                            RecordProfileErrorLocked(exception.Code, exception.Message);
+                            emit("Profile request denied: " + exception.Message);
+                            emit("Error code: " + exception.Code);
+                            emit("No launch was attempted.");
+                            return 4;
+                        }
+                        ProjectIntentRegistration lateRegistration = EnsureCompatibilityRegistrationLocked(
+                            request, lateAliases);
+                        SaveStateLocked();
+                        if (lateRegistration != null && !state.FrozenRegistrations.Any(value =>
+                                string.Equals(value.Id, lateRegistration.Id, StringComparison.Ordinal)))
+                        {
+                            emit("Project intent " + lateRegistration.Id +
+                                " was registered after the frozen generation and is queued for the next generation.");
+                            emit("The current frozen registration/profile evidence is immutable.");
+                        }
+                    }
+                    emit("Restart already accepted for generation " + currentGeneration + " -> " + targetGeneration + ".");
                 }
-
-                if (!alreadyPending)
+                else
                 {
+                    try
+                    {
+                        if (restartArguments.LegacyProduction)
+                        {
+                            if (ActiveProjectIntentsLocked().Count > 0)
+                                throw new ProfileException("PROFILE_LEGACY_CONFLICT",
+                                    "active project registrations must be released before explicit human legacy production mode.");
+                        }
+                        else
+                        {
+                            List<string> aliases = AggregateAliasesLocked(restartArguments);
+                            requestedProfile = ResolveAggregateProfile(aliases);
+                            ModProfileResolver.ValidateResolvedProfile(requestedProfile);
+                            EnsureAggregateBaselineLocked(requestedProfile.BaselineFingerprint);
+                            if (restartArguments.HasProjects && restartArguments.Projects.Count > 0)
+                                compatibilityAliases = CanonicalProjectUnion(restartArguments.Projects);
+                        }
+                    }
+                    catch (ProfileException exception)
+                    {
+                        RecordProfileErrorLocked(exception.Code, exception.Message);
+                        emit("Profile request denied: " + exception.Message);
+                        emit("Error code: " + exception.Code);
+                        emit("No launch was attempted.");
+                        return 4;
+                    }
+
                     targetGeneration = Math.Max(state.Generation + 1, state.TargetGeneration);
-                    if (!TryAcquireLaunchOwnerLocked(LaunchOwnerFor(request), "restart-" + targetGeneration,
-                            resetBudget: true))
+                    string requestKey = "restart-" + targetGeneration;
+                    if (!TryAcquireLaunchOwnerLocked(LaunchOwnerFor(request), requestKey, resetBudget: true))
                     {
                         emit("Restart denied: another owner already controls this runtime slot launch.");
                         emit("No launch was attempted.");
                         return 4;
                     }
-                    ModProfile acceptedProfile = restartArguments.HasProjects ? requestedProfile : null;
+                    if (!restartArguments.LegacyProduction && compatibilityAliases != null)
+                        EnsureCompatibilityRegistrationLocked(request, compatibilityAliases);
                     ArchiveCompletedIsolationLocked();
-                    SetActiveProfileLocked(acceptedProfile);
-                    state.RuntimeProfile = PersistedProfileSnapshot.FromModProfile(acceptedProfile);
+                    if (restartArguments.LegacyProduction)
+                    {
+                        ClearActiveProfileLocked();
+                        state.RuntimeProfile = null;
+                        state.FrozenRegistrations = new List<ProjectIntentSnapshot>();
+                        state.FrozenRequestedProjects = new List<string>();
+                        state.FrozenResolvedProjectPackageIds = new List<string>();
+                        state.FrozenResolvedMods = new List<string>();
+                        state.FrozenProfileFingerprint = null;
+                        state.FrozenBaselineFingerprint = null;
+                        state.FrozenTargetGeneration = targetGeneration;
+                        state.FrozenLaunchOwner = LaunchOwnerFor(request);
+                        state.FrozenLaunchRequestKey = requestKey;
+                        state.AggregateFreezePending = false;
+                        state.AggregateFrozenUtc = clock.UtcNow;
+                    }
+                    else
+                    {
+                        SetActiveProfileLocked(requestedProfile);
+                    }
+                    state.RuntimeProfile = PersistedProfileSnapshot.FromModProfile(
+                        restartArguments.LegacyProduction ? null : requestedProfile);
                     state.LaunchProfileFingerprint = null;
                     state.LaunchProfileInstalled = false;
                     state.ProfileErrorCode = null;
@@ -3182,20 +3753,34 @@ internal sealed class CoordinatorState
                     state.ErrorCode = null;
                     state.Phase = BridgePhase.DRAINING;
                     DeleteReadinessLocked();
-                    SaveStateLocked();
+                    if (restartArguments.LegacyProduction)
+                    {
+                        state.AggregateGenerations ??= new List<AggregateGenerationEvidence>();
+                        state.AggregateGenerations.Add(new AggregateGenerationEvidence
+                        {
+                            Generation = targetGeneration,
+                            FrozenUtc = clock.UtcNow,
+                            LaunchOwner = LaunchOwnerFor(request),
+                            LaunchRequestKey = requestKey,
+                            ProfileMode = "explicit-human-legacy"
+                        });
+                        while (state.AggregateGenerations.Count > 16)
+                            state.AggregateGenerations.RemoveAt(0);
+                        SaveStateLocked();
+                    }
+                    else
+                    {
+                        List<ProjectIntentRegistration> registrations = ActiveProjectIntentsLocked();
+                        FreezeAggregateLocked(requestedProfile, registrations, targetGeneration,
+                            LaunchOwnerFor(request), requestKey);
+                    }
                     StartRestartWorkerLocked(targetGeneration, LaunchOwnerFor(request));
                     Monitor.PulseAll(gate);
-                }
-                else
-                {
-                    targetGeneration = state.TargetGeneration;
                 }
             }
         }
 
-        if (alreadyPending)
-            emit("Restart already accepted for generation " + currentGeneration + " -> " + targetGeneration + ".");
-        else
+        if (!alreadyPending)
             emit("Restart accepted for generation " + currentGeneration + " -> " + targetGeneration + ".");
         emit("Agent/session: " + request.Agent);
         emit("DevBridge now owns this restart.");
@@ -3216,7 +3801,10 @@ internal sealed class CoordinatorState
                     emit("RimWorld restarted successfully.");
                     emit("Generation: " + state.Generation);
                     emit("Quicktest map is ready.");
-                    EmitNextCommand(emit, "DevBridge.cmd test begin");
+                    List<string> missingProjects = MissingProjectsFor(state, request);
+                    EmitNextCommand(emit, missingProjects.Count == 0
+                        ? "DevBridge.cmd test begin"
+                        : "DevBridge.cmd restart");
                     return 0;
                 }
 
@@ -3238,9 +3826,17 @@ internal sealed class CoordinatorState
         string leaseId = null;
         string projectValue = null;
         bool hasProjects = false;
+        bool legacyProduction = false;
         for (int index = 0; index < (arguments?.Count ?? 0); index++)
         {
             string argument = arguments[index]?.Trim() ?? string.Empty;
+            if (string.Equals(argument, "--legacy-production", StringComparison.OrdinalIgnoreCase))
+            {
+                if (legacyProduction)
+                    throw new ProfileException("PROFILE_INVALID_REQUEST", "restart accepts only one --legacy-production option.");
+                legacyProduction = true;
+                continue;
+            }
             if (string.Equals(argument, "--projects", StringComparison.OrdinalIgnoreCase))
             {
                 if (hasProjects || index + 1 >= arguments.Count || string.IsNullOrWhiteSpace(arguments[++index]))
@@ -3267,8 +3863,10 @@ internal sealed class CoordinatorState
                 throw new ProfileException("PROFILE_INVALID_REQUEST", "restart accepts at most one lease ID.");
         }
 
+        if (legacyProduction && hasProjects)
+            throw new ProfileException("PROFILE_INVALID_REQUEST", "--legacy-production cannot be combined with --projects.");
         if (!hasProjects)
-            return new RestartArguments { LeaseId = leaseId };
+            return new RestartArguments { LeaseId = leaseId, LegacyProduction = legacyProduction };
         if (string.Equals(projectValue, "none", StringComparison.OrdinalIgnoreCase))
             return new RestartArguments { LeaseId = leaseId, HasProjects = true };
         string[] parts = projectValue.Split(',', StringSplitOptions.None);
@@ -3284,6 +3882,156 @@ internal sealed class CoordinatorState
         lock (gate)
             baselineFingerprint = ReadBaselineFingerprintLocked();
         return ModProfileResolver.Resolve(root, baselineFingerprint, aliases, options.InstalledModsRoots);
+    }
+
+    private ModProfile ResolveAggregateProfile(IReadOnlyList<string> aliases)
+    {
+        string baselineFingerprint;
+        lock (gate)
+        {
+            baselineFingerprint = ReadBaselineFingerprintLocked();
+            if (string.IsNullOrWhiteSpace(baselineFingerprint))
+            {
+                if (!File.Exists(modsConfigPath))
+                    throw new ProfileException("PROFILE_MODS_CONFIG_MISSING",
+                        "ModsConfig.xml was not found at " + modsConfigPath + ".");
+                try
+                {
+                    baselineFingerprint = HashBytes(File.ReadAllBytes(modsConfigPath));
+                }
+                catch (Exception exception)
+                {
+                    throw new ProfileException("PROFILE_BASELINE_MISSING",
+                        "The current ModsConfig.xml could not be read as the first aggregate baseline: " + exception.Message);
+                }
+            }
+        }
+
+        return ModProfileResolver.Resolve(root, baselineFingerprint,
+            CanonicalProjectUnion(aliases), options.InstalledModsRoots);
+    }
+
+    private List<string> AggregateAliasesLocked(RestartArguments arguments)
+    {
+        IEnumerable<string> aliases = ActiveProjectIntentsLocked().SelectMany(value => value.RequestedProjects);
+        if (arguments.HasProjects && arguments.Projects.Count > 0)
+            aliases = aliases.Concat(arguments.Projects);
+        return CanonicalProjectUnion(aliases);
+    }
+
+    private ProjectIntentRegistration EnsureCompatibilityRegistrationLocked(BridgeRequest request,
+        IReadOnlyList<string> aliases)
+    {
+        if (aliases == null || aliases.Count == 0)
+            return null;
+        string owner = StableProjectOwner(request);
+        string session = StableProjectSession(request);
+        ProjectIntentRegistration existing = state.ProjectIntents.FirstOrDefault(value =>
+            string.Equals(value.Status, "ACTIVE", StringComparison.Ordinal) &&
+            string.Equals(value.Owner, owner, StringComparison.Ordinal) &&
+            string.Equals(value.SessionId, session, StringComparison.Ordinal) &&
+            SequenceEqualAliases(value.RequestedProjects, aliases));
+        if (existing != null)
+        {
+            TouchProjectIntentLocked(existing);
+            return existing;
+        }
+
+        DateTime now = clock.UtcNow;
+        ProjectIntentRegistration registration = new()
+        {
+            Id = NewProjectIntentIdLocked(owner, session, aliases),
+            Owner = owner,
+            SessionId = session,
+            ClientProcessId = request.ClientProcessId,
+            RequestedProjects = aliases.ToList(),
+            CreatedUtc = now,
+            LastHeartbeatUtc = now,
+            ExpiresUtc = now.Add(options.ProjectIntentDuration),
+            Status = "ACTIVE"
+        };
+        state.ProjectIntents.Add(registration);
+        return registration;
+    }
+
+    private void EnsureAggregateBaselineLocked(string expectedFingerprint)
+    {
+        string sidecarFingerprint = ReadBaselineFingerprintLocked();
+        if (!string.IsNullOrWhiteSpace(sidecarFingerprint))
+        {
+            if (!string.Equals(sidecarFingerprint, expectedFingerprint, StringComparison.Ordinal))
+                throw new ProfileException("PROFILE_BASELINE_CHANGED",
+                    "The durable aggregate baseline changed while the profile was resolving.");
+            state.BaselineFingerprint = sidecarFingerprint;
+            return;
+        }
+
+        if (!File.Exists(modsConfigPath))
+            throw new ProfileException("PROFILE_MODS_CONFIG_MISSING",
+                "ModsConfig.xml was not found at " + modsConfigPath + ".");
+        byte[] current;
+        try { current = File.ReadAllBytes(modsConfigPath); }
+        catch (Exception exception)
+        {
+            throw new ProfileException("PROFILE_BASELINE_MISSING",
+                "The current ModsConfig.xml could not be read as the aggregate baseline: " + exception.Message);
+        }
+        if (!string.Equals(HashBytes(current), expectedFingerprint, StringComparison.Ordinal))
+            throw new ProfileException("PROFILE_BASELINE_CHANGED",
+                "ModsConfig.xml changed while the aggregate profile was resolving; no profile was installed.");
+
+        // The first aggregate launch adopts the exact pre-DevBridge bytes as a
+        // durable safety baseline. It does not write ModsConfig.xml and is done
+        // only after metadata resolution succeeded.
+        AtomicWriteFile(baselinePath, current);
+        state.BaselineFingerprint = expectedFingerprint;
+        state.LastKnownGoodProfile ??= PersistedProfileSnapshot.FromModProfile(
+            ModProfileResolver.CreateBaselineProfile(expectedFingerprint));
+    }
+
+    private void FreezeAggregateLocked(ModProfile profile, IReadOnlyList<ProjectIntentRegistration> registrations,
+        int targetGeneration, string owner, string requestKey)
+    {
+        ModProfileResolver.ValidateResolvedProfile(profile);
+        List<ProjectIntentSnapshot> frozenRegistrations = (registrations ?? Array.Empty<ProjectIntentRegistration>())
+            .OrderBy(value => value.Id, StringComparer.Ordinal)
+            .Select(SnapshotProjectIntent).ToList();
+        state.FrozenRegistrations = frozenRegistrations;
+        state.FrozenRequestedProjects = profile.RequestedProjects.ToList();
+        state.FrozenResolvedProjectPackageIds = profile.ResolvedProjectPackageIds.ToList();
+        state.FrozenResolvedMods = profile.ResolvedMods.ToList();
+        state.FrozenProfileFingerprint = profile.ProfileFingerprint;
+        state.FrozenBaselineFingerprint = profile.BaselineFingerprint;
+        state.FrozenTargetGeneration = targetGeneration;
+        state.FrozenLaunchOwner = owner;
+        state.FrozenLaunchRequestKey = requestKey;
+        state.AggregateFreezePending = true;
+        state.AggregateFreezeRequestedUtc = clock.UtcNow;
+        state.AggregateFrozenUtc = clock.UtcNow;
+        state.AggregateGenerations ??= new List<AggregateGenerationEvidence>();
+        state.AggregateGenerations.Add(new AggregateGenerationEvidence
+        {
+            Generation = targetGeneration,
+            FrozenUtc = clock.UtcNow,
+            LaunchOwner = owner,
+            LaunchRequestKey = requestKey,
+            ProfileMode = state.LaunchProfileMode,
+            Registrations = frozenRegistrations.Select(value => new ProjectIntentSnapshot
+            {
+                Id = value.Id,
+                Owner = value.Owner,
+                SessionId = value.SessionId,
+                RequestedProjects = value.RequestedProjects.ToList()
+            }).ToList(),
+            RequestedProjects = profile.RequestedProjects.ToList(),
+            ResolvedProjectPackageIds = profile.ResolvedProjectPackageIds.ToList(),
+            ResolvedMods = profile.ResolvedMods.ToList(),
+            ProfileFingerprint = profile.ProfileFingerprint,
+            BaselineFingerprint = profile.BaselineFingerprint
+        });
+        while (state.AggregateGenerations.Count > 16)
+            state.AggregateGenerations.RemoveAt(0);
+        SaveStateLocked();
     }
 
     private bool ProfileRequestMatchesLocked(RestartArguments arguments, ModProfile requestedProfile)
@@ -3343,7 +4091,10 @@ internal sealed class CoordinatorState
             emit("RimWorld is ready.");
             emit("Generation: " + state.Generation);
             emit("Quicktest map is ready.");
-            EmitNextCommand(emit, "DevBridge.cmd test begin");
+            List<string> missingProjects = MissingProjectsFor(state, request);
+            EmitNextCommand(emit, missingProjects.Count == 0
+                ? "DevBridge.cmd test begin"
+                : "DevBridge.cmd restart");
         }
         return 0;
     }
@@ -3507,17 +4258,41 @@ internal sealed class CoordinatorState
         return true;
     }
 
-    private void StartInitialLaunchLocked(string owner = null)
+    private bool StartInitialLaunchLocked(string owner = null)
     {
         if (launchTask != null && !launchTask.IsCompleted)
-            return;
+            return true;
 
         owner ??= "coordinator@" + runtimeSlotId;
-        if (!TryAcquireLaunchOwnerLocked(owner, "initial", resetBudget: true))
-            return;
-
         int target = Math.Max(1, state.Generation + 1);
+        ModProfile profile;
+        try
+        {
+            PruneProjectIntentsLocked();
+            profile = ResolveAggregateProfile(AggregateAliasesLocked(new RestartArguments()));
+            EnsureAggregateBaselineLocked(profile.BaselineFingerprint);
+            ModProfileResolver.ValidateResolvedProfile(profile);
+        }
+        catch (ProfileException exception)
+        {
+            RecordProfileErrorLocked(exception.Code, exception.Message);
+            state.ErrorCode = exception.Code;
+            state.Error = exception.Message;
+            state.Phase = BridgePhase.ERROR;
+            SaveStateLocked();
+            return false;
+        }
+
+        if (!TryAcquireLaunchOwnerLocked(owner, "initial-" + target, resetBudget: true))
+            return false;
+
+        state.LaunchProfileMode = profile.Mode == ModProfile.BaselineMode
+            ? "aggregate-minimal-control" : "aggregate-projects";
+        SetActiveProfileLocked(profile);
+        List<ProjectIntentRegistration> registrations = ActiveProjectIntentsLocked();
         state.TargetGeneration = target;
+        state.RestartPending = true;
+        state.RestartRequestedUtc = clock.UtcNow;
         state.Phase = BridgePhase.RESTARTING;
         state.Error = null;
         state.ErrorCode = null;
@@ -3532,12 +4307,13 @@ internal sealed class CoordinatorState
         state.RequiresNewProcess = true;
         state.WaitingForBridgeDeadlineUtc = null;
         DeleteReadinessLocked();
-        SaveStateLocked();
+        FreezeAggregateLocked(profile, registrations, target, owner, "initial-" + target);
         launchTask = Task.Run(() =>
         {
             lock (lifecycleGate)
                 LaunchGenerationWorker(target, isRestart: false, owner: owner);
         });
+        return true;
     }
 
     private void StartRestartWorkerLocked(int targetGeneration, string owner = null)
@@ -4076,7 +4852,16 @@ internal sealed class CoordinatorState
             SearchPoolProjects = projects,
             DeltaCurrentProjects = projects.ToList(),
             DeltaGranularity = Math.Min(2, Math.Max(1, projects.Count)),
-            IsolationLaunchesRemaining = Math.Max(1, options.IsolationMaxAttempts)
+            IsolationLaunchesRemaining = Math.Max(1, options.IsolationMaxAttempts),
+            OriginalRegistrations = (state.FrozenRegistrations ?? new List<ProjectIntentSnapshot>())
+                .Select(value => new ProjectIntentSnapshot
+                {
+                    Id = value.Id,
+                    Owner = value.Owner,
+                    SessionId = value.SessionId,
+                    RequestedProjects = (value.RequestedProjects ?? new List<string>()).ToList()
+                }).ToList(),
+            ProjectRequesters = BuildProjectRequesterMap(state.FrozenRegistrations)
         };
         incident.OriginalDiagnosticMetadata["acceptedAtUtc"] =
             state.RestartRequestedUtc?.ToUniversalTime().ToString("O") ?? string.Empty;
@@ -4099,6 +4884,37 @@ internal sealed class CoordinatorState
         state.ProfileError = null;
         SaveStateLocked();
         StartIsolationWorkerLocked();
+    }
+
+    private static Dictionary<string, List<ProjectIntentRequester>> BuildProjectRequesterMap(
+        IEnumerable<ProjectIntentSnapshot> registrations)
+    {
+        Dictionary<string, List<ProjectIntentRequester>> result =
+            new(StringComparer.OrdinalIgnoreCase);
+        foreach (ProjectIntentSnapshot registration in registrations ?? Array.Empty<ProjectIntentSnapshot>())
+        {
+            foreach (string alias in registration.RequestedProjects ?? new List<string>())
+            {
+                if (!result.TryGetValue(alias, out List<ProjectIntentRequester> requesters))
+                {
+                    requesters = new List<ProjectIntentRequester>();
+                    result[alias] = requesters;
+                }
+                if (!requesters.Any(value => string.Equals(value.RegistrationId, registration.Id,
+                        StringComparison.Ordinal)))
+                {
+                    requesters.Add(new ProjectIntentRequester
+                    {
+                        RegistrationId = registration.Id,
+                        Owner = registration.Owner,
+                        SessionId = registration.SessionId
+                    });
+                }
+            }
+        }
+        foreach (List<ProjectIntentRequester> requesters in result.Values)
+            requesters.Sort((left, right) => StringComparer.Ordinal.Compare(left.RegistrationId, right.RegistrationId));
+        return result;
     }
 
     private void StartIsolationWorkerLocked()
@@ -4961,6 +5777,7 @@ internal sealed class CoordinatorState
         state.Generation = state.TargetGeneration;
         state.RestartPending = false;
         state.RestartRequestedUtc = null;
+        state.AggregateFreezePending = false;
         state.TargetGeneration = 0;
         state.LastLaunchOwner = state.LaunchOwner;
         state.LastLaunchRequestKey = state.LaunchRequestKey;
@@ -5223,6 +6040,7 @@ internal sealed class CoordinatorState
         state.ErrorCode = null;
         state.RestartPending = false;
         state.RestartRequestedUtc = null;
+        state.AggregateFreezePending = false;
         state.TargetGeneration = 0;
         state.LastLaunchOwner = state.LaunchOwner;
         state.LastLaunchRequestKey = state.LaunchRequestKey;
@@ -5348,6 +6166,7 @@ internal sealed class CoordinatorState
     private void SynchronizeLocked()
     {
         PruneStaleLeasesLocked();
+        PruneProjectIntentsLocked();
 
         if (IsolationActiveLocked())
         {
@@ -5754,6 +6573,12 @@ internal sealed class CoordinatorState
 
         state.Leases ??= new List<TestLease>();
         state.ScopeTickets ??= new List<ScopeTicket>();
+        state.ProjectIntents ??= new List<ProjectIntentRegistration>();
+        state.FrozenRegistrations ??= new List<ProjectIntentSnapshot>();
+        state.FrozenRequestedProjects ??= new List<string>();
+        state.FrozenResolvedProjectPackageIds ??= new List<string>();
+        state.FrozenResolvedMods ??= new List<string>();
+        state.AggregateGenerations ??= new List<AggregateGenerationEvidence>();
         state.CrashIsolationHistory ??= new List<CrashIsolationIncident>();
         if (state.CrashIsolation != null)
         {
@@ -5777,6 +6602,8 @@ internal sealed class CoordinatorState
             state.CrashIsolation.OriginalResolvedProjectPackageIds ??= new List<string>();
             state.CrashIsolation.OriginalResolvedMods ??= new List<string>();
             state.CrashIsolation.OriginalDiagnosticMetadata ??= new Dictionary<string, string>();
+            state.CrashIsolation.OriginalRegistrations ??= new List<ProjectIntentSnapshot>();
+            state.CrashIsolation.ProjectRequesters ??= new Dictionary<string, List<ProjectIntentRequester>>();
             // The two copies are a launch guard and incident evidence. Never
             // replenish either one from the other after a restart: a mismatch
             // fails closed at the lower value and is repaired durably.
@@ -5812,6 +6639,17 @@ internal sealed class CoordinatorState
         else
             state.ProfileMode = persistedProfileMode.Trim().ToLowerInvariant();
 
+        string expectedLaunchProfileMode = state.ProfileMode == ModProfile.LegacyMode
+            ? "explicit-human-legacy"
+            : state.ProfileMode == ModProfile.BaselineMode
+                ? "aggregate-minimal-control"
+                : "aggregate-projects";
+        if (!string.Equals(state.LaunchProfileMode, expectedLaunchProfileMode, StringComparison.Ordinal))
+        {
+            state.LaunchProfileMode = expectedLaunchProfileMode;
+            changed = true;
+        }
+
         if (state.ProfileMode != ModProfile.LegacyMode && state.ProfileMode != ModProfile.BaselineMode &&
             state.ProfileMode != ModProfile.ProjectsMode)
         {
@@ -5821,6 +6659,60 @@ internal sealed class CoordinatorState
         state.RequestedProjects ??= new List<string>();
         state.ResolvedProjectPackageIds ??= new List<string>();
         state.ResolvedMods ??= new List<string>();
+        foreach (ProjectIntentRegistration registration in state.ProjectIntents.Where(value => value != null))
+        {
+            registration.RequestedProjects ??= new List<string>();
+            registration.Owner ??= "unknown-agent";
+            registration.SessionId ??= registration.Owner;
+            if (registration.CreatedUtc == default)
+            {
+                registration.CreatedUtc = registration.LastHeartbeatUtc == default ? clock.UtcNow : registration.LastHeartbeatUtc;
+                changed = true;
+            }
+            if (string.IsNullOrWhiteSpace(registration.Status))
+            {
+                registration.Status = "ACTIVE";
+                changed = true;
+            }
+            else
+            {
+                string normalizedStatus = registration.Status.Trim().ToUpperInvariant();
+                if (!string.Equals(registration.Status, normalizedStatus, StringComparison.Ordinal))
+                {
+                    registration.Status = normalizedStatus;
+                    changed = true;
+                }
+            }
+            if (string.Equals(registration.Status, "ACTIVE", StringComparison.Ordinal))
+            {
+                try
+                {
+                    IReadOnlyList<string> canonical = ModProfileResolver.CanonicalAliases(registration.RequestedProjects);
+                    if (!registration.RequestedProjects.SequenceEqual(canonical, StringComparer.Ordinal))
+                    {
+                        registration.RequestedProjects = canonical.ToList();
+                        changed = true;
+                    }
+                }
+                catch (ProfileException exception)
+                {
+                    registration.Status = "INVALID";
+                    registration.ReleasedUtc = clock.UtcNow;
+                    registration.ReleaseReason = exception.Code + ": " + exception.Message;
+                    changed = true;
+                }
+            }
+            if (registration.LastHeartbeatUtc == default)
+            {
+                registration.LastHeartbeatUtc = registration.CreatedUtc == default ? clock.UtcNow : registration.CreatedUtc;
+                changed = true;
+            }
+            if (registration.ExpiresUtc == default)
+            {
+                registration.ExpiresUtc = registration.LastHeartbeatUtc.Add(options.ProjectIntentDuration);
+                changed = true;
+            }
+        }
         if (state.ProfileMode == ModProfile.LegacyMode &&
             (state.RequestedProjects.Count > 0 || state.ResolvedProjectPackageIds.Count > 0 ||
              state.ResolvedMods.Count > 0 ||
@@ -5995,6 +6887,8 @@ internal sealed class CoordinatorState
         state.ResolvedMods = profile.ResolvedMods.ToList();
         state.ProfileFingerprint = profile.ProfileFingerprint;
         state.BaselineFingerprint = profile.BaselineFingerprint;
+        state.LaunchProfileMode = profile.Mode == ModProfile.BaselineMode
+            ? "aggregate-minimal-control" : "aggregate-projects";
     }
 
     private void ClearActiveProfileLocked()
@@ -6004,6 +6898,7 @@ internal sealed class CoordinatorState
         state.ResolvedProjectPackageIds = new List<string>();
         state.ResolvedMods = new List<string>();
         state.ProfileFingerprint = null;
+        state.LaunchProfileMode = "explicit-human-legacy";
     }
 
     private void RecordProfileError(string code, string message)
@@ -6038,7 +6933,9 @@ internal sealed class CoordinatorState
 
     private void EmitProfile(PersistedState snapshot, Action<string> emit)
     {
-        emit("Profile mode: " + (string.IsNullOrWhiteSpace(snapshot.ProfileMode) ? ModProfile.LegacyMode : snapshot.ProfileMode));
+        emit("Profile mode: " + (snapshot.LaunchProfileMode ??
+            (string.IsNullOrWhiteSpace(snapshot.ProfileMode) ? ModProfile.LegacyMode : snapshot.ProfileMode)));
+        emit("Resolver profile mode: " + (string.IsNullOrWhiteSpace(snapshot.ProfileMode) ? ModProfile.LegacyMode : snapshot.ProfileMode));
         emit("Requested projects: " +
             (snapshot.RequestedProjects == null || snapshot.RequestedProjects.Count == 0
                 ? "none" : string.Join(", ", snapshot.RequestedProjects)));
@@ -6444,7 +7341,10 @@ internal sealed class CoordinatorState
                 RevalidateMaintenanceReadyLocked();
             }
             else
+            {
+                PruneProjectIntentsLocked();
                 PruneStaleLeasesLocked();
+            }
             snapshot = CloneStateLocked();
             snapshot.BaselineFingerprint = ReadBaselineFingerprintLocked() ?? snapshot.BaselineFingerprint;
             snapshot.ModsConfigOwnership = CurrentModsConfigOwnershipLocked();
@@ -6499,6 +7399,8 @@ internal sealed class CoordinatorState
                 : RetryAfterSeconds(snapshot.Leases.Min(value => LeaseExpiresUtc(value)), clock.UtcNow),
             RequiresNewProcess = snapshot.RequiresNewProcess,
             ProfileMode = snapshot.ProfileMode,
+            ResolverProfileMode = snapshot.ProfileMode,
+            LaunchProfileMode = snapshot.LaunchProfileMode,
             RequestedProjects = snapshot.RequestedProjects ?? new List<string>(),
             ResolvedProjectPackageIds = snapshot.ResolvedProjectPackageIds ?? new List<string>(),
             ResolvedMods = snapshot.ResolvedMods ?? new List<string>(),
@@ -6508,6 +7410,25 @@ internal sealed class CoordinatorState
             ProfileConflict = snapshot.ProfileConflict,
             RuntimeProfileFingerprint = snapshot.RuntimeProfile?.ProfileFingerprint,
             CrashIsolation = snapshot.CrashIsolation,
+            FrozenGeneration = snapshot.FrozenTargetGeneration,
+            FrozenRequestedProjects = snapshot.FrozenRequestedProjects ?? new List<string>(),
+            FrozenResolvedProjectPackageIds = snapshot.FrozenResolvedProjectPackageIds ?? new List<string>(),
+            FrozenResolvedMods = snapshot.FrozenResolvedMods ?? new List<string>(),
+            FrozenProfileFingerprint = snapshot.FrozenProfileFingerprint,
+            FrozenBaselineFingerprint = snapshot.FrozenBaselineFingerprint,
+            AggregateFreezePending = snapshot.AggregateFreezePending,
+            FrozenLaunchOwner = snapshot.FrozenLaunchOwner,
+            FrozenLaunchRequestKey = snapshot.FrozenLaunchRequestKey,
+            FrozenRegistrationIds = (snapshot.FrozenRegistrations ?? new List<ProjectIntentSnapshot>())
+                .Select(value => value.Id).ToList(),
+            FrozenRegistrations = (snapshot.FrozenRegistrations ?? new List<ProjectIntentSnapshot>()).ToList(),
+            ActiveProjectIntents = (snapshot.ProjectIntents ?? new List<ProjectIntentRegistration>())
+                .Where(value => value != null && string.Equals(value.Status, "ACTIVE", StringComparison.Ordinal))
+                .OrderBy(value => value.Id, StringComparer.Ordinal)
+                .Select(ToJsonProjectIntent).ToList(),
+            QueuedProjectIntents = QueuedProjectIntents(snapshot).Select(ToJsonProjectIntent).ToList(),
+            AggregateGenerations = snapshot.AggregateGenerations ?? new List<AggregateGenerationEvidence>(),
+            MissingProjects = MissingProjectsFor(snapshot, request),
             Agent = request.Agent,
             Leases = snapshot.Leases
                 .OrderBy(value => value.StartedUtc)
@@ -6573,6 +7494,44 @@ internal sealed class CoordinatorState
         return response;
     }
 
+    private static ProjectIntentRegistrationInfo ToJsonProjectIntent(ProjectIntentRegistration registration) => new()
+    {
+        Id = registration.Id,
+        Owner = registration.Owner,
+        SessionId = registration.SessionId,
+        RequestedProjects = (registration.RequestedProjects ?? new List<string>()).ToList(),
+        Status = registration.Status,
+        CreatedUtc = registration.CreatedUtc,
+        LastHeartbeatUtc = registration.LastHeartbeatUtc,
+        ExpiresUtc = registration.ExpiresUtc,
+        ReleasedUtc = registration.ReleasedUtc,
+        ReleaseReason = registration.ReleaseReason,
+        ClientProcessId = registration.ClientProcessId
+    };
+
+    private static List<ProjectIntentRegistration> QueuedProjectIntents(PersistedState snapshot)
+    {
+        HashSet<string> included = new((snapshot.FrozenRegistrations ?? new List<ProjectIntentSnapshot>())
+            .Select(value => value.Id), StringComparer.Ordinal);
+        return (snapshot.ProjectIntents ?? new List<ProjectIntentRegistration>())
+            .Where(value => value != null && string.Equals(value.Status, "ACTIVE", StringComparison.Ordinal) &&
+                            !included.Contains(value.Id))
+            .OrderBy(value => value.Id, StringComparer.Ordinal).ToList();
+    }
+
+    private static List<string> MissingProjectsFor(PersistedState snapshot, BridgeRequest request)
+    {
+        string owner = StableProjectOwner(request);
+        string session = StableProjectSession(request);
+        List<string> requested = CanonicalProjectUnion((snapshot.ProjectIntents ?? new List<ProjectIntentRegistration>())
+            .Where(value => value != null && string.Equals(value.Status, "ACTIVE", StringComparison.Ordinal) &&
+                            string.Equals(value.Owner, owner, StringComparison.Ordinal) &&
+                            string.Equals(value.SessionId, session, StringComparison.Ordinal))
+            .SelectMany(value => value.RequestedProjects));
+        List<string> included = CanonicalProjectUnion(snapshot.RequestedProjects ?? new List<string>());
+        return requested.Where(value => !included.Contains(value, StringComparer.Ordinal)).ToList();
+    }
+
     private string JsonNextAction(BridgeRequest request, PersistedState snapshot,
         int exitCode, string leaseId)
     {
@@ -6588,6 +7547,14 @@ internal sealed class CoordinatorState
              !IsTerminalIsolationStatus(snapshot.CrashIsolation.Status)))
         {
             return "Crash isolation is running; Do not retry or change ModsConfig.xml. Run: DevBridge.cmd status and keep waiting.";
+        }
+
+        List<string> missingProjects = MissingProjectsFor(snapshot, request);
+        if (missingProjects.Count > 0 && !snapshot.RestartPending &&
+            snapshot.Phase != BridgePhase.ERROR)
+        {
+            return "Requested projects are not in the READY profile (missing: " +
+                string.Join(", ", missingProjects) + "). Run: DevBridge.cmd restart, then verify status --json before testing.";
         }
 
         if (string.Equals(command, "test", StringComparison.OrdinalIgnoreCase) &&

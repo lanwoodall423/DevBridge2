@@ -18,6 +18,10 @@ Use `DevBridge.cmd` from the installed mod root.
 - Register managed project intent before testing: `DevBridge.cmd project register <alias[,alias...]>`.
   Registrations are durable, owner/session-bound, renewed by heartbeat, and expire safely when the
   owner stops renewing. Use `project status` to inspect active, frozen, and queued registrations.
+- Default to aggregate-first coordination: register immediately even when unrelated project intents
+  or test leases are active, and do not wait for them to clear. Existing tests can delay the replacement
+  launch or your test start, but they do not block registration. Use a project-only/exclusive run only
+  to reproduce a baseline, isolate a failure after a combined run fails, or honor a known incompatibility.
 - Plain `DevBridge.cmd restart` is an aggregate launch. It uses the minimal control profile when there
   are no active project registrations, or the deterministic union and full dependency closure of all
   active registrations. It never preserves or implicitly launches a production ModsConfig.
@@ -98,6 +102,120 @@ The readiness wait defaults to six minutes, based on observed full-modlist start
 Set `DEVBRIDGE_READINESS_TIMEOUT_SECONDS` for a deterministic local override; this is a fixed deadline,
 not an adaptive retry policy.
 
+### RimBridgeServer integration
+
+DevBridge remains the sole owner of the RimWorld process lifecycle, restart/shutdown decisions,
+`ModsConfig.xml`, profiles, generations, maintenance windows, and test leases. RimBridgeServer remains
+the live-game inspection/control service: its debug actions, screenshots, saves, profiling, and other
+runtime operations are not reimplemented by DevBridge. DevBridge never starts GABS and never gives
+RimBridgeServer an independent lifecycle; direct/standalone RimBridgeServer startup remains supported.
+
+The integration is backward-compatible and off by default. Set `DEVBRIDGE_RIMBRIDGE_MODE` to `off`,
+`optional`, or `required`; set `DEVBRIDGE_PLAYER_LOG` when `Player.log` is not at RimWorld's normal
+user-data location. `required` rejects a missing, ambiguous, or malformed `brrainz.rimbridgeserver`
+package before any `ModsConfig.xml` mutation and makes the same-launch verified endpoint part of
+readiness. `optional` includes the package when it resolves and reports failures without blocking the
+playable-map readiness contract. `off` excludes the package and performs no bridge readiness work.
+
+Use `DevBridge.cmd bridge status` for token-free human or JSON diagnostics. Use
+`DevBridge.cmd bridge endpoint` only when a credential is intentionally needed; the human command
+prints the token and `bridge endpoint --json` returns it in the dedicated `rimBridgeEndpoint` field.
+Ordinary `status`, `doctor`, lifecycle JSON, and persisted integration state never contain the token.
+The endpoint is bound to the current launch ID, generation, RimWorld PID, and process-start identity;
+stop, restart, process exit/identity change, generation change, or maintenance invalidates it. Discovery
+uses only new append-only `Player.log` lines after the launch boundary, the logged loopback port, and
+bounded loopback verification; it never assumes port 5174. `RIMBRIDGE_NOT_INSTALLED`,
+`RIMBRIDGE_ENDPOINT_NOT_FOUND`, `RIMBRIDGE_STARTUP_TIMEOUT`, `RIMBRIDGE_STARTUP_FAILED`,
+`RIMBRIDGE_AUTH_FAILED`, and `RIMBRIDGE_PROCESS_MISMATCH` are bounded terminal/diagnostic codes;
+follow the reported status/next action rather than blindly retrying.
+
+#### ModsConfig ownership boundary
+
+Agents may use RimBridgeServer freely for live-game observation, UI/debug actions, screenshots, saves,
+and profiling. While DevBridge owns a generation, agents must not use RimBridge to persist enabled-mod or
+mod-order changes: `rimworld/set_mod_enabled` and `rimworld/reorder_mod` are conflicting operations.
+Those changes must go through DevBridge's explicit baseline/profile maintenance workflow so the accepted
+profile and generation remain immutable.
+
+Inspect the machine-readable rule with `DevBridge.cmd bridge policy` or the token-free
+`devbridge/get_control_policy` companion tool. `status`, `doctor`, `mods status`, and bridge status also
+report the owners, mutation authority, blocked operations, and any durable evidence. If DevBridge detects
+that `ModsConfig.xml` changed outside an authorized transition, it emits `PROFILE_EXTERNAL_MUTATION`,
+preserves the accepted profile and both fingerprints as evidence, marks the generation untrustworthy, and
+does not bless the file or enter an automatic restart loop. Run `DevBridge.cmd mods status`, then perform
+an explicit baseline capture or restore while the maintenance preconditions are satisfied before accepting
+another generation.
+
+#### Optional RimBridge companion tool
+
+`Source/BridgeTools/DevBridge2.BridgeTools.csproj` builds an optional RimBridgeServer companion
+assembly. It is not referenced by `Source/Mod/DevBridge2.csproj`, so the core DevBridge2 mod loads
+without RimBridgeServer or its SDK. The companion exposes the read-only authenticated tools
+`devbridge/get_generation_context` and `devbridge/get_control_policy`; it is not a second lifecycle
+controller and cannot restart RimWorld, edit `ModsConfig.xml`, or write DevBridge state.
+
+The tool returns this token-free schema (nullable values are `null` when unavailable):
+
+```json
+{
+  "success": true,
+  "available": true,
+  "schemaVersion": "devbridge-generation-context/v1",
+  "launchId": "...",
+  "generation": 17,
+  "profileFingerprint": "sha256...",
+  "baselineFingerprint": "sha256...",
+  "profileMode": "projects",
+  "processId": 1234,
+  "processStartUtcTicks": 638000000000000000,
+  "devBridge2ModVersion": "1.2.4",
+  "rimBridgeIntegrationSchemaVersion": "rimbridge-integration/v1",
+  "errorCode": null,
+  "error": null
+}
+```
+
+It reads the inherited `DEVBRIDGE_ROOT`, launch, generation, profile, and baseline environment
+values, using `Runtime/state.json` only as a durable fallback, and derives the current RimWorld
+process identity. It never returns the RimBridge token. Missing or malformed launch values return
+`success=false` with bounded diagnostics. The coordinator optionally calls the same tool over the
+authenticated GABP `session/hello` and `tools/call` protocol after endpoint verification. Matching
+`launchId`, `generation`, and `processId` strengthens the endpoint evidence; any disagreement is
+`RIMBRIDGE_COMPANION_IDENTITY_MISMATCH` and is never silently accepted. If the companion is absent,
+endpoint-only integration remains valid and reports `RIMBRIDGE_COMPANION_UNAVAILABLE` diagnostically.
+
+The SDK is compile-time only. Build with `dotnet build Source\BridgeTools\DevBridge2.BridgeTools.csproj
+-c Release`, then place only `DevBridge2.BridgeTools.dll` in the active mod's `BridgeTools` folder
+(for example `Mods\DevBridge2\BridgeTools\`). Do not copy `RimBridgeServer.Sdk.dll`; RimBridgeServer
+supplies it. A host/SDK incompatibility is diagnosed by RimBridgeServer and leaves the endpoint-only
+path available.
+
+#### Recommended routed workflow
+
+When an active generation is ready, use DevBridge as the authenticated route to RimBridgeServer:
+
+```text
+DevBridge.cmd test begin
+DevBridge.cmd bridge status --json
+DevBridge.cmd bridge policy --json
+DevBridge.cmd bridge tools --lease <lease-id> --json
+DevBridge.cmd bridge call rimworld/get_game_state {"include":"colonists"} --lease <lease-id> --json
+```
+
+`bridge tools` and `bridge call` validate the current launch ID, generation, PID/start identity,
+loopback endpoint, optional `devbridge/get_generation_context` companion evidence, and the caller's
+durable lease before opening a per-call authenticated GABP session. Each routed JSON result includes
+the tool, launch/generation/profile/PID, endpoint, and invocation timestamp; opaque `evidence` or
+`metadata` returned by the tool is retained. Tokens are never included in route results, status, or
+errors. `RIMBRIDGE_OPERATION_BLOCKED_BY_DEVBRIDGE_POLICY` is deterministic for persistent mod-enable,
+mod-order, and lifecycle operations; use DevBridge's lease-held maintenance/profile workflow for
+those changes. Authentication, identity, unavailable, tool-not-found, timeout, and protocol failures
+invalidate stale credentials where appropriate and do not trigger an automatic restart or retry.
+
+Routed calls are optional: `DEVBRIDGE_RIMBRIDGE_MODE=off` rejects them locally, while optional mode
+reports `RIMBRIDGE_ENDPOINT_NOT_FOUND` or another bounded route error when RimBridgeServer is absent.
+The existing endpoint-only and direct RimBridgeServer workflows remain valid when routing is not needed.
+
 Useful diagnostics:
 
 ```text
@@ -121,6 +239,9 @@ launch safety check is fail-closed: DevBridge makes no ModsConfig write and no l
 ### Aggregate project launches
 
 Register project intent, restart or await the accepted generation, verify inclusion, then begin a test:
+
+Other active registrations are normal inputs to the same launch, not conflicts. Join them first and
+isolate only after combined-profile evidence makes isolation necessary.
 
 ```text
 set DEVBRIDGE_AGENT=agent-a
@@ -198,6 +319,55 @@ for an aggregate with project intent, and `explicit-human-legacy` only for `--le
 `resolvedMods` example is abbreviated; status returns the complete activeMods order. The response also
 exposes `frozenRegistrations` and `queuedProjectIntents` so agents can verify inclusion before testing.
 
+### Pure project planning
+
+Inspect a prospective profile before creating project intent:
+
+```text
+DevBridge.cmd project resolve horticulture,aquaculture --json
+```
+
+`project resolve` is a pure planning operation. It canonicalizes aliases, discovers installed
+metadata, resolves and deduplicates dependencies, honors load-order constraints, calculates the
+exact `resolvedMods` order and fingerprints, and returns a machine-readable `projectResolution`
+object with package IDs, dependency edges, per-mod provenance, comparison fields, warnings, errors,
+and next actions. Provenance categories include `CONTROL_REQUIRED`, `PROJECT_ROOT`, `DEPENDENCY_OF`,
+`LOAD_ORDER_CONSTRAINT`, `OFFICIAL_CONTENT`, and `OTHER_REQUIRED_BASELINE`. Add `--explain` for a
+compact human-readable provenance view.
+
+Resolve never registers intent, changes a lease, writes `ModsConfig.xml` or the baseline, queues a
+restart, changes generation, or launches/stops RimWorld. The recommended autonomous workflow is:
+run `project resolve ... --json`, inspect the closure/fingerprint, run `project register ...`,
+restart/wait-ready, then verify the frozen generation in `status --json`. Resolution failures return
+machine-readable codes before persistent mutation. When a pinned accepted manifest exists, the plan
+reports added/removed packages, order and project-intent changes, fingerprint change, and restart
+requirement. Status and Doctor expose `currentGenerationTrust` and `nextGenerationConfig`, so invalid
+future metadata does not make a valid current generation unmanageable; new launches remain refused
+until the configuration is fixed.
+
+### Declared test inputs
+
+Generation-specific test variation is deliberately limited to Dev Bridge's declared built-in
+Quicktest inputs; it is not a generic launcher argument or environment injection mechanism. Use
+repeated `--input name=value` assignments with `project resolve` to preview them:
+
+```text
+DevBridge.cmd project resolve horticulture --input quicktest=true --input quicktestTimeoutSeconds=45 --input quicktestVariant=builtin-dev --json
+```
+
+Supported declarations are `quicktest` (`true`/`false`), `quicktestTimeoutSeconds` (integer
+`5` through `120`), and `quicktestVariant` (`builtin-dev` or `disabled`). Values are normalized,
+bounded, and included in the prospective profile fingerprint, pinned accepted-generation manifest,
+history, and status. The current launch emits only Dev Bridge-owned Quicktest environment keys;
+argv remains empty and callers cannot choose environment names, shell fragments, save arguments, or
+other game flags. Unknown names, invalid types, out-of-range values, and unsupported profile
+combinations fail before mutation or launch.
+
+Inputs are frozen with the generation. A later explicit input is a next-generation request and
+cannot rewrite the accepted manifest; an incompatible request for an already pending generation
+returns `TEST_INPUT_CONFLICT` without replacing its frozen inputs. Use resolve JSON to inspect
+`testInputs`, `testInputsChanged`, and `wouldRequireRestart` before registering or restarting.
+
 ## Maintenance workflow
 
 Maintenance is an explicit owner-held session for a build, edit, or assembly replacement:
@@ -253,3 +423,41 @@ command completed successfully, `2` indicates usage/request failure, `4` indicat
 refusal or bounded terminal failure, and `doctor` uses `1` when its checks fail. With `--json`, parse
 the JSON fields such as `success`, `state`, `errorCode`, and `exitCode`, while still honoring the
 native CLI exit code; a successful status query can report that the runtime itself is in `ERROR`.
+
+### Authoritative forensic audit
+
+`doctor` is the comprehensive, non-short-circuiting audit. It independently checks coordinator
+scope/state, deployed versions and durable schemas, process identity and quarantine, ModsConfig
+ownership and mutation evidence, project/profile resolution, generation coherence, leases and
+maintenance, readiness and Quicktest artifacts, recovery/isolation, and filesystem permissions.
+One failed check does not suppress the others. Use this workflow after a refusal or terminal result:
+
+```text
+DevBridge.cmd status --json
+DevBridge.cmd doctor --json
+# Follow doctor.nextActions only; actions are deterministic, safe, and lease-parameterized.
+```
+
+Doctor JSON uses contract `devbridge-doctor/v1` and has stable `schemaVersion`, `healthy`,
+`findings`, `components`, `operationalState`, and `nextActions` fields. Findings contain
+`severity`, `code`, `message`, `component`, `details`, and safe `nextActions`; findings and actions
+are deterministically ordered. `healthy` is false when any finding has severity `ERROR`.
+Diagnostic text is redacted before doctor/status JSON is emitted; tokens, credentials, and raw
+authentication values are never ordinary diagnostic output. The native doctor exit code is `0`
+when healthy and `1` when any error finding remains.
+
+### Accepted-generation history
+
+Every successful READY transition pins an immutable manifest at
+`Runtime/generations/<generation>.json`. It records launch identity and timestamps, the accepted
+profile, exact resolved mod order, project registrations, ModsConfig fingerprints, process/readiness
+evidence, and component schema markers. It is never rewritten; a mismatch is a fail-closed
+integrity error. Failed or stopped outcomes are recorded semantically in the atomic
+`Runtime/generation-history.json` envelope without treating a pre-READY generation as accepted.
+
+Use `history`, `history show <generation>`, and `history last-good` (append `--json` for automation)
+to inspect current, previous, and last-known-good generations. Last-known-good advances only after
+defensible READY evidence; later normal termination leaves that generation last-good, and failed
+generations cannot replace it. The files contain allow-listed evidence only—never RimBridge tokens,
+credentials, raw exceptions, or arbitrary logs. If either file is malformed or missing, history and
+doctor report the corruption without rewriting it.

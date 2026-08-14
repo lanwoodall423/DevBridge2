@@ -25,20 +25,42 @@ dotnet build Source\Mod\DevBridge2.csproj -c Release -p:RimWorldManagedDir="<Rim
 
 The mod build output is `1.6\Assemblies\DevBridge2.dll`.
 
-## Opt-in mod profiles
+## Durable aggregate project launches
 
-Profile selection is explicit. A plain `DevBridge.cmd restart` preserves the existing ModsConfig
-behavior and does not select a reduced profile. To manage profiles, first stop RimWorld and ensure
-there are no active leases or pending restarts, then capture the user configuration:
+Register managed project intent before a restart. A plain `DevBridge.cmd restart` always selects the
+aggregate contract: the minimal control profile when no active registrations exist, or the deterministic
+union and complete dependency closure of every active registration. It never implicitly launches the
+production ModsConfig:
 
 ```text
-DevBridge.cmd mods capture-baseline
-DevBridge.cmd restart --projects none
-DevBridge.cmd restart --projects horticulture
-DevBridge.cmd restart --projects horticulture,aquaculture
-DevBridge.cmd mods status --json
-DevBridge.cmd mods restore-baseline
+set DEVBRIDGE_AGENT=agent-a
+set DEVBRIDGE_SESSION=agent-a-session
+DevBridge.cmd project register horticulture,aquaculture
+DevBridge.cmd project status
+DevBridge.cmd restart
+DevBridge.cmd wait-ready
+DevBridge.cmd status --json
+DevBridge.cmd test begin
+DevBridge.cmd test end <lease-id>
+DevBridge.cmd project release <registration-id>
 ```
+
+`restart --projects ...` is compatibility syntax: it registers the caller's request into the same
+aggregate and cannot replace or omit other active registrations. `restart --legacy-production` is the
+sole explicit human production compatibility path; it is never an automatic fallback or a source of
+project attribution and cannot be combined with active intent.
+
+Registrations are durable and owner/session-bound. Renew them with `project renew <registration-id>`
+while work continues, and release them explicitly when finished. Expiry and release affect future
+generations only. Once a generation freezes, its registration IDs/owners, aliases, resolved project
+packages, ordered closure, baseline/profile fingerprints, target generation, and launch owner/request
+key are immutable. A late registration is reported in `queuedProjectIntents` and must wait for the next
+restart. Verify `frozenRegistrations`, `requestedProjects`, `resolvedMods`, and both fingerprints before
+calling `test begin`; test begin is denied when the caller's active registrations are missing.
+
+If the baseline sidecar is absent, the first successful aggregate resolution adopts the exact current
+ModsConfig bytes as the durable baseline. `mods capture-baseline` remains an explicit operator action
+for intentionally changing that baseline while RimWorld is stopped and no lease or restart is active.
 
 Aliases are `deferred-reality`, `insight-canvas`, `knowledge-framework`, `frontier`, `aquaculture`,
 `horticulture`, and `wildlife`. Every managed profile always includes the baseline tooling and
@@ -54,8 +76,9 @@ has stopped RimWorld and changed the list. `mods restore-baseline` is also expli
 leases, a restart, or a RimWorld process exist.
 
 The accepted aliases, resolved package IDs, exact ordered mod list, and SHA-256 profile fingerprint
-are persisted with the restart generation. A different profile request cannot replace a pending
-accepted request and reports `PROFILE_CONFLICT`.
+are persisted with the restart generation. A request arriving after the freeze is queued for the
+next generation and cannot replace the pending accepted request; an incompatible owner or unsafe
+pending request reports `PROFILE_CONFLICT`.
 
 ## Operator workflow
 
@@ -111,7 +134,9 @@ Example lease projection:
 {"id":"T001","agent":"agent-a","lastHeartbeatUtc":"2026-08-11T16:00:00Z","expiresUtc":"2026-08-11T16:02:00Z","retryAfterSeconds":120}
 ```
 
-`mods status --json` uses the same response envelope and additionally exposes `profileMode`,
-`requestedProjects`, `resolvedProjectPackageIds`, `resolvedMods`, `profileFingerprint`,
-`baselineFingerprint`, `modsConfigOwnership`, and `profileConflict`. `resolvedMods` is the exact
-activeMods order that the next managed launch will use.
+`status --json` and `mods status --json` expose `launchProfileMode`, resolver `profileMode`, current and
+frozen generations, active/frozen/queued registrations and owners, missing projects, exact ordered
+packages, all fingerprints, `aggregateGenerations`, and the next action. During crash isolation the
+next action is polling only: do not retry restart, edit ModsConfig.xml, or mutate registrations.
+Failures in resolution, metadata, ownership, lease/maintenance, process identity, or launch safety
+are fail-closed with zero ModsConfig writes and zero launches.

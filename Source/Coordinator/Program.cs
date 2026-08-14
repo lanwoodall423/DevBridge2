@@ -1680,42 +1680,69 @@ internal static class ModProfileResolver
         if (root == null)
             throw new ProfileException("PROFILE_MALFORMED_METADATA", "Installed metadata has no XML root: " + metadata.DirectoryPath);
 
-        ReadReferences(root, "modDependencies", metadata.Dependencies, metadata, required: true);
-        ReadReferences(root, "loadBefore", metadata.LoadBefore, metadata, required: false);
-        ReadReferences(root, "loadAfter", metadata.LoadAfter, metadata, required: false);
+        ReadReferences(root, "modDependencies", metadata.Dependencies, metadata);
+        ReadReferences(root, "loadBefore", metadata.LoadBefore, metadata);
+        ReadReferences(root, "loadAfter", metadata.LoadAfter, metadata);
     }
 
     private static void ReadReferences(XElement root, string sectionName, List<string> destination,
-        InstalledModMetadata metadata, bool required)
+        InstalledModMetadata metadata)
     {
-        XElement section = root.Elements().FirstOrDefault(value =>
-            string.Equals(value.Name.LocalName, sectionName, StringComparison.OrdinalIgnoreCase));
-        if (section == null)
+        List<XElement> sections = root.Elements().Where(value =>
+            string.Equals(value.Name.LocalName, sectionName, StringComparison.OrdinalIgnoreCase)).ToList();
+        if (sections.Count == 0)
             return;
+        if (sections.Count > 1)
+            throw new ProfileException("PROFILE_MALFORMED_METADATA",
+                "Installed metadata for " + metadata.PackageId + " has multiple " + sectionName + " sections.");
+
+        XElement section = sections[0];
         if (section.Nodes().Any(node => node switch
         {
             XElement element => !string.Equals(element.Name.LocalName, "li", StringComparison.OrdinalIgnoreCase),
             XText text => !string.IsNullOrWhiteSpace(text.Value),
+            XComment => false,
             _ => true
         }))
             throw new ProfileException("PROFILE_MALFORMED_METADATA",
                 "Installed metadata for " + metadata.PackageId + " has a malformed " + sectionName + " section.");
 
-        foreach (XElement child in section.Elements())
+        foreach (XElement li in section.Elements())
         {
-            XElement li = child;
-            XElement package = li.Elements().FirstOrDefault(value =>
-                string.Equals(value.Name.LocalName, "packageId", StringComparison.OrdinalIgnoreCase));
-            string value = package?.Value.Trim();
-            if (package == null && !li.Elements().Any())
+            List<XElement> elements = li.Elements().ToList();
+            List<XElement> packages = elements.Where(value =>
+                string.Equals(value.Name.LocalName, "packageId", StringComparison.OrdinalIgnoreCase)).ToList();
+            string value;
+            if (elements.Count == 0)
                 value = li.Value.Trim();
-            bool extraContent = li.Elements().Any(element => package == null || !ReferenceEquals(element, package)) ||
-                (package != null && li.Nodes().OfType<XText>().Any(text => !string.IsNullOrWhiteSpace(text.Value)));
-            if (extraContent || string.IsNullOrWhiteSpace(value) || value.Any(char.IsWhiteSpace))
+            else
+            {
+                if (packages.Count != 1 ||
+                    li.Nodes().OfType<XText>().Any(text => !string.IsNullOrWhiteSpace(text.Value)))
+                    throw new ProfileException("PROFILE_MALFORMED_METADATA",
+                        "Installed metadata for " + metadata.PackageId + " has a malformed " + sectionName + " entry.");
+
+                XElement package = packages[0];
+                if (package.Elements().Any() || package.Nodes().Any(node => node is not XText && node is not XComment))
+                    throw new ProfileException("PROFILE_MALFORMED_METADATA",
+                        "Installed metadata for " + metadata.PackageId + " has a malformed " + sectionName + " entry.");
+                value = package.Value.Trim();
+            }
+
+            if (!IsValidReferencePackageId(value))
                 throw new ProfileException("PROFILE_MALFORMED_METADATA",
                     "Installed metadata for " + metadata.PackageId + " has a malformed " + sectionName + " entry.");
             destination.Add(value);
         }
+    }
+
+    private static bool IsValidReferencePackageId(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value) || value.Any(char.IsWhiteSpace))
+            return false;
+        if (!char.IsLetterOrDigit(value[0]) || !char.IsLetterOrDigit(value[^1]))
+            return false;
+        return value.All(character => char.IsLetterOrDigit(character) || character is '.' or '_' or '-');
     }
 }
 

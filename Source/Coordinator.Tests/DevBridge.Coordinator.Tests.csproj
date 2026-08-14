@@ -11,6 +11,7 @@
   <ItemGroup>
     <Compile Include="..\Coordinator\Program.cs" Link="Coordinator.Program.cs" />
     <Compile Include="..\Coordinator\QuicktestActivationCore.cs" Link="QuicktestActivationCore.cs" />
+    <Compile Include="..\Coordinator\QuicktestFailureArtifact.cs" Link="QuicktestFailureArtifact.cs" />
     <Compile Include="OfflineTests.cs" />
     <Compile Include="DevBridgeWrapperTests.cs" />
   </ItemGroup>

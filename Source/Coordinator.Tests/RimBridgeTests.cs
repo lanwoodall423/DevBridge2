@@ -19,42 +19,42 @@ internal static partial class OfflineTests
         using ProfileSetup setup = ProfileSetup.Create();
         string baseline = Convert.ToHexString(SHA256.HashData(
             File.ReadAllBytes(Path.Combine(setup.Fixture.Root, "ModsConfig.xml"))));
+
+        string rimBridgeAbout = Path.Combine(setup.MetadataRoot,
+            RimBridgeIntegrationConstants.PackageId, "About", "About.xml");
+        File.WriteAllText(rimBridgeAbout, "<ModMetaData><packageId>" +
+            RimBridgeIntegrationConstants.PackageId + "</packageId><modVersion>9.8.7</modVersion></ModMetaData>");
+
         ModProfile off = ModProfileResolver.Resolve(setup.Fixture.Root, baseline, Array.Empty<string>(),
             setup.Fixture.InstalledModsRoots, RimBridgeMode.Off);
-        ModProfile optionalMissing = ModProfileResolver.Resolve(setup.Fixture.Root, baseline,
-            Array.Empty<string>(), setup.Fixture.InstalledModsRoots, RimBridgeMode.Optional);
-        Assert(!off.ResolvedMods.Contains(RimBridgeIntegrationConstants.PackageId, StringComparer.OrdinalIgnoreCase),
-            "off mode must exclude RimBridgeServer");
-        Assert(!optionalMissing.ResolvedMods.Contains(RimBridgeIntegrationConstants.PackageId,
+        ModProfile optional = ModProfileResolver.Resolve(setup.Fixture.Root, baseline, Array.Empty<string>(),
+            setup.Fixture.InstalledModsRoots, RimBridgeMode.Optional);
+        ModProfile required = ModProfileResolver.Resolve(setup.Fixture.Root, baseline, Array.Empty<string>(),
+            setup.Fixture.InstalledModsRoots, RimBridgeMode.Required);
+        Assert(off.ResolvedMods.Contains(RimBridgeIntegrationConstants.PackageId,
                    StringComparer.OrdinalIgnoreCase) &&
-               optionalMissing.RimBridgeResolutionErrorCode == "RIMBRIDGE_NOT_INSTALLED",
-            "optional mode must continue visibly when RimBridgeServer is missing");
+               off.RimBridgeVersion == null,
+            "off mode must keep RimBridgeServer in the base profile without resolving an endpoint version");
+        Assert(optional.ResolvedMods.Contains(RimBridgeIntegrationConstants.PackageId,
+                   StringComparer.OrdinalIgnoreCase) && optional.RimBridgeVersion == "9.8.7",
+            "optional mode must include and resolve the base RimBridgeServer package");
+        Assert(required.ResolvedMods.Contains(RimBridgeIntegrationConstants.PackageId,
+                   StringComparer.OrdinalIgnoreCase) && required.RimBridgeVersion == "9.8.7",
+            "required mode must include the installed RimBridge package and version");
+
+        Directory.Delete(Path.Combine(setup.MetadataRoot, RimBridgeIntegrationConstants.PackageId), true);
         try
         {
             ModProfileResolver.Resolve(setup.Fixture.Root, baseline, Array.Empty<string>(),
-                setup.Fixture.InstalledModsRoots, RimBridgeMode.Required);
-            throw new InvalidOperationException("required mode unexpectedly resolved a missing package");
+                setup.Fixture.InstalledModsRoots, RimBridgeMode.Optional);
+            throw new InvalidOperationException("optional mode unexpectedly resolved a missing base package");
         }
         catch (ProfileException exception)
         {
             Assert(exception.Code == "RIMBRIDGE_NOT_INSTALLED",
-                "required mode must use the stable missing-package error code");
+                "missing base RimBridgeServer must use the stable missing-package error code");
         }
 
-        WriteInstalledMetadata(setup.MetadataRoot, "rimbridge", RimBridgeIntegrationConstants.PackageId, "");
-        string about = Path.Combine(setup.MetadataRoot, "rimbridge", "About", "About.xml");
-        File.WriteAllText(about, "<ModMetaData><packageId>" + RimBridgeIntegrationConstants.PackageId +
-            "</packageId><modVersion>9.8.7</modVersion></ModMetaData>");
-        ModProfile required = ModProfileResolver.Resolve(setup.Fixture.Root, baseline, Array.Empty<string>(),
-            setup.Fixture.InstalledModsRoots, RimBridgeMode.Required);
-        ModProfile optional = ModProfileResolver.Resolve(setup.Fixture.Root, baseline, Array.Empty<string>(),
-            setup.Fixture.InstalledModsRoots, RimBridgeMode.Optional);
-        Assert(required.ResolvedMods.Contains(RimBridgeIntegrationConstants.PackageId,
-                   StringComparer.OrdinalIgnoreCase) && required.RimBridgeVersion == "9.8.7",
-            "required mode must include the installed RimBridge package and version");
-        Assert(optional.ResolvedMods.Contains(RimBridgeIntegrationConstants.PackageId,
-                   StringComparer.OrdinalIgnoreCase),
-            "optional mode must include RimBridge when it is uniquely resolvable");
         Assert(off.ProfileFingerprint != required.ProfileFingerprint &&
                optional.ProfileFingerprint != required.ProfileFingerprint,
             "non-off mode fingerprints must distinguish their configured participation policy");
@@ -67,7 +67,8 @@ internal static partial class OfflineTests
         string path = Path.Combine(root, "Player.log");
         try
         {
-            File.WriteAllText(path, "[RimBridge] GABP server running standalone on port 5174\n" +
+            File.WriteAllText(path, new string('x', 512) + "\n" +
+                "[RimBridge] GABP server running standalone on port 5174\n" +
                 "[RimBridge] Bridge token: stale-token\n");
             RimBridgeLogBoundary boundary = RimBridgeLogDiscovery.CaptureBoundary(path, ClockStart);
             File.AppendAllText(path, "[RimBridge] GABP server running standalone on port 59123\n" +
@@ -83,8 +84,18 @@ internal static partial class OfflineTests
             File.WriteAllText(path, "x");
             RimBridgeLogDiscoveryResult rotated = RimBridgeLogDiscovery.Discover(boundary,
                 "launch-current", 4, 123, 456, ClockStart.AddSeconds(2));
-            Assert(rotated.Endpoint == null && rotated.BoundaryInvalid,
-                "truncation/rotation must reject the segment rather than reuse stale output");
+            Assert(rotated.Endpoint == null && !rotated.BoundaryInvalid &&
+                   rotated.ErrorCode == null,
+                "a shortened log before the fresh startup marker must remain pending");
+
+            File.WriteAllText(path, "RimWorld 1.6.4871 rev591\n" +
+                "[RimBridge] GABP server running standalone on port 59125\n" +
+                "[RimBridge] Bridge token: rebased-token\n");
+            RimBridgeLogDiscoveryResult rebased = RimBridgeLogDiscovery.Discover(boundary,
+                "launch-rebased", 4, 123, 456, ClockStart.AddSeconds(2));
+            Assert(rebased.Endpoint != null && rebased.Endpoint.Port == 59125 &&
+                   rebased.Endpoint.Token == "rebased-token" && !rebased.BoundaryInvalid,
+                "a shortened RimWorld log with a fresh startup marker must be rebased");
 
             File.WriteAllText(path, "old-file-prefix\n[RimBridge] Bridge token: old-token\n");
             RimBridgeLogBoundary largerRotationBoundary = RimBridgeLogDiscovery.CaptureBoundary(
@@ -511,6 +522,72 @@ internal static partial class OfflineTests
         }, TimeSpan.FromMilliseconds(50), call: true);
         Assert(timeout.Timeout && timeout.ErrorCode == "RIMBRIDGE_CALL_TIMEOUT",
             "a stalled GABP response must produce the bounded timeout result");
+    }
+
+    private static void TestRimBridgeWireClientInfo()
+    {
+        TcpListener listener = new(IPAddress.Loopback, 0);
+        listener.Start();
+        int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        Exception serverFailure = null;
+        Task server = Task.Run(() =>
+        {
+            try
+            {
+                using TcpClient client = listener.AcceptTcpClient();
+                using NetworkStream stream = client.GetStream();
+                using JsonDocument hello = JsonDocument.Parse(ReadTestFrame(stream));
+                JsonElement clientInfo = hello.RootElement.GetProperty("params")
+                    .GetProperty("clientInfo");
+                if (clientInfo.ValueKind != JsonValueKind.Object ||
+                    clientInfo.GetProperty("name").GetString() != "DevBridge2.Coordinator" ||
+                    string.IsNullOrWhiteSpace(clientInfo.GetProperty("version").GetString()))
+                    throw new InvalidOperationException(
+                        "session/hello must send GabpClientInfo-shaped client metadata");
+
+                string helloId = hello.RootElement.GetProperty("id").GetString();
+                WriteTestFrame(stream, new
+                {
+                    v = "gabp/1", type = "response", id = helloId,
+                    result = new { agentId = "wire-agent" }
+                });
+
+                using JsonDocument list = JsonDocument.Parse(ReadTestFrame(stream));
+                string listId = list.RootElement.GetProperty("id").GetString();
+                WriteTestFrame(stream, new
+                {
+                    v = "gabp/1", type = "response", id = listId,
+                    result = new { tools = Array.Empty<object>() }
+                });
+            }
+            catch (Exception exception)
+            {
+                serverFailure = exception;
+            }
+        });
+
+        try
+        {
+            RimBridgeWireResult result = new RimBridgeClient().ListTools(new RimBridgeEndpoint
+            {
+                Host = "127.0.0.1",
+                Port = port,
+                Token = "wire-secret",
+                LaunchId = "wire-launch",
+                Generation = 1,
+                ProcessId = 101,
+                ProcessStartUtcTicks = 1001,
+                DiscoveredUtc = ClockStart
+            }, "wire-launch", TimeSpan.FromSeconds(2));
+            Assert(result.Success, "structured RimBridge client information must complete hello");
+        }
+        finally
+        {
+            try { server.Wait(TimeSpan.FromSeconds(2)); } catch { }
+            listener.Stop();
+            if (serverFailure != null)
+                throw new InvalidOperationException("wire client-info test server failed", serverFailure);
+        }
     }
 
     private static RimBridgeWireResult RunWireCase(Action<NetworkStream, string> handler,

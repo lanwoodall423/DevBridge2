@@ -340,6 +340,12 @@ internal sealed partial class CoordinatorState
         Monitor.PulseAll(gate);
     }
 
+    private bool IsConfirmedMaintenanceWindowLocked()
+    {
+        return state.MaintenanceReady && state.ProcessId == 0 &&
+            state.ProcessStartUtcTicks == 0 && !state.RestartPending;
+    }
+
     private MaintenanceValidation RevalidateMaintenanceReadyLocked()
     {
         if (!state.MaintenanceReady)

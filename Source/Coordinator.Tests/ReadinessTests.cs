@@ -148,6 +148,33 @@ internal static partial class OfflineTests
             "reacquiring a maintenance lease must not launch RimWorld");
     }
 
+    private static void TestMaintenanceLeaseReacquisitionAfterProfileError()
+    {
+        using Fixture fixture = new(new PersistedState
+        {
+            Generation = 265,
+            Phase = BridgePhase.ERROR,
+            ErrorCode = "PROFILE_REQUIRED_MOD_MISSING",
+            Error = "The accepted profile is missing required tooling package brrainz.rimbridgeserver.",
+            MaintenanceReady = true,
+            SessionDirty = true,
+            ProcessId = 0,
+            ProcessStartUtcTicks = 0
+        });
+
+        BridgeRequest begin = Request("test", "replacement-holder", 88, "begin");
+        int exitCode = fixture.State.Execute(begin, _ => { }, () => true);
+        JsonCommandResponse response = fixture.State.CreateJsonResponse(begin, exitCode, Array.Empty<string>());
+
+        Assert(exitCode == 0 && response.State == "ERROR" && response.MaintenanceReady,
+            "a safe maintenance window must remain lease-reacquirable after persisted profile validation error");
+        Assert(response.ActiveTests == 1 && response.LeaseState == "HELD" &&
+            !string.IsNullOrWhiteSpace(response.LeaseId),
+            "profile-error maintenance recovery must return a usable replacement lease");
+        Assert(fixture.Adapter.LaunchCalls == 0,
+            "profile-error maintenance recovery must not launch RimWorld");
+    }
+
     private static void TestFailedProcessRecoveryStop()
     {
         using Fixture fixture = Fixture.FailedWithoutLease();

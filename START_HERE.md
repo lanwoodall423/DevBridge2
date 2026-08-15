@@ -110,12 +110,13 @@ the live-game inspection/control service: its debug actions, screenshots, saves,
 runtime operations are not reimplemented by DevBridge. DevBridge never starts GABS and never gives
 RimBridgeServer an independent lifecycle; direct/standalone RimBridgeServer startup remains supported.
 
-The integration is backward-compatible and off by default. Set `DEVBRIDGE_RIMBRIDGE_MODE` to `off`,
-`optional`, or `required`; set `DEVBRIDGE_PLAYER_LOG` when `Player.log` is not at RimWorld's normal
-user-data location. `required` rejects a missing, ambiguous, or malformed `brrainz.rimbridgeserver`
-package before any `ModsConfig.xml` mutation and makes the same-launch verified endpoint part of
-readiness. `optional` includes the package when it resolves and reports failures without blocking the
-playable-map readiness contract. `off` excludes the package and performs no bridge readiness work.
+The base profile always includes `brrainz.rimbridgeserver`, while endpoint integration is off by
+default. Set `DEVBRIDGE_RIMBRIDGE_MODE` to `off`, `optional`, or `required`; set
+`DEVBRIDGE_PLAYER_LOG` when `Player.log` is not at RimWorld's normal user-data location. Missing,
+ambiguous, or malformed package metadata fails profile resolution before any `ModsConfig.xml` mutation.
+`required` additionally makes the same-launch verified endpoint part of readiness. `optional` reports
+endpoint failures without blocking the playable-map readiness contract; `off` disables endpoint
+integration and performs no bridge readiness work.
 
 Use `DevBridge.cmd bridge status` for token-free human or JSON diagnostics. Use
 `DevBridge.cmd bridge endpoint` only when a credential is intentionally needed; the human command
@@ -150,7 +151,7 @@ another generation.
 
 `Source/BridgeTools/DevBridge2.BridgeTools.csproj` builds an optional RimBridgeServer companion
 assembly. It is not referenced by `Source/Mod/DevBridge2.csproj`, so the core DevBridge2 mod loads
-without RimBridgeServer or its SDK. The companion exposes the read-only authenticated tools
+without the RimBridgeServer SDK. The companion exposes the read-only authenticated tools
 `devbridge/get_generation_context` and `devbridge/get_control_policy`; it is not a second lifecycle
 controller and cannot restart RimWorld, edit `ModsConfig.xml`, or write DevBridge state.
 

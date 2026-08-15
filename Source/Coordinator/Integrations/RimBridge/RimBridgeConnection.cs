@@ -69,7 +69,11 @@ internal sealed class RimBridgeConnection : IDisposable
                 ["bridgeVersion"] = ComponentVersions.CoordinatorHandshakeVersion(),
                 ["platform"] = "RimWorld",
                 ["launchId"] = expectedLaunchId,
-                ["clientInfo"] = "DevBridge-controlled route"
+                ["clientInfo"] = new Dictionary<string, object>
+                {
+                    ["name"] = "DevBridge2.Coordinator",
+                    ["version"] = ComponentVersions.CoordinatorHandshakeVersion()
+                }
             });
             connection.ThrowIfError(welcome.RootElement, "session/hello");
             return connection;

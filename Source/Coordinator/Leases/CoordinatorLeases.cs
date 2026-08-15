@@ -25,7 +25,8 @@ internal sealed partial class CoordinatorState
             bool recoverableFailedProcess = state.Phase == BridgePhase.ERROR &&
                 state.ProcessId > 0 && state.ProcessStartUtcTicks > 0 &&
                 state.ErrorCode != ProcessInspection.ErrorCode;
-            if (state.Phase == BridgePhase.ERROR && !recoverableFailedProcess)
+            if (state.Phase == BridgePhase.ERROR && !recoverableFailedProcess &&
+                !IsConfirmedMaintenanceWindowLocked())
             {
                 emit("RimWorld is in ERROR state: " + state.Error);
                 EmitNextCommand(emit, "DevBridge.cmd doctor");
@@ -59,7 +60,7 @@ internal sealed partial class CoordinatorState
             {
                 SynchronizeLocked();
                 PruneStaleLeasesLocked();
-                bool stoppedMaintenance = state.Phase == BridgePhase.STOPPED && state.MaintenanceReady;
+                bool stoppedMaintenance = IsConfirmedMaintenanceWindowLocked();
                 bool failedProcess = state.Phase == BridgePhase.ERROR && !state.MaintenanceReady &&
                     state.ProcessId > 0 && state.ProcessStartUtcTicks > 0 &&
                     state.ErrorCode != ProcessInspection.ErrorCode;

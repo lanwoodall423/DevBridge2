@@ -172,50 +172,26 @@ internal static class RimBridgeProfilePolicy
         if (installed == null || !installed.TryGetValue(RimBridgeIntegrationConstants.PackageId,
                 out List<InstalledModMetadata> candidates) || candidates.Count == 0)
         {
-            if (mode == RimBridgeMode.Required)
-                throw new ProfileException("RIMBRIDGE_NOT_INSTALLED",
-                    "RimBridgeServer package " + RimBridgeIntegrationConstants.PackageId +
-                    " is required but was not found in the configured mod roots.");
-
-            return new RimBridgeProfileDecision
-            {
-                Mode = mode,
-                ErrorCode = "RIMBRIDGE_NOT_INSTALLED",
-                Error = "RimBridgeServer is optional but was not found; continuing without it."
-            };
+            throw new ProfileException("RIMBRIDGE_NOT_INSTALLED",
+                "RimBridgeServer package " + RimBridgeIntegrationConstants.PackageId +
+                " is required by the base profile but was not found in the configured mod roots.");
         }
 
         if (candidates.Count > 1)
         {
             string detail = string.Join("; ", candidates.Select(value => value.DirectoryPath)
                 .OrderBy(value => value, StringComparer.OrdinalIgnoreCase));
-            if (mode == RimBridgeMode.Required)
-                throw new ProfileException("RIMBRIDGE_AMBIGUOUS_PACKAGE",
-                    "RimBridgeServer package " + RimBridgeIntegrationConstants.PackageId +
-                    " is ambiguous; installed candidates are: " + detail + ".");
-
-            return new RimBridgeProfileDecision
-            {
-                Mode = mode,
-                ErrorCode = "RIMBRIDGE_AMBIGUOUS_PACKAGE",
-                Error = "RimBridgeServer is optional but ambiguous; continuing without it. Candidates: " + detail
-            };
+            throw new ProfileException("RIMBRIDGE_AMBIGUOUS_PACKAGE",
+                "RimBridgeServer package " + RimBridgeIntegrationConstants.PackageId +
+                " is ambiguous; installed candidates are: " + detail + ".");
         }
 
         InstalledModMetadata metadata = candidates[0];
         if (!string.IsNullOrWhiteSpace(metadata.MetadataError))
         {
-            if (mode == RimBridgeMode.Required)
-                throw new ProfileException("RIMBRIDGE_MALFORMED_METADATA",
-                    "RimBridgeServer metadata is malformed at " + metadata.DirectoryPath + ": " +
-                    metadata.MetadataError);
-
-            return new RimBridgeProfileDecision
-            {
-                Mode = mode,
-                ErrorCode = "RIMBRIDGE_MALFORMED_METADATA",
-                Error = "RimBridgeServer is optional but its metadata is malformed; continuing without it."
-            };
+            throw new ProfileException("RIMBRIDGE_MALFORMED_METADATA",
+                "RimBridgeServer metadata is malformed at " + metadata.DirectoryPath + ": " +
+                metadata.MetadataError);
         }
 
         return new RimBridgeProfileDecision
@@ -278,6 +254,9 @@ internal static class RimBridgeLogDiscovery
     private static readonly Regex FailureLine = new(
         @"\[RimBridge\].*(Failed to start server|STARTUP_INIT_FAILURE|startup failure)",
         RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+    private static readonly Regex RimWorldStartupLine = new(
+        @"^\s*RimWorld\s+\d+\.\d+",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
 
     internal static RimBridgeLogBoundary CaptureBoundary(string path, DateTime capturedUtc)
     {
@@ -337,6 +316,7 @@ internal static class RimBridgeLogDiscovery
                 return new RimBridgeLogDiscoveryResult();
 
             FileInfo info = new(boundary.Path);
+            bool scanFromBeginning = !boundary.Existed;
             if (boundary.Existed &&
                 (info.Length < boundary.Length ||
                  (boundary.CreationUtcTicks > 0 && info.CreationTimeUtc.Ticks > 0 &&
@@ -345,21 +325,32 @@ internal static class RimBridgeLogDiscovery
                  !string.Equals(ReadPrefixHash(boundary.Path, boundary.Length),
                      boundary.PrefixHash, StringComparison.Ordinal)))
             {
-                // A truncation/rotation destroys the append-only attribution boundary. Do
-                // not scan from byte zero, because that could accept an older token. The
-                // prefix and creation identity also catch rotations that produce a larger
-                // replacement file.
-                return new RimBridgeLogDiscoveryResult
+                // RimWorld truncates Player.log during a normal launch. A genuinely
+                // shortened log that contains the fresh process startup marker can be
+                // safely rebased; arbitrary or larger replacements still destroy the
+                // append-only attribution boundary and remain fail-closed.
+                bool hasStartupMarker = HasRimWorldStartupMarker(boundary.Path);
+                if (hasStartupMarker)
+                    scanFromBeginning = true;
+                else if (info.Length < boundary.Length)
+                    // The file is in the normal pre-marker truncation window. Keep
+                    // polling instead of converting a transient state into a terminal
+                    // required-mode failure.
+                    return new RimBridgeLogDiscoveryResult();
+                else
                 {
-                    BoundaryInvalid = true,
-                    ErrorCode = RimBridgeIntegrationConstants.EndpointNotFoundCode,
-                    Error = "Player.log was truncated or rotated after the launch boundary; stale bridge output was ignored."
-                };
+                    return new RimBridgeLogDiscoveryResult
+                    {
+                        BoundaryInvalid = true,
+                        ErrorCode = RimBridgeIntegrationConstants.EndpointNotFoundCode,
+                        Error = "Player.log was truncated or rotated after the launch boundary; stale bridge output was ignored."
+                    };
+                }
             }
 
             using FileStream stream = new(boundary.Path, FileMode.Open, FileAccess.Read,
                 FileShare.ReadWrite | FileShare.Delete);
-            if (boundary.Existed)
+            if (!scanFromBeginning)
                 stream.Seek(boundary.Length, SeekOrigin.Begin);
             using StreamReader reader = new(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
 
@@ -456,6 +447,21 @@ internal static class RimBridgeLogDiscovery
         }
 
         return Convert.ToHexString(SHA256.HashData(buffer.AsSpan(0, read)));
+    }
+
+    private static bool HasRimWorldStartupMarker(string path)
+    {
+        using FileStream stream = new(path, FileMode.Open, FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete);
+        using StreamReader reader = new(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+        string line;
+        while ((line = reader.ReadLine()) != null)
+        {
+            if (RimWorldStartupLine.IsMatch(line))
+                return true;
+        }
+
+        return false;
     }
 }
 

@@ -46,6 +46,7 @@ internal static partial class OfflineTests
         Run("connected lease sessions heartbeat active tests", TestConnectedLeaseSession);
         Run("stopped lease sessions expire without an orphan heartbeat", TestStoppedLeaseSessionExpires);
         Run("lease heartbeats and stable-agent authorization", TestLeaseHeartbeatAndAuthorization);
+        Run("profile-error maintenance windows reacquire a lease", TestMaintenanceLeaseReacquisitionAfterProfileError);
         Run("orphaned leases expire without blocking a restart", TestOrphanLeaseExpiry);
         Run("shared leases block restart until the final lease ends", TestMultipleSharedLeases);
         Run("lease JSON reports exact expiration and retry timing", TestLeaseJsonTiming);
@@ -107,6 +108,7 @@ internal static partial class OfflineTests
         Run("RimBridge route enforces valid shared leases", TestRimBridgeRouteLeaseSafety);
         Run("RimBridge route auth failure invalidates credentials and redacts secrets", TestRimBridgeRouteAuthRedaction);
         Run("RimBridge route is disabled or unavailable fail closed", TestRimBridgeRouteUnavailableModes);
+        Run("RimBridge hello sends structured client information", TestRimBridgeWireClientInfo);
         Run("RimBridge client maps wire auth, tool, and timeout failures", TestRimBridgeWireFailures);
         Run("DevBridge core mod remains SDK-free", TestCoreModRemainsSdkFree);
         Run("baseline profile excludes managed projects and load-them-last", TestBaselineProfile);

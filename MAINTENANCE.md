@@ -36,10 +36,11 @@ run GABS or delegate lifecycle ownership to it, and RimBridgeServer may still be
 standalone mode.
 
 Integration is configured with `DEVBRIDGE_RIMBRIDGE_MODE=off|optional|required` (default `off`) and,
-if needed, `DEVBRIDGE_PLAYER_LOG=<path>`. Required mode resolves
-`brrainz.rimbridgeserver` before writing ModsConfig and requires a same-launch endpoint; optional mode
-keeps the bridge failure visible without blocking ordinary playable-map readiness; off mode excludes
-the package. Inspect with `DevBridge.cmd bridge status`. Obtain credentials only with the explicit
+if needed, `DEVBRIDGE_PLAYER_LOG=<path>`. The base profile always resolves
+`brrainz.rimbridgeserver` before writing ModsConfig; missing, ambiguous, or malformed metadata fails
+profile resolution. Required mode additionally requires a same-launch endpoint; optional mode keeps
+endpoint failures visible without blocking ordinary playable-map readiness; off mode disables DevBridge's
+endpoint integration. Inspect with `DevBridge.cmd bridge status`. Obtain credentials only with the explicit
 `DevBridge.cmd bridge endpoint` command (or its dedicated JSON response); ordinary status and persisted
 integration metadata never include the token. The endpoint is discarded whenever process identity,
 launch, generation, stop, restart, or maintenance identity changes. Player.log parsing starts after a
@@ -147,8 +148,9 @@ ModsConfig bytes as the durable baseline. `mods capture-baseline` remains an exp
 for intentionally changing that baseline while RimWorld is stopped and no lease or restart is active.
 
 Aliases are `deferred-reality`, `insight-canvas`, `knowledge-framework`, `frontier`, `aquaculture`,
-`horticulture`, and `wildlife`. Every managed profile always includes the baseline tooling and
-`lan.devbridge2`, then adds requested roots and their full transitive dependency closure. Installed
+`horticulture`, and `wildlife`. Every managed profile always includes the baseline tooling,
+`lan.devbridge2`, and `brrainz.rimbridgeserver`, then adds requested roots and their full transitive
+dependency closure. Installed
 `About.xml` metadata supplies dependency and load-order constraints. Dependencies precede dependents,
 shared dependencies are deduplicated, and missing, ambiguous, malformed, or cyclic graphs fail before
 any config write or launch. `ferny.loadthemlast` is never added.

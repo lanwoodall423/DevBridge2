@@ -388,10 +388,14 @@ internal static class CoordinatorServer
         if (!ownsMutex)
             return 0;
 
+        CoordinatorOptions production = CoordinatorOptions.ForProduction();
         CoordinatorState state = new(root, new CoordinatorOptions
         {
             CoordinatorRoot = root,
-            RuntimeSlotId = slot
+            RuntimeSlotId = slot,
+            ReadinessTimeout = production.ReadinessTimeout,
+            RimBridgeMode = production.RimBridgeMode,
+            PlayerLogPath = production.PlayerLogPath
         });
         state.StartRecoveryWork();
 
@@ -1426,7 +1430,8 @@ internal static class ModProfileResolver
         DevBridgePackageId,
         "mlie.dingongameloaded",
         "dubwise.dubsperformanceanalyzer.steam",
-        "astryl.moderndevtools"
+        "astryl.moderndevtools",
+        RimBridgeIntegrationConstants.PackageId
     };
 
     private static readonly IReadOnlyDictionary<string, string> ProjectAliases =
@@ -1488,7 +1493,6 @@ internal static class ModProfileResolver
         Dictionary<string, List<InstalledModMetadata>> installed = Discover(coordinatorRoot, configuredRoots);
         RimBridgeProfileDecision rimBridge = RimBridgeProfilePolicy.Decide(rimBridgeMode, installed);
         List<string> roots = AlwaysOnPackageIds
-            .Concat(rimBridge.Included ? new[] { RimBridgeIntegrationConstants.PackageId } : Array.Empty<string>())
             .Concat(requestedPackageIds)
             .ToList();
         Dictionary<string, InstalledModMetadata> resolved = new(StringComparer.OrdinalIgnoreCase);
@@ -1584,7 +1588,7 @@ internal static class ModProfileResolver
                 reasons.Add(new ProfileModReason
                 {
                     Category = "OTHER_REQUIRED_BASELINE",
-                    Detail = "Included by the selected RimBridge policy."
+                    Detail = "Required by the base profile; endpoint participation follows the selected RimBridge policy."
                 });
             if (requestedPackageIds.Any(value => string.Equals(value, packageId, StringComparison.OrdinalIgnoreCase)))
                 reasons.Add(new ProfileModReason
@@ -1732,9 +1736,7 @@ internal static class ModProfileResolver
                 : Discover(coordinatorRoot, configuredRoots);
         RimBridgeProfileDecision rimBridge = RimBridgeProfilePolicy.Decide(rimBridgeMode, installed);
         TestInputSet testInputs = TestGenerationInputs.Normalize(testInputAssignments, ModProfile.BaselineMode);
-        List<string> resolvedMods = AlwaysOnPackageIds
-            .Concat(rimBridge.Included ? new[] { RimBridgeIntegrationConstants.PackageId } : Array.Empty<string>())
-            .ToList();
+        List<string> resolvedMods = AlwaysOnPackageIds.ToList();
         ModProfile profile = new()
         {
             Mode = ModProfile.BaselineMode,
@@ -1802,14 +1804,6 @@ internal static class ModProfileResolver
                     "The accepted profile is missing required tooling package " + required + ".");
         }
 
-        bool hasRimBridge = seen.Contains(RimBridgeIntegrationConstants.PackageId);
-        if (profile.RimBridgeMode == RimBridgeMode.Required && !hasRimBridge)
-            throw new ProfileException("RIMBRIDGE_NOT_INSTALLED",
-                "The required RimBridgeServer package is missing from the accepted profile.");
-        if (profile.RimBridgeMode == RimBridgeMode.Off && hasRimBridge)
-            throw new ProfileException("PROFILE_INVALID_STATE",
-                "The accepted profile includes RimBridgeServer while RimBridge mode is off.");
-
         if (string.IsNullOrWhiteSpace(profile.ProfileFingerprint))
             throw new ProfileException("PROFILE_INVALID_STATE", "The accepted profile has no fingerprint.");
         string expectedFingerprint = Fingerprint(profile.Mode, profile.BaselineFingerprint,
@@ -1854,8 +1848,8 @@ internal static class ModProfileResolver
         IReadOnlyList<string> semanticInputs = TestGenerationInputs.SemanticFingerprintEntries(testInputs);
         if (semanticInputs.Count > 0)
             parts.Add("testInputs=" + string.Join(",", semanticInputs));
-        // Keep the historical off fingerprint byte-for-byte compatible. Non-off modes
-        // must still change the profile identity even when optional RimBridge is absent.
+        // Non-off modes must still change the profile identity even though RimBridgeServer
+        // is present in every base profile.
         if (rimBridgeMode != RimBridgeMode.Off)
             parts.Add("rimbridge=" + RimBridgeModes.Text(rimBridgeMode) + ":" +
                 (resolvedMods.Any(value => string.Equals(value,

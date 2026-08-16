@@ -110,6 +110,11 @@ internal static partial class OfflineTests
         Run("RimBridge route is disabled or unavailable fail closed", TestRimBridgeRouteUnavailableModes);
         Run("RimBridge hello sends structured client information", TestRimBridgeWireClientInfo);
         Run("RimBridge client maps wire auth, tool, and timeout failures", TestRimBridgeWireFailures);
+        Run("RimBridge GABP compatibility contract is centralized", TestRimBridgeProtocolCompatibilityContract);
+        Run("RimBridge GABP typed protocol fixtures are stable", TestRimBridgeProtocolTypedFixtures);
+        Run("RimBridge GABP wire fixtures reject drift", TestRimBridgeProtocolWireFixtures);
+        Run("RimBridge GABP framing rejects malformed messages", TestRimBridgeProtocolFramingFailures);
+        Run("RimBridge companion authentication failures stay bounded", TestRimBridgeProtocolCompanionFailures);
         Run("DevBridge core mod remains SDK-free", TestCoreModRemainsSdkFree);
         Run("BridgeTools companion project and publish contract", TestBridgeToolsPublishContract);
         Run("BridgeTools publishing refreshes stale deployment output", TestBridgeToolsPublishRefreshesStaleDll);
@@ -166,13 +171,40 @@ internal static partial class OfflineTests
         Run("structured recovery guidance is safe and parameterized", TestStructuredRecoveryGuidance);
         Run("wrapper propagates native exit codes", DevBridgeWrapperTests.Run);
         Run("named-pipe stop completes the originating client", TestNamedPipeStopCompletesClient);
-        Run("named-pipe JSON stop completes with one terminal marker", TestNamedPipeJsonStopCompletesClient);
+        Run("named-pipe JSON stop completes with one terminal result", TestNamedPipeJsonStopCompletesClient);
         Run("coordinator shutdown responds before exit", TestCoordinatorShutdownRespondsBeforeExit);
         Run("coordinator shutdown reacquires mutex and pipe", TestCoordinatorShutdownReacquiresMutexAndPipe);
         Run("coordinator reloads current environment and executable", TestCoordinatorShutdownReloadsCurrentEnvironmentAndExecutable);
+        Run("versioned IPC requestId and terminal result contract", TestVersionedIpcRequestIdAndTerminalResult);
+        Run("versioned IPC events precede exactly one result", TestVersionedIpcEventsAndSingleResult);
+        Run("versioned IPC preserves long-running session semantics", TestVersionedIpcLongRunningSession);
+        Run("versioned IPC JSON and human clients remain supported", TestVersionedIpcJsonAndHumanClients);
+        Run("versioned IPC malformed requests fail boundedly", TestVersionedIpcMalformedRequest);
+        Run("versioned IPC rejects unsupported protocol versions", TestVersionedIpcUnsupportedProtocol);
+        Run("versioned IPC rejects mismatched response correlation", TestVersionedIpcMismatchedRequestId);
+        Run("versioned IPC rejects server disconnect before result", TestVersionedIpcDisconnectBeforeResult);
+        Run("versioned IPC duplicate terminal results are rejected deterministically", TestVersionedIpcDuplicateResult);
+        Run("coordinator build identity is exact and revision-distinguishable", TestCoordinatorBuildIdentity);
+        Run("coordinator pipe trust boundary and IPC limits", TestCoordinatorPipeTrustBoundaryAndLimits);
+        Run("oversized and malformed IPC requests are mutation-free", TestOversizedAndMalformedRequestsAreMutationFree);
+        Run("runtime namespace identities are canonical and collision-resistant", TestRuntimeNamespaceInvariants);
+        Run("durable identifiers are widened with safe legacy handling", TestIdentifierStrengthAndLegacyCompatibility);
+        Run("two coordinators cannot own one runtime slot", TestTwoCoordinatorsCannotOwnSameSlot);
         Run("finite commands have bounded terminal responses", TestFiniteCommandsHaveBoundedTerminalResponses);
         Run("durable wait response policy remains unbounded", TestDurableWaitResponsePolicyRemainsUnbounded);
         Run("simultaneous shutdown clients are bounded and durable", TestSimultaneousShutdownClientsAreBoundedAndDurable);
+        Run("coordinator trace lifecycle events are ordered", TestCoordinatorTraceLifecycleOrder);
+        Run("coordinator trace separates STOPPED persistence from result", TestCoordinatorTraceSeparatesStoppedPersistenceFromResult);
+        Run("coordinator trace is secret-safe and bounded", TestCoordinatorTraceSecretSafetyAndBounds);
+        Run("coordinator trace rotation is bounded", TestCoordinatorTraceRotation);
+        Run("diagnostic write failure is non-fatal and has no unsafe fallback", TestCoordinatorTraceWriteFailureIsNonFatal);
+        Run("concurrent requests retain distinguishable trace correlation", TestCoordinatorTraceConcurrentRequestCorrelation);
+        Run("fault injection covers durable lifecycle boundaries", TestFaultInjectionDurableStateBoundaries);
+        Run("fault injection covers launch boundaries", TestFaultInjectionLaunchBoundaries);
+        Run("fault injection covers ensure-ready boundaries", TestFaultInjectionEnsureReadyBoundary);
+        Run("fault injection covers IPC and shutdown boundaries", TestFaultInjectionIpcAndShutdownBoundaries);
+        Run("fault injection covers artifacts and recovery", TestFaultInjectionArtifactAndRecoveryBoundaries);
+        Run("deterministic coordinator state-machine sequences", TestDeterministicCoordinatorStateMachine);
 
         Console.WriteLine(failures == 0 ? "OFFLINE TESTS PASS" : "OFFLINE TESTS FAIL: " + failures);
         return failures == 0 ? 0 : 1;
@@ -265,6 +297,7 @@ internal static partial class OfflineTests
         internal IRimBridgeClient RouteClient { get; set; }
         internal IRimBridgeGenerationVerifier RouteVerifier { get; set; }
         internal Action BeforeModsConfigWrite { get; set; }
+        internal ICoordinatorFaultInjector FaultInjector { get; set; }
 
         internal Fixture(PersistedState initial)
         {
@@ -456,7 +489,8 @@ internal static partial class OfflineTests
                 PlayerLogPath = PlayerLogPath ?? Path.Combine(Root, "Player.log"),
                 RimBridgeClient = RouteClient,
                 RimBridgeGenerationVerifier = RouteVerifier,
-                BeforeModsConfigWrite = BeforeModsConfigWrite
+                BeforeModsConfigWrite = BeforeModsConfigWrite,
+                FaultInjector = FaultInjector
             });
         }
 

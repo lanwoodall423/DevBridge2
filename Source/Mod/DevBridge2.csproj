@@ -18,9 +18,9 @@
     <OutputPath Condition="'$(OutputPath)' == ''">$(MSBuildThisFileDirectory)..\..\1.6\Assemblies\</OutputPath>
   </PropertyGroup>
   <ItemGroup>
-    <Compile Include="..\Coordinator\State\DevBridgeSchemaVersions.cs" Link="DevBridgeSchemaVersions.cs" />
-    <Compile Include="..\Coordinator\QuicktestActivationCore.cs" Link="QuicktestActivationCore.cs" />
-    <Compile Include="..\Coordinator\QuicktestFailureArtifact.cs" Link="QuicktestFailureArtifact.cs" />
+    <Compile Include="..\Coordinator.Core\State\DevBridgeSchemaVersions.cs" Link="DevBridgeSchemaVersions.cs" />
+    <Compile Include="..\Coordinator.Core\QuicktestActivationCore.cs" Link="QuicktestActivationCore.cs" />
+    <Compile Include="..\Coordinator.Core\QuicktestFailureArtifact.cs" Link="QuicktestFailureArtifact.cs" />
     <Reference Include="Assembly-CSharp">
       <HintPath>$(RimWorldManagedDir)\Assembly-CSharp.dll</HintPath>
       <Private>false</Private>

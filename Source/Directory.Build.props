@@ -2,6 +2,7 @@
   <PropertyGroup>
     <!-- Product version source of truth for all buildable DevBridge components. -->
     <DevBridgeProductVersion>1.2.4</DevBridgeProductVersion>
-    <DevBridgeAssemblyVersion>1.2.4.0</DevBridgeAssemblyVersion>
+    <DevBridgeAssemblyVersion>$(DevBridgeProductVersion).0</DevBridgeAssemblyVersion>
+    <Deterministic>true</Deterministic>
   </PropertyGroup>
 </Project>

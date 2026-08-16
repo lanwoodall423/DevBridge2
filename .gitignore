@@ -8,3 +8,7 @@ BridgeTools/*
 !1.6/Assemblies/.gitkeep
 Source/**/bin/
 Source/**/obj/
+artifacts/
+
+# Generated coordinator build/publish staging; keep build products out of source control.
+Coordinator_build/

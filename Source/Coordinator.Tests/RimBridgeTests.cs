@@ -721,11 +721,12 @@ internal static partial class OfflineTests
 
     private static void TestDevBridgeGenerationContext()
     {
+        string productVersion = ComponentVersions.Current.ModVersion;
         string root = Path.Combine(Path.GetTempPath(), "DevBridge2-generation-context-" +
             Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(Path.Combine(root, "About"));
         File.WriteAllText(Path.Combine(root, "About", "About.xml"),
-            "<ModMetaData><modVersion>1.2.4</modVersion></ModMetaData>");
+            "<ModMetaData><modVersion>" + productVersion + "</modVersion></ModMetaData>");
         try
         {
             Dictionary<string, string> environment = new(StringComparer.OrdinalIgnoreCase)
@@ -746,7 +747,7 @@ internal static partial class OfflineTests
             string toolJson = Encoding.UTF8.GetString(toolStream.ToArray());
             Assert(context.Success && context.Available && context.LaunchId == "launch-context" &&
                    context.Generation == 17 && context.ProcessId == 700 &&
-                   context.ProcessStartUtcTicks == 800 && context.DevBridge2ModVersion == "1.2.4" &&
+                   context.ProcessStartUtcTicks == 800 && context.DevBridge2ModVersion == productVersion &&
                    context.RimBridgeIntegrationSchemaVersion == "rimbridge-integration/v1" &&
                    json.Contains("profile-hash", StringComparison.Ordinal) &&
                    toolJson.Contains("\"launchId\"", StringComparison.Ordinal) &&
@@ -855,15 +856,15 @@ internal static partial class OfflineTests
             {
                 using TcpClient client = listener.AcceptTcpClient();
                 using NetworkStream stream = client.GetStream();
-                ReadTestFrame(stream);
+                string helloId = FrameId(ReadTestFrame(stream));
                 WriteTestFrame(stream, new
                 {
                     v = "gabp/1",
                     type = "response",
-                    id = "hello",
+                    id = helloId,
                     result = new { agentId = "test-agent" }
                 });
-                ReadTestFrame(stream);
+                string contextId = FrameId(ReadTestFrame(stream));
                 Dictionary<string, object> context = pascalCase
                     ? new Dictionary<string, object>
                     {
@@ -889,7 +890,7 @@ internal static partial class OfflineTests
                 {
                     v = "gabp/1",
                     type = "response",
-                    id = "context",
+                    id = contextId,
                     result = context
                 });
             }

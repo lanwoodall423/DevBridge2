@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using DevBridge2;
 
 namespace DevBridge.Coordinator;
@@ -9,10 +10,11 @@ internal static partial class OfflineTests
     private static void TestComponentVersionsAndSchemas()
     {
         ComponentVersionReport report = ComponentVersions.Current;
+        string expectedVersion = report.CoordinatorVersion;
         Assert(report.CliWrapperVersion == null &&
-               report.CoordinatorVersion == "1.2.4" &&
-               report.ModVersion == "1.2.4" &&
-               report.BridgeToolsVersion == "1.2.4" &&
+               !string.IsNullOrWhiteSpace(expectedVersion) &&
+               report.ModVersion == expectedVersion &&
+               report.BridgeToolsVersion == expectedVersion &&
                report.RuntimeStateSchema == "devbridge-runtime-state/v1" &&
                report.ReadinessSchema == "devbridge-readiness/v1" &&
                report.GeneratedModsConfigSchema == "devbridge-generated-mods-config/v1" &&
@@ -25,11 +27,14 @@ internal static partial class OfflineTests
         string coordinator = ReadWorkspaceFile(Path.Combine("Source", "Coordinator", "DevBridge.Coordinator.csproj"));
         string mod = ReadWorkspaceFile(Path.Combine("Source", "Mod", "DevBridge2.csproj"));
         string bridgeTools = ReadWorkspaceFile(Path.Combine("Source", "BridgeTools", "DevBridge2.BridgeTools.csproj"));
-        string handshake = ReadWorkspaceFile(Path.Combine("Source", "Coordinator", "Integrations", "RimBridge", "RimBridgeConnection.cs"));
+        string handshake = ReadWorkspaceFile(Path.Combine("Source", "Coordinator.Core", "Integrations", "RimBridge", "RimBridgeConnection.cs"));
 
-        Assert(about.Contains("<modVersion>1.2.4</modVersion>", StringComparison.Ordinal) &&
-               changelog.Contains("## 1.2.4", StringComparison.Ordinal) &&
-               props.Contains("<DevBridgeProductVersion>1.2.4</DevBridgeProductVersion>", StringComparison.Ordinal) &&
+        Match aboutVersion = Regex.Match(about, "<modVersion>([^<]+)</modVersion>",
+            RegexOptions.CultureInvariant);
+        Assert(aboutVersion.Success && aboutVersion.Groups[1].Value == expectedVersion &&
+               changelog.Contains("## " + expectedVersion, StringComparison.Ordinal) &&
+               props.Contains("<DevBridgeProductVersion>" + expectedVersion +
+                   "</DevBridgeProductVersion>", StringComparison.Ordinal) &&
                coordinator.Contains("$(DevBridgeProductVersion)", StringComparison.Ordinal) &&
                mod.Contains("$(DevBridgeProductVersion)", StringComparison.Ordinal) &&
                mod.Contains("<GenerateAssemblyInfo>true</GenerateAssemblyInfo>", StringComparison.Ordinal) &&

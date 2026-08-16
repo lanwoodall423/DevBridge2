@@ -1,0 +1,57 @@
+{
+  "contractVersion": 1,
+  "gabp": {
+    "major": 1,
+    "envelopeVersion": "gabp/1",
+    "transport": "TCP loopback with LSP-style Content-Length framing",
+    "requestEnvelope": ["v", "type", "id", "method", "params"],
+    "responseEnvelope": ["v", "type", "id", "result|error"]
+  },
+  "rimBridgeServer": {
+    "testedVersions": [],
+    "supportStatement": "GABP-1 contract verified by offline fixtures; no live RimBridgeServer version is claimed",
+    "liveSmokeTest": "required before claiming a host version"
+  },
+  "bridgeTools": {
+    "sdkPackage": "RimBridgeServer.Sdk",
+    "sdkPackageVersion": "2.0.0",
+    "compileTested": true,
+    "runtimeAssemblyBundled": false,
+    "hostSdkOverrideSupported": true
+  },
+  "sessionHello": {
+    "method": "session/hello",
+    "requiredParams": ["token", "bridgeVersion", "platform", "launchId"],
+    "optionalParams": ["clientInfo"],
+    "clientInfoShape": {"name": "string", "version": "string"},
+    "success": "response.result",
+    "authenticationError": -31000
+  },
+  "toolsList": {
+    "method": "tools/list",
+    "params": {},
+    "resultShape": {"tools": "array of tool descriptors"},
+    "toolDescriptorFields": ["name", "description", "inputSchema", "outputSchema"]
+  },
+  "toolsCall": {
+    "method": "tools/call",
+    "requiredParams": ["name", "arguments"],
+    "argumentsShape": "JSON object",
+    "success": "response.result",
+    "invalidArgumentsError": -32602,
+    "methodNotFoundError": -32601,
+    "toolNotFoundError": -31002
+  },
+  "errorMapping": {
+    "-31000": "RIMBRIDGE_AUTH_FAILED",
+    "-31002": "RIMBRIDGE_TOOL_NOT_FOUND",
+    "-32601": "RIMBRIDGE_TOOL_NOT_FOUND for tools/call; protocol error otherwise",
+    "-32602": "RIMBRIDGE_INVALID_ARGUMENTS"
+  },
+  "companion": {
+    "optional": true,
+    "unavailableIsNonFatal": true,
+    "generationContextTool": "devbridge/get_generation_context",
+    "authenticationFailureIsFatalForVerification": true
+  }
+}

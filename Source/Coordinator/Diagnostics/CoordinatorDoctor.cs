@@ -163,6 +163,7 @@ internal sealed partial class CoordinatorState
         string bridgeToolsPath = FindBridgeToolsAssembly();
         versions.BridgeToolsVersion = AssemblyVersion(bridgeToolsPath) ??
             (bridgeToolsPath == null ? "not-deployed" : "unknown");
+        versions.BridgeToolsPath = bridgeToolsPath;
         report.Components = versions;
 
         if (string.Equals(versions.CoordinatorVersion, "unknown", StringComparison.Ordinal))
@@ -212,17 +213,56 @@ internal sealed partial class CoordinatorState
 
         if (bridgeToolsPath == null)
         {
-            report.AddFinding(DoctorSeverities.Info, "BRIDGETOOLS_NOT_DEPLOYED",
-                "The optional BridgeTools companion is not deployed in a checked location.", "Compatibility");
+            string modLocalBridgeToolsPath = FindModLocalBridgeToolsAssembly();
+            string sourceBridgeToolsPath = FindSourceBridgeToolsAssembly();
+            if (modLocalBridgeToolsPath != null)
+            {
+                report.AddFinding(DoctorSeverities.Warning, "BRIDGETOOLS_WRONG_LOCATION",
+                    "The BridgeTools companion is nested inside the mod; RimBridgeServer discovers the sibling global BridgeTools bundle.",
+                    "Compatibility", new Dictionary<string, string>(StringComparer.Ordinal)
+                    {
+                        ["expectedPath"] = ExpectedBridgeToolsAssemblyPath(),
+                        ["wrongLocationPath"] = modLocalBridgeToolsPath
+                    });
+            }
+            else if (sourceBridgeToolsPath != null)
+            {
+                report.AddFinding(DoctorSeverities.Warning, "BRIDGETOOLS_WRONG_LOCATION",
+                    "The BridgeTools companion exists only in a source build output; RimBridgeServer discovers the sibling global BridgeTools bundle.",
+                    "Compatibility", new Dictionary<string, string>(StringComparer.Ordinal)
+                    {
+                        ["expectedPath"] = ExpectedBridgeToolsAssemblyPath(),
+                        ["sourceBuildPath"] = sourceBridgeToolsPath
+                    });
+            }
+            else
+            {
+                report.AddFinding(DoctorSeverities.Info, "BRIDGETOOLS_ASSEMBLY_NOT_DISCOVERED",
+                    "The optional BridgeTools companion assembly was not found in the sibling global BridgeTools bundle.",
+                    "Compatibility", new Dictionary<string, string>(StringComparer.Ordinal)
+                    {
+                        ["expectedPath"] = ExpectedBridgeToolsAssemblyPath()
+                    });
+            }
+        }
+        else if (versions.BridgeToolsVersion == "unknown")
+        {
+            report.AddFinding(DoctorSeverities.Error, "BRIDGETOOLS_LOAD_FAILED",
+                "The deployed BridgeTools companion assembly could not be read for compatibility inspection.",
+                "Compatibility", new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["path"] = bridgeToolsPath
+                });
         }
         else if (!string.Equals(versions.BridgeToolsVersion, versions.CoordinatorVersion, StringComparison.Ordinal))
         {
-            report.AddFinding(DoctorSeverities.Warning, "COMPONENT_VERSION_SKEW",
+            report.AddFinding(DoctorSeverities.Warning, "BRIDGETOOLS_STALE_BINARY",
                 "The optional BridgeTools companion has a different product version.", "Compatibility",
                 new Dictionary<string, string>(StringComparer.Ordinal)
                 {
                     ["coordinatorVersion"] = versions.CoordinatorVersion,
-                    ["bridgeToolsVersion"] = versions.BridgeToolsVersion
+                    ["bridgeToolsVersion"] = versions.BridgeToolsVersion,
+                    ["path"] = bridgeToolsPath
                 });
         }
 
@@ -1276,9 +1316,31 @@ internal sealed partial class CoordinatorState
 
     private string FindBridgeToolsAssembly()
     {
+        string deployedPath = ExpectedBridgeToolsAssemblyPath();
+        return File.Exists(deployedPath) ? deployedPath : null;
+    }
+
+    private string FindModLocalBridgeToolsAssembly()
+    {
+        string modLocalPath = Path.Combine(root, "BridgeTools", "DevBridge2.BridgeTools.dll");
+        return File.Exists(modLocalPath) ? modLocalPath : null;
+    }
+
+    private string ExpectedBridgeToolsAssemblyPath()
+    {
+        DirectoryInfo modRoot = new(root);
+        DirectoryInfo modsRoot = modRoot.Parent;
+        DirectoryInfo rimWorldRoot = modsRoot?.Parent;
+        if (rimWorldRoot == null || !string.Equals(modsRoot.Name, "Mods", StringComparison.OrdinalIgnoreCase))
+            return Path.Combine(root, "..", "..", "BridgeTools", modRoot.Name, "DevBridge2.BridgeTools.dll");
+
+        return Path.Combine(rimWorldRoot.FullName, "BridgeTools", modRoot.Name, "DevBridge2.BridgeTools.dll");
+    }
+
+    private string FindSourceBridgeToolsAssembly()
+    {
         string[] candidates =
         {
-            Path.Combine(root, "BridgeTools", "DevBridge2.BridgeTools.dll"),
             Path.Combine(root, "Source", "BridgeTools", "bin", "Release", "DevBridge2.BridgeTools.dll"),
             Path.Combine(root, "Source", "BridgeTools", "bin", "Debug", "DevBridge2.BridgeTools.dll")
         };

@@ -19,6 +19,7 @@ internal sealed partial class CoordinatorState
     {
         bool doctorCommand = string.Equals(request.Command, "doctor", StringComparison.OrdinalIgnoreCase);
         bool historyCommand = string.Equals(request.Command, "history", StringComparison.OrdinalIgnoreCase);
+        bool coordinatorControl = string.Equals(request.Command, "coordinator", StringComparison.OrdinalIgnoreCase);
         bool projectResolveCommand = IsProjectResolveCommand(request);
         if (doctorCommand && request.DoctorAudit == null)
             request.DoctorAudit = RunDoctorAudit(request);
@@ -38,6 +39,8 @@ internal sealed partial class CoordinatorState
                 snapshot = CloneStateLocked();
             else if (projectResolveCommand)
                 snapshot = CloneStateLocked();
+            else if (coordinatorControl)
+                snapshot = CloneStateLocked();
             else if (!statusCommand)
             {
                 SynchronizeLocked();
@@ -49,12 +52,13 @@ internal sealed partial class CoordinatorState
                 PruneProjectIntentsLocked();
                 PruneStaleLeasesLocked();
             }
-            if (!persistedStateLoadBlocked && !(doctorCommand && request.DoctorAudit != null) &&
+            if (!coordinatorControl && !persistedStateLoadBlocked && !(doctorCommand && request.DoctorAudit != null) &&
                 !projectResolveCommand)
                 RefreshRimBridgePolicyStateLocked();
             snapshot = CloneStateLocked();
-            snapshot.BaselineFingerprint = ReadBaselineFingerprintLocked() ?? snapshot.BaselineFingerprint;
-            if (!(doctorCommand && request.DoctorAudit != null) && !projectResolveCommand)
+            if (!coordinatorControl)
+                snapshot.BaselineFingerprint = ReadBaselineFingerprintLocked() ?? snapshot.BaselineFingerprint;
+            if (!coordinatorControl && !(doctorCommand && request.DoctorAudit != null) && !projectResolveCommand)
                 snapshot.ModsConfigOwnership = CurrentModsConfigOwnershipLocked();
         }
 
@@ -349,6 +353,9 @@ internal sealed partial class CoordinatorState
         RimBridgeIntegrationState copy = source.Clone();
         copy.Error = DiagnosticRedactor.Text(copy.Error);
         copy.CompanionError = DiagnosticRedactor.Text(copy.CompanionError);
+        copy.CompanionDiagnosticCode = RimBridgeCompanionDiagnostics.Code(copy);
+        copy.CompanionDiagnosticReason = DiagnosticRedactor.Text(
+            RimBridgeCompanionDiagnostics.Reason(copy));
         return copy;
     }
 

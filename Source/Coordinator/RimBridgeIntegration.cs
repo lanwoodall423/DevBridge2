@@ -54,6 +54,76 @@ internal static class RimBridgeIntegrationConstants
     internal const string CompanionUnavailableCode = "RIMBRIDGE_COMPANION_UNAVAILABLE";
     internal const string CompanionContextInvalidCode = "RIMBRIDGE_COMPANION_CONTEXT_INVALID";
     internal const string CompanionIdentityMismatchCode = "RIMBRIDGE_COMPANION_IDENTITY_MISMATCH";
+    internal const string CompanionAssemblyNotDiscoveredDiagnostic = "ASSEMBLY_NOT_DISCOVERED";
+    internal const string CompanionWrongLocationDiagnostic = "WRONG_LOCATION";
+    internal const string CompanionStaleBinaryDiagnostic = "STALE_BINARY";
+    internal const string CompanionLoadFailedDiagnostic = "COMPANION_LOAD_FAILED";
+    internal const string CompanionSdkCompatibilityDiagnostic = "SDK_COMPATIBILITY_FAILURE";
+    internal const string CompanionToolRegistrationDiagnostic = "TOOL_REGISTRATION_FAILED";
+    internal const string CompanionToolNotRegisteredDiagnostic = "TOOL_NOT_REGISTERED";
+    internal const string CompanionToolCallFailedDiagnostic = "TOOL_CALL_FAILED";
+    internal const string CompanionGenerationContextIncompleteDiagnostic = "GENERATION_CONTEXT_INCOMPLETE";
+    internal const string CompanionIdentityMismatchDiagnostic = "IDENTITY_MISMATCH";
+    internal const string CompanionAuthenticationDiagnostic = "AUTHENTICATION_FAILED";
+    internal const string CompanionEndpointUnavailableDiagnostic = "ENDPOINT_UNAVAILABLE";
+}
+
+internal static class RimBridgeCompanionDiagnostics
+{
+    internal static string Code(RimBridgeIntegrationState bridge)
+    {
+        if (bridge == null)
+            return null;
+        if (!string.IsNullOrWhiteSpace(bridge.CompanionDiagnosticCode))
+            return bridge.CompanionDiagnosticCode;
+        if (string.Equals(bridge.CompanionErrorCode, RimBridgeIntegrationConstants.AuthFailedCode,
+                StringComparison.Ordinal))
+            return RimBridgeIntegrationConstants.CompanionAuthenticationDiagnostic;
+        if (string.Equals(bridge.CompanionErrorCode, RimBridgeIntegrationConstants.CompanionIdentityMismatchCode,
+                StringComparison.Ordinal))
+            return RimBridgeIntegrationConstants.CompanionIdentityMismatchDiagnostic;
+        if (string.Equals(bridge.CompanionErrorCode, RimBridgeIntegrationConstants.CompanionContextInvalidCode,
+                StringComparison.Ordinal))
+            return RimBridgeIntegrationConstants.CompanionGenerationContextIncompleteDiagnostic;
+        if (string.Equals(bridge.CompanionErrorCode, RimBridgeIntegrationConstants.CompanionUnavailableCode,
+                StringComparison.Ordinal))
+        {
+            if (Contains(bridge.CompanionError, "not registered"))
+                return RimBridgeIntegrationConstants.CompanionToolNotRegisteredDiagnostic;
+            if (Contains(bridge.CompanionError, "could not be called"))
+                return RimBridgeIntegrationConstants.CompanionToolCallFailedDiagnostic;
+            return RimBridgeIntegrationConstants.CompanionLoadFailedDiagnostic;
+        }
+        return null;
+    }
+
+    internal static string Reason(RimBridgeIntegrationState bridge)
+    {
+        if (bridge == null)
+            return null;
+        if (!string.IsNullOrWhiteSpace(bridge.CompanionDiagnosticReason))
+            return bridge.CompanionDiagnosticReason;
+        return Code(bridge) switch
+        {
+            RimBridgeIntegrationConstants.CompanionToolNotRegisteredDiagnostic =>
+                "The companion tool is not registered.",
+            RimBridgeIntegrationConstants.CompanionToolCallFailedDiagnostic =>
+                "The companion tool call failed.",
+            RimBridgeIntegrationConstants.CompanionAuthenticationDiagnostic =>
+                "RimBridge authentication failed.",
+            RimBridgeIntegrationConstants.CompanionIdentityMismatchDiagnostic =>
+                "Generation context identity does not match coordinator state.",
+            RimBridgeIntegrationConstants.CompanionGenerationContextIncompleteDiagnostic =>
+                "Generation context is incomplete or unsupported.",
+            RimBridgeIntegrationConstants.CompanionLoadFailedDiagnostic =>
+                "Companion verification failed without a more specific host diagnostic.",
+            _ => null
+        };
+    }
+
+    private static bool Contains(string value, string fragment) =>
+        !string.IsNullOrWhiteSpace(value) &&
+        value.IndexOf(fragment, StringComparison.OrdinalIgnoreCase) >= 0;
 }
 
 internal sealed class RimBridgeIntegrationException : Exception
@@ -108,6 +178,8 @@ internal sealed class RimBridgeIntegrationState
     public DateTime? CompanionVerificationTimestampUtc { get; set; }
     public string CompanionErrorCode { get; set; }
     public string CompanionError { get; set; }
+    public string CompanionDiagnosticCode { get; set; }
+    public string CompanionDiagnosticReason { get; set; }
 
     internal RimBridgeIntegrationState Clone() => new()
     {
@@ -139,7 +211,9 @@ internal sealed class RimBridgeIntegrationState
         CompanionProcessId = CompanionProcessId,
         CompanionVerificationTimestampUtc = CompanionVerificationTimestampUtc,
         CompanionErrorCode = CompanionErrorCode,
-        CompanionError = CompanionError
+        CompanionError = CompanionError,
+        CompanionDiagnosticCode = CompanionDiagnosticCode,
+        CompanionDiagnosticReason = CompanionDiagnosticReason
     };
 
     internal static RimBridgeIntegrationState Disabled(RimBridgeMode mode) => new()
@@ -499,6 +573,8 @@ internal sealed class RimBridgeCompanionVerification
     internal RimBridgeCompanionVerificationStatus Status { get; init; }
     internal string Code { get; init; }
     internal string Error { get; init; }
+    internal string DiagnosticCode { get; init; }
+    internal string DiagnosticReason { get; init; }
     internal string LaunchId { get; init; }
     internal int Generation { get; init; }
     internal int ProcessId { get; init; }
@@ -517,7 +593,9 @@ internal static class RimBridgeCompanionClient
     {
         if (endpoint == null || !endpoint.IsValid)
             return Unavailable(RimBridgeIntegrationConstants.EndpointNotFoundCode,
-                "A verified RimBridge endpoint was not available for companion verification.");
+                "A verified RimBridge endpoint was not available for companion verification.",
+                RimBridgeIntegrationConstants.CompanionEndpointUnavailableDiagnostic,
+                "RimBridge endpoint unavailable.");
 
         try
         {
@@ -528,7 +606,9 @@ internal static class RimBridgeCompanionClient
             Task connect = client.ConnectAsync(endpoint.Host, endpoint.Port);
             if (!connect.Wait(boundedTimeout) || !client.Connected)
                 return Unavailable(RimBridgeIntegrationConstants.EndpointNotFoundCode,
-                    "The RimBridge endpoint did not accept a companion verification connection.");
+                    "The RimBridge endpoint did not accept a companion verification connection.",
+                    RimBridgeIntegrationConstants.CompanionEndpointUnavailableDiagnostic,
+                    "RimBridge endpoint unavailable.");
 
             client.ReceiveTimeout = Math.Max(1, (int)boundedTimeout.TotalMilliseconds);
             client.SendTimeout = Math.Max(1, (int)boundedTimeout.TotalMilliseconds);
@@ -555,9 +635,13 @@ internal static class RimBridgeCompanionClient
             {
                 if (helloErrorCode == -31000)
                     return Invalid(RimBridgeIntegrationConstants.AuthFailedCode,
-                        "RimBridge rejected the bridge token during companion verification.");
+                        "RimBridge rejected the bridge token during companion verification.",
+                        RimBridgeIntegrationConstants.CompanionAuthenticationDiagnostic,
+                        "RimBridge authentication failed.");
                 return Unavailable(RimBridgeIntegrationConstants.CompanionUnavailableCode,
-                    "RimBridge did not establish a companion verification session.");
+                    "RimBridge did not establish a companion verification session.",
+                    RimBridgeIntegrationConstants.CompanionLoadFailedDiagnostic,
+                    "Companion session/handshake failed; the host did not establish the companion session.");
             }
 
             SendFrame(stream, new Dictionary<string, object>
@@ -578,43 +662,55 @@ internal static class RimBridgeCompanionClient
             {
                 if (toolErrorCode == -31000)
                     return Invalid(RimBridgeIntegrationConstants.AuthFailedCode,
-                        "RimBridge rejected the bridge token for the generation-context tool.");
+                        "RimBridge rejected the bridge token for the generation-context tool.",
+                        RimBridgeIntegrationConstants.CompanionAuthenticationDiagnostic,
+                        "RimBridge authentication failed.");
                 if (toolErrorCode == -31002 || toolErrorCode == -32601)
                     return Unavailable(RimBridgeIntegrationConstants.CompanionUnavailableCode,
-                        "The optional DevBridge generation-context tool is not registered.");
+                        "The optional DevBridge generation-context tool is not registered.",
+                        RimBridgeIntegrationConstants.CompanionToolNotRegisteredDiagnostic,
+                        "The companion loaded or was queried, but devbridge/get_generation_context is not registered.");
                 return Unavailable(RimBridgeIntegrationConstants.CompanionUnavailableCode,
-                    "The optional DevBridge generation-context tool could not be called.");
+                    "The optional DevBridge generation-context tool could not be called.",
+                    RimBridgeIntegrationConstants.CompanionToolCallFailedDiagnostic,
+                    "The companion tool call failed; the host did not identify a more specific cause.");
             }
 
             JsonElement payload = response.RootElement.GetProperty("result");
             if (payload.ValueKind == JsonValueKind.Object &&
-                payload.TryGetProperty("structuredContent", out JsonElement structured) &&
+                TryGetProperty(payload, "structuredContent", out JsonElement structured) &&
                 structured.ValueKind == JsonValueKind.Object)
                 payload = structured;
 
             if (payload.ValueKind != JsonValueKind.Object ||
-                !payload.TryGetProperty("success", out JsonElement success) ||
+                !TryGetProperty(payload, "success", out JsonElement success) ||
                 success.ValueKind != JsonValueKind.True ||
-                !payload.TryGetProperty("available", out JsonElement available) ||
+                !TryGetProperty(payload, "available", out JsonElement available) ||
                 available.ValueKind != JsonValueKind.True)
             {
                 string code = ReadString(payload, "errorCode") ??
                     RimBridgeIntegrationConstants.CompanionContextInvalidCode;
-                return Invalid(code, "The companion returned no complete DevBridge generation context.");
+                return Invalid(code, "The companion returned no complete DevBridge generation context.",
+                    RimBridgeIntegrationConstants.CompanionGenerationContextIncompleteDiagnostic,
+                    "Generation context is incomplete or unavailable.");
             }
 
             if (!string.Equals(ReadString(payload, "schemaVersion"),
                     RimBridgeIntegrationConstants.CompanionSchemaVersion,
                     StringComparison.Ordinal))
                 return Invalid(RimBridgeIntegrationConstants.CompanionContextInvalidCode,
-                    "The companion generation-context schema is not supported.");
+                    "The companion generation-context schema is not supported.",
+                    RimBridgeIntegrationConstants.CompanionGenerationContextIncompleteDiagnostic,
+                    "Generation context schema is unsupported or incomplete.");
 
             string launchId = ReadString(payload, "launchId");
             int? generation = ReadInt(payload, "generation");
             int? processId = ReadInt(payload, "processId");
             if (string.IsNullOrWhiteSpace(launchId) || !generation.HasValue || !processId.HasValue)
                 return Invalid(RimBridgeIntegrationConstants.CompanionContextInvalidCode,
-                    "The companion returned an incomplete DevBridge generation context.");
+                    "The companion returned an incomplete DevBridge generation context.",
+                    RimBridgeIntegrationConstants.CompanionGenerationContextIncompleteDiagnostic,
+                    "Generation context is incomplete; launchId, generation, or processId is missing.");
 
             if (!string.Equals(launchId, expectedLaunchId, StringComparison.Ordinal) ||
                 generation.Value != expectedGeneration || processId.Value != expectedProcessId)
@@ -624,6 +720,8 @@ internal static class RimBridgeCompanionClient
                     Status = RimBridgeCompanionVerificationStatus.Mismatch,
                     Code = RimBridgeIntegrationConstants.CompanionIdentityMismatchCode,
                     Error = "The RimBridge companion reported a different DevBridge launch, generation, or process identity.",
+                    DiagnosticCode = RimBridgeIntegrationConstants.CompanionIdentityMismatchDiagnostic,
+                    DiagnosticReason = "Generation context identity does not match coordinator state.",
                     LaunchId = launchId,
                     Generation = generation.Value,
                     ProcessId = processId.Value
@@ -641,37 +739,51 @@ internal static class RimBridgeCompanionClient
         catch (TimeoutException)
         {
             return Unavailable(RimBridgeIntegrationConstants.CompanionUnavailableCode,
-                "RimBridge companion verification timed out.");
+                "RimBridge companion verification timed out.",
+                RimBridgeIntegrationConstants.CompanionEndpointUnavailableDiagnostic,
+                "Companion verification timed out.");
         }
         catch (SocketException)
         {
             return Unavailable(RimBridgeIntegrationConstants.CompanionUnavailableCode,
-                "RimBridge companion verification could not connect.");
+                "RimBridge companion verification could not connect.",
+                RimBridgeIntegrationConstants.CompanionEndpointUnavailableDiagnostic,
+                "Companion endpoint connection failed.");
         }
         catch (JsonException)
         {
             return Invalid(RimBridgeIntegrationConstants.CompanionContextInvalidCode,
-                "RimBridge returned an invalid companion response.");
+                "RimBridge returned an invalid companion response.",
+                RimBridgeIntegrationConstants.CompanionLoadFailedDiagnostic,
+                "Companion response was malformed or incompatible.");
         }
         catch
         {
             return Unavailable(RimBridgeIntegrationConstants.CompanionUnavailableCode,
-                "RimBridge companion verification was unavailable.");
+                "RimBridge companion verification was unavailable.",
+                RimBridgeIntegrationConstants.CompanionLoadFailedDiagnostic,
+                "Companion verification failed without a more specific host diagnostic.");
         }
     }
 
-    private static RimBridgeCompanionVerification Unavailable(string code, string error) => new()
+    private static RimBridgeCompanionVerification Unavailable(string code, string error,
+        string diagnosticCode, string diagnosticReason) => new()
     {
         Status = RimBridgeCompanionVerificationStatus.Unavailable,
         Code = code,
-        Error = error
+        Error = error,
+        DiagnosticCode = diagnosticCode,
+        DiagnosticReason = diagnosticReason
     };
 
-    private static RimBridgeCompanionVerification Invalid(string code, string error) => new()
+    private static RimBridgeCompanionVerification Invalid(string code, string error,
+        string diagnosticCode = null, string diagnosticReason = null) => new()
     {
         Status = RimBridgeCompanionVerificationStatus.Invalid,
         Code = code,
-        Error = error
+        Error = error,
+        DiagnosticCode = diagnosticCode,
+        DiagnosticReason = diagnosticReason
     };
 
     private static void SendFrame(NetworkStream stream, object message)
@@ -741,21 +853,39 @@ internal static class RimBridgeCompanionClient
     private static bool TryReadError(JsonElement root, out int code)
     {
         code = 0;
-        if (!root.TryGetProperty("error", out JsonElement error) ||
+        if (!TryGetProperty(root, "error", out JsonElement error) ||
             error.ValueKind != JsonValueKind.Object)
             return false;
-        if (error.TryGetProperty("code", out JsonElement value) && value.TryGetInt32(out int parsed))
+        if (TryGetProperty(error, "code", out JsonElement value) && value.TryGetInt32(out int parsed))
             code = parsed;
         return true;
     }
 
     private static string ReadString(JsonElement value, string name) =>
-        value.TryGetProperty(name, out JsonElement property) &&
+        TryGetProperty(value, name, out JsonElement property) &&
         property.ValueKind == JsonValueKind.String ? property.GetString() : null;
 
     private static int? ReadInt(JsonElement value, string name) =>
-        value.TryGetProperty(name, out JsonElement property) && property.TryGetInt32(out int parsed)
+        TryGetProperty(value, name, out JsonElement property) && property.TryGetInt32(out int parsed)
             ? parsed : null;
+
+    private static bool TryGetProperty(JsonElement value, string name, out JsonElement property)
+    {
+        if (value.ValueKind == JsonValueKind.Object)
+        {
+            foreach (JsonProperty candidate in value.EnumerateObject())
+            {
+                if (string.Equals(candidate.Name, name, StringComparison.OrdinalIgnoreCase))
+                {
+                    property = candidate.Value;
+                    return true;
+                }
+            }
+        }
+
+        property = default;
+        return false;
+    }
 }
 
 internal static class RimBridgeEndpointStore

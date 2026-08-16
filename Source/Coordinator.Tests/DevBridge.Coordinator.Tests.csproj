@@ -63,5 +63,7 @@
     <Compile Include="ProjectResolutionTests.cs" />
     <Compile Include="TestGenerationInputTests.cs" />
     <Compile Include="DevBridgeWrapperTests.cs" />
+    <Compile Include="CoordinatorLifecycleTests.cs" />
+    <Compile Include="BridgeToolsDeploymentTests.cs" />
   </ItemGroup>
 </Project>

@@ -15,6 +15,8 @@ internal sealed class ComponentVersionReport
     public string ModVersion { get; set; }
     [JsonPropertyName("bridgeToolsVersion")]
     public string BridgeToolsVersion { get; set; }
+    [JsonPropertyName("bridgeToolsPath")]
+    public string BridgeToolsPath { get; set; }
     [JsonPropertyName("runtimeStateSchema")]
     public string RuntimeStateSchema { get; set; }
     [JsonPropertyName("readinessSchema")]

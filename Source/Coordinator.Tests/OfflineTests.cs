@@ -111,6 +111,10 @@ internal static partial class OfflineTests
         Run("RimBridge hello sends structured client information", TestRimBridgeWireClientInfo);
         Run("RimBridge client maps wire auth, tool, and timeout failures", TestRimBridgeWireFailures);
         Run("DevBridge core mod remains SDK-free", TestCoreModRemainsSdkFree);
+        Run("BridgeTools companion project and publish contract", TestBridgeToolsPublishContract);
+        Run("BridgeTools publishing refreshes stale deployment output", TestBridgeToolsPublishRefreshesStaleDll);
+        Run("doctor identifies a mod-local BridgeTools companion", TestBridgeToolsWrongLocationDiagnostic);
+        Run("RimBridge companion status exposes a bounded diagnostic category", TestRimBridgeCompanionDiagnosticCategory);
         Run("baseline profile excludes managed projects and load-them-last", TestBaselineProfile);
         Run("profile dependency closure is ordered, deduplicated, and case-insensitive", TestProfileDependencyClosure);
         Run("structured dependency metadata accepts descriptive fields and preserves constraints", TestStructuredDependencyMetadata);
@@ -161,6 +165,14 @@ internal static partial class OfflineTests
         Run("doctor redacts secret-shaped diagnostic values", TestDoctorRedactsSecrets);
         Run("structured recovery guidance is safe and parameterized", TestStructuredRecoveryGuidance);
         Run("wrapper propagates native exit codes", DevBridgeWrapperTests.Run);
+        Run("named-pipe stop completes the originating client", TestNamedPipeStopCompletesClient);
+        Run("named-pipe JSON stop completes with one terminal marker", TestNamedPipeJsonStopCompletesClient);
+        Run("coordinator shutdown responds before exit", TestCoordinatorShutdownRespondsBeforeExit);
+        Run("coordinator shutdown reacquires mutex and pipe", TestCoordinatorShutdownReacquiresMutexAndPipe);
+        Run("coordinator reloads current environment and executable", TestCoordinatorShutdownReloadsCurrentEnvironmentAndExecutable);
+        Run("finite commands have bounded terminal responses", TestFiniteCommandsHaveBoundedTerminalResponses);
+        Run("durable wait response policy remains unbounded", TestDurableWaitResponsePolicyRemainsUnbounded);
+        Run("simultaneous shutdown clients are bounded and durable", TestSimultaneousShutdownClientsAreBoundedAndDurable);
 
         Console.WriteLine(failures == 0 ? "OFFLINE TESTS PASS" : "OFFLINE TESTS FAIL: " + failures);
         return failures == 0 ? 0 : 1;

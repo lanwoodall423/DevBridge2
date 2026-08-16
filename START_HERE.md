@@ -68,6 +68,19 @@ Use `DevBridge.cmd` from the installed mod root.
   `wait-ready`, or `doctor` for one machine-readable JSON result. `test session` is intentionally a
   connected text stream; do not use `--json` with it.
 
+### Refreshing the coordinator artifacts
+
+To reload a newly published coordinator binary or changed coordinator environment/configuration without
+stopping RimWorld, run `DevBridge.cmd coordinator shutdown` (or append `--json`). The command flushes its
+response and terminal marker before the slot mutex and named pipe are released; durable `Runtime/state.json`,
+leases, and the RimWorld process are preserved. A later `DevBridge.cmd status` or other command lazily starts
+the current `Coordinator\DevBridge.Coordinator.exe` with the current environment. An already accepted long
+`restart`, `wait-ready`, or test session may be disconnected while the coordinator drains; reconnect with
+`status`/`wait-ready` and do not resubmit the accepted operation.
+
+Use `DevBridge.cmd stop <lease-id>` instead when the goal is assembly or ModsConfig maintenance: `stop`
+intentionally terminates the owned RimWorld process and opens the exclusive `STOPPED` maintenance window.
+
 ## Normal workflow
 
 ```text
@@ -184,12 +197,30 @@ authenticated GABP `session/hello` and `tools/call` protocol after endpoint veri
 `launchId`, `generation`, and `processId` strengthens the endpoint evidence; any disagreement is
 `RIMBRIDGE_COMPANION_IDENTITY_MISMATCH` and is never silently accepted. If the companion is absent,
 endpoint-only integration remains valid and reports `RIMBRIDGE_COMPANION_UNAVAILABLE` diagnostically.
+The base profile still includes `brrainz.rimbridgeserver` regardless of whether endpoint integration is
+`off`, `optional`, or `required`; the companion is optional strengthening/diagnostic functionality, not
+a second RimBridgeServer or lifecycle owner.
 
-The SDK is compile-time only. Build with `dotnet build Source\BridgeTools\DevBridge2.BridgeTools.csproj
--c Release`, then place only `DevBridge2.BridgeTools.dll` in the active mod's `BridgeTools` folder
-(for example `Mods\DevBridge2\BridgeTools\`). Do not copy `RimBridgeServer.Sdk.dll`; RimBridgeServer
-supplies it. A host/SDK incompatibility is diagnosed by RimBridgeServer and leaves the endpoint-only
-path available.
+Use the repository-owned publish workflow instead of manually hunting for a DLL:
+
+```text
+DevBridge.cmd coordinator shutdown
+powershell -NoProfile -ExecutionPolicy Bypass -File .\Publish-DevBridge.ps1 -Configuration Release -DeployCompanion -DeploymentRoot "<active DevBridge2 mod root>" -RimBridgeSdkPath "<host RimBridgeServer.Sdk.dll>"
+DevBridge.cmd status --json
+```
+
+It publishes the coordinator, performs a fresh companion rebuild against the matching host SDK, and deploys exactly
+`<RimWorld root>\BridgeTools\DevBridge2\DevBridge2.BridgeTools.dll`, derived from the validated active
+mod root. Pass the host `RimBridgeServer.Sdk.dll` with `-RimBridgeSdkPath` (or set
+`DEVBRIDGE_RIMBRIDGE_SDK_PATH`) so the companion's compile-time reference matches the live host. It removes
+the obsolete nested `<active mod root>\BridgeTools` companion directory and verifies the deployed hash. It
+never copies `RimBridgeServer.Sdk.dll`, because RimBridgeServer supplies the host SDK. Use `-CompanionOnly` without
+`-DeployCompanion` for a source-only/test build; a missing or wrong deployment root fails clearly. Doctor
+reports `BRIDGETOOLS_ASSEMBLY_NOT_DISCOVERED`, `BRIDGETOOLS_WRONG_LOCATION`,
+`BRIDGETOOLS_LOAD_FAILED`, or `BRIDGETOOLS_STALE_BINARY` when it has local evidence. Runtime status
+retains the stable nonfatal `RIMBRIDGE_COMPANION_UNAVAILABLE` and adds bounded reasons such as
+`TOOL_NOT_REGISTERED`, `TOOL_CALL_FAILED`, `GENERATION_CONTEXT_INCOMPLETE`, or
+`ENDPOINT_UNAVAILABLE`. No diagnostic category includes credentials or tokens.
 
 #### Recommended routed workflow
 

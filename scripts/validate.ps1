@@ -12,6 +12,7 @@ $coordinatorCoreProject = 'Source\Coordinator.Core\DevBridge.Coordinator.Core.cs
 $coordinatorProject = 'Source\Coordinator\DevBridge.Coordinator.csproj'
 $testsProject = 'Source\Coordinator.Tests\DevBridge.Coordinator.Tests.csproj'
 $bridgeToolsProject = 'Source\BridgeTools\DevBridge2.BridgeTools.csproj'
+$fakeRimWorldProject = 'Source\FakeRimWorld\FakeRimWorld.csproj'
 $bridgeToolsOutput = Join-Path $repoRoot 'Source\BridgeTools\bin\Release'
 $restoreMode = if ($UpdatePackages) { '--force-evaluate' } else { '--locked-mode' }
 
@@ -41,6 +42,9 @@ Invoke-Required 'Restore Coordinator.Tests' 'dotnet' @(
 Invoke-Required 'Restore BridgeTools' 'dotnet' @(
     'restore', $bridgeToolsProject, $restoreMode, '--nologo'
 )
+Invoke-Required 'Restore FakeRimWorld process host' 'dotnet' @(
+    'restore', $fakeRimWorldProject, $restoreMode, '--nologo'
+)
 
 Invoke-Required 'Build Coordinator.Core Release' 'dotnet' @(
     'build', $coordinatorCoreProject, '--configuration', 'Release', '--no-restore', '--nologo'
@@ -54,8 +58,20 @@ Invoke-Required 'Build Coordinator.Tests Release' 'dotnet' @(
 Invoke-Required 'Build BridgeTools Release' 'dotnet' @(
     'build', $bridgeToolsProject, '--configuration', 'Release', '--no-restore', '--nologo'
 )
+Invoke-Required 'Build FakeRimWorld process host Release' 'dotnet' @(
+    'build', $fakeRimWorldProject, '--configuration', 'Release', '--no-restore', '--nologo'
+)
 Invoke-Required 'Run complete offline coordinator test suite' 'dotnet' @(
     'run', '--project', $testsProject, '--configuration', 'Release', '--no-build', '--no-restore'
+)
+Invoke-Required 'Run deterministic development-plan/publish matrix' 'pwsh' @(
+    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'scripts\dev-plan.tests.ps1'
+)
+Invoke-Required 'Run development artifact hash/deployment matrix' 'pwsh' @(
+    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'scripts\dev-publish.tests.ps1'
+)
+Invoke-Required 'Run process-level FakeRimWorld E2E suite' 'pwsh' @(
+    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'scripts\process-e2e.tests.ps1'
 )
 
 Invoke-Required 'Check working-tree whitespace' 'git' @('diff', '--check')

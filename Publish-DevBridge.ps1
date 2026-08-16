@@ -4,6 +4,7 @@ param(
     [string]$Configuration = 'Release',
     [string]$DeploymentRoot,
     [switch]$DeployCompanion,
+    [switch]$SkipIfIdentical,
     [switch]$CompanionOnly,
     [string]$CoordinatorOutput,
     [string]$RimBridgeSdkPath
@@ -160,6 +161,19 @@ if (Test-Path -LiteralPath $legacyDirectory -PathType Container) {
 }
 
 $destinationDll = Join-Path $destinationDirectory 'DevBridge2.BridgeTools.dll'
+$sourceHash = Get-FileSha256 $companionDll
+$existingHash = $null
+if (Test-Path -LiteralPath $destinationDll -PathType Leaf) {
+    $existingHash = Get-FileSha256 $destinationDll
+}
+if ($SkipIfIdentical -and $null -ne $existingHash -and
+    [string]::Equals($sourceHash, $existingHash, [StringComparison]::OrdinalIgnoreCase)) {
+    Write-Host "Companion deployment is a byte-identical no-op: $destinationDll"
+    if (Test-Path -LiteralPath $sdkDestination -PathType Leaf) {
+        throw "Companion deployment verification found RimBridgeServer.Sdk.dll in the deployment directory."
+    }
+    exit 0
+}
 $temporaryDll = Join-Path $destinationDirectory ('.DevBridge2.BridgeTools.dll.' + $PID + '.tmp')
 try {
     Copy-Item -LiteralPath $companionDll -Destination $temporaryDll -Force
@@ -170,7 +184,6 @@ try {
     }
 }
 
-$sourceHash = Get-FileSha256 $companionDll
 $deployedHash = Get-FileSha256 $destinationDll
 if (-not [string]::Equals($sourceHash, $deployedHash, [StringComparison]::OrdinalIgnoreCase)) {
     throw "Companion deployment verification failed; deployed DLL does not match the successful build."

@@ -21,6 +21,14 @@ internal static class Program
         Converters = { new JsonStringEnumConverter() }
     };
 
+    internal static bool IsRecipeCommand(BridgeRequest request)
+    {
+        IReadOnlyList<string> arguments = request?.Arguments ?? new List<string>();
+        return string.Equals(request?.Command, "test", StringComparison.OrdinalIgnoreCase) &&
+            arguments.Count > 0 && string.Equals(arguments[0], "recipe",
+                StringComparison.OrdinalIgnoreCase);
+    }
+
     private static int Main(string[] args)
     {
         try
@@ -259,8 +267,9 @@ internal static class CoordinatorClient
                 }
                 catch (OperationCanceledException) when (responseTimeout?.IsCancellationRequested == true)
                 {
-                    throw new IOException(CoordinatorResponsePolicy.TimeoutMessage(
-                        normalizedCommand[0]));
+                    throw new IOException(
+                        "the coordinator disconnected or timed out before returning a terminal IPC result; " +
+                        CoordinatorResponsePolicy.TimeoutMessage(normalizedCommand[0]));
                 }
                 catch (CoordinatorIpcException exception)
                 {
@@ -273,9 +282,16 @@ internal static class CoordinatorClient
                         "the coordinator disconnected before returning a terminal IPC result; use DevBridge.cmd wait-ready or status",
                         exception);
                 }
+                catch (ObjectDisposedException exception)
+                {
+                    throw new IOException(
+                        "the coordinator disconnected before returning a terminal IPC result; use DevBridge.cmd wait-ready or status",
+                        exception);
+                }
 
                 if (line == null)
-                    break;
+                    throw new IOException(
+                        "the coordinator disconnected before returning a terminal IPC result; use DevBridge.cmd wait-ready or status");
 
                 CoordinatorIpcFrame frame;
                 try
@@ -307,7 +323,7 @@ internal static class CoordinatorClient
 
                     string payload = frame.Payload.Value.GetRawText();
                     receivedLine?.Invoke(payload);
-                    Console.WriteLine(payload);
+                    WriteJsonPayload(payload);
                 }
                 return frame.ExitCode.Value;
             }
@@ -327,6 +343,19 @@ internal static class CoordinatorClient
         return "agent-" + Environment.ProcessId.ToString("X4");
     }
 
+    private static void WriteJsonPayload(string payload)
+    {
+        string resultPath = Environment.GetEnvironmentVariable("DEVBRIDGE_TEST_RESULT_FILE");
+        if (!string.IsNullOrWhiteSpace(resultPath) &&
+            !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("DEVBRIDGE_TEST_RIMWORLD_PATH")))
+        {
+            string fullPath = Path.GetFullPath(resultPath);
+            Directory.CreateDirectory(Path.GetDirectoryName(fullPath) ?? ".");
+            File.WriteAllText(fullPath, payload, new UTF8Encoding(false));
+        }
+        Console.WriteLine(payload);
+    }
+
     private static void StartServer(string root, string runtimeSlotId, string ticketId)
     {
         string processPath = ProcessPathProviderForTests?.Invoke() ?? Environment.ProcessPath;
@@ -338,12 +367,11 @@ internal static class CoordinatorClient
             UseShellExecute = false,
             CreateNoWindow = true,
             WorkingDirectory = root,
-            // A detached coordinator must not inherit redirected pipes that no
-            // process drains. A full stdout/stderr buffer otherwise freezes the
-            // server after a diagnostic write, leaving clients without an end
-            // marker even when the durable operation already completed.
-            RedirectStandardOutput = false,
-            RedirectStandardError = false
+            // A detached coordinator must not inherit the CLI's redirected
+            // stdout/stderr handles. Those handles may remain open after the
+            // finite client response and make shell callers wait forever.
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
         };
 
         if (string.Equals(Path.GetFileNameWithoutExtension(processPath), "dotnet",
@@ -376,7 +404,16 @@ internal static class CoordinatorClient
         if (ProcessStarterForTests != null)
             ProcessStarterForTests(start);
         else
-            Process.Start(start)?.Dispose();
+        {
+            Process server = Process.Start(start);
+            if (server != null)
+            {
+                // Keep the detached server's pipes drained while the server
+                // remains available for later lazy client requests.
+                _ = server.StandardOutput.BaseStream.CopyToAsync(Stream.Null);
+                _ = server.StandardError.BaseStream.CopyToAsync(Stream.Null);
+            }
+        }
     }
 }
 
@@ -423,15 +460,8 @@ internal static class CoordinatorServer
         CoordinatorState state = null;
         try
         {
-            CoordinatorOptions production = optionsOverride ?? CoordinatorOptions.ForProduction();
-            state = new(root, optionsOverride ?? new CoordinatorOptions
-            {
-                CoordinatorRoot = root,
-                RuntimeSlotId = slot,
-                ReadinessTimeout = production.ReadinessTimeout,
-                RimBridgeMode = production.RimBridgeMode,
-                PlayerLogPath = production.PlayerLogPath
-            });
+            CoordinatorOptions configured = optionsOverride ?? CoordinatorOptions.ForProduction(root, slot);
+            state = new(root, configured.ForScope(root, slot));
             state.StartRecoveryWork();
             started?.Invoke(state);
 
@@ -709,11 +739,24 @@ internal static class CoordinatorServer
                                 errorCode: written ? null : "EVENT_NOT_WRITTEN");
                         };
                     int exitCode = state.Execute(request, emit, () => output.Connected && pipe.IsConnected);
-                    JsonCommandResponse response = null;
+                    object response = null;
                     if (request.Json)
                     {
-                        response = state.CreateJsonResponse(request, exitCode, buffered);
-                        exitCode = response.ExitCode;
+                        response = string.Equals(request.Command, "agent", StringComparison.OrdinalIgnoreCase)
+                            ? state.CreateAgentJsonResponse(request, exitCode)
+                            : Program.IsRecipeCommand(request)
+                                ? state.CreateRecipeJsonResponse(request, exitCode)
+                                : state.IsForensicCommand(request)
+                                    ? state.CreateForensicJsonResponse(request, exitCode)
+                                : state.CreateJsonResponse(request, exitCode, buffered);
+                        exitCode = response switch
+                        {
+                            AgentResponse agentResponse => agentResponse.ExitCode,
+                            RecipeResponse recipeResponse => recipeResponse.ExitCode,
+                            ForensicResponse forensicResponse => forensicResponse.ExitCode,
+                            JsonCommandResponse legacyResponse => legacyResponse.ExitCode,
+                            _ => exitCode
+                        };
                     }
                     if (string.Equals(request.Command, "stop", StringComparison.OrdinalIgnoreCase) &&
                         state.PhaseForTesting == BridgePhase.STOPPED)
@@ -817,9 +860,16 @@ internal static class CoordinatorResponsePolicy
         if (string.Equals(command, "wait-ready", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(command, "restart", StringComparison.OrdinalIgnoreCase))
             return false;
+        if (string.Equals(command, "agent", StringComparison.OrdinalIgnoreCase) && arguments.Count > 0 &&
+            string.Equals(arguments[0], "wait-event", StringComparison.OrdinalIgnoreCase))
+            return false;
         if (string.Equals(command, "test", StringComparison.OrdinalIgnoreCase) && arguments.Count > 0 &&
             (string.Equals(arguments[0], "begin", StringComparison.OrdinalIgnoreCase) ||
              string.Equals(arguments[0], "session", StringComparison.OrdinalIgnoreCase)))
+            return false;
+        if (string.Equals(command, "test", StringComparison.OrdinalIgnoreCase) && arguments.Count > 1 &&
+            string.Equals(arguments[0], "recipe", StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(arguments[1], "run", StringComparison.OrdinalIgnoreCase))
             return false;
         return true;
     }

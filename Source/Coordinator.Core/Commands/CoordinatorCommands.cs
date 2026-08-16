@@ -37,7 +37,10 @@ internal sealed partial class CoordinatorState
         string command = (request.Command ?? string.Empty).Trim().ToLowerInvariant();
         if (persistedStateLoadBlocked && command != "doctor" && command != "history" &&
             command != "coordinator" &&
-            !IsProjectResolveCommand(request))
+            command != "agent" &&
+            command != "logs" && command != "evidence" &&
+            !IsProjectResolveCommand(request) &&
+            !IsPureRecipeCommand(request))
         {
             string errorCode;
             string error;
@@ -56,12 +59,15 @@ internal sealed partial class CoordinatorState
 
         return command switch
         {
+            "agent" => Agent(arguments, request, emit, connected),
             "status" => Status(request, emit),
             "bridge" => Bridge(arguments, request, emit),
             "rimbridge" => Bridge(arguments, request, emit),
             "mods" => Mods(arguments, emit),
             "doctor" => Doctor(request, emit),
             "history" => History(arguments, request, emit),
+            "logs" => Logs(arguments, request, emit),
+            "evidence" => Evidence(arguments, request, emit),
             "wait-ready" => WaitReady(request, emit),
             "restart" => Restart(request, emit),
             "stop" => Stop(request, emit),
@@ -139,7 +145,7 @@ internal sealed partial class CoordinatorState
     {
         if (arguments.Count == 0)
         {
-            emit("Usage: DevBridge.cmd test begin | test session | test renew <lease-id> | test end <lease-id>");
+            emit("Usage: DevBridge.cmd test begin | test session | test renew <lease-id> | test end <lease-id> | test recipe list|show|plan|run");
             return 2;
         }
 
@@ -149,6 +155,7 @@ internal sealed partial class CoordinatorState
             "session" => SessionLease(request, emit, connected),
             "renew" => RenewLease(request, arguments, emit),
             "end" => EndLease(request, arguments, emit),
+            "recipe" => TestRecipe(arguments, request, emit, connected),
             _ => Unknown("test " + arguments[0], emit)
         };
     }

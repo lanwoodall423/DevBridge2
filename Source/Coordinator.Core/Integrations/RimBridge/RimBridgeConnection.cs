@@ -164,7 +164,8 @@ internal sealed class RimBridgeConnection : IDisposable
             {
                 read = stream.Read(body, offset, body.Length - offset);
             }
-            catch (IOException) when (DateTime.UtcNow >= deadlineUtc)
+            catch (IOException exception) when (DateTime.UtcNow >= deadlineUtc ||
+                                                IsSocketTimeout(exception))
             {
                 throw new TimeoutException("RimBridge response timed out.");
             }
@@ -193,7 +194,8 @@ internal sealed class RimBridgeConnection : IDisposable
         {
             read = stream.Read(one, 0, 1);
         }
-        catch (IOException) when (DateTime.UtcNow >= deadlineUtc)
+        catch (IOException exception) when (DateTime.UtcNow >= deadlineUtc ||
+                                            IsSocketTimeout(exception))
         {
             throw new TimeoutException("RimBridge response timed out.");
         }
@@ -204,6 +206,12 @@ internal sealed class RimBridgeConnection : IDisposable
     {
         if (DateTime.UtcNow >= deadlineUtc)
             throw new TimeoutException("RimBridge request exceeded the bounded timeout.");
+    }
+
+    private static bool IsSocketTimeout(IOException exception)
+    {
+        SocketException socket = exception.InnerException as SocketException;
+        return socket?.SocketErrorCode == SocketError.TimedOut;
     }
 
     private static TimeSpan Bound(TimeSpan timeout) => timeout <= TimeSpan.Zero

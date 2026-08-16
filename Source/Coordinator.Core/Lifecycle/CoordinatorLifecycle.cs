@@ -22,7 +22,8 @@ internal sealed partial class CoordinatorState
             string failurePhase = state.Phase.ToString();
             int historyGeneration = state.LaunchGeneration > 0 ? state.LaunchGeneration :
                 (state.TargetGeneration > 0 ? state.TargetGeneration : state.Generation);
-            TryRecordGenerationOutcomeLocked(historyGeneration, "FAILED", errorCode, detail);
+            FailureFingerprintInput failureInput = BuildFailureInputLocked(errorCode, failurePhase,
+                detail, failure);
             if (state.ModsConfigMutationAuthority == ModsConfigMutationAuthorityValues.DevBridgeTransition &&
                 state.ExternalModsConfigMutation == null)
             {
@@ -43,11 +44,15 @@ internal sealed partial class CoordinatorState
                 state.TerminalFailureExceptionMessage = failure.ExceptionMessage;
                 state.TerminalFailureDiagnosticDetail = failure.DiagnosticDetail;
             }
+            TryRecordGenerationOutcomeLocked(historyGeneration, "FAILED", errorCode, detail, failureInput);
             if (IsolationActiveLocked() && state.CrashIsolation.CurrentAttemptId == null &&
                 string.Equals(state.CrashIsolation.OriginalLaunchId, state.LaunchId, StringComparison.Ordinal) &&
                 state.CrashIsolation.OriginalGeneration == state.LaunchGeneration &&
                 string.Equals(state.CrashIsolation.OriginalFailureCode, errorCode, StringComparison.Ordinal))
+            {
+                SaveStateLocked();
                 return;
+            }
             if (IsolationActiveLocked() && state.CrashIsolation.CurrentAttemptId != null)
             {
                 CrashIsolationIncident incident = state.CrashIsolation;
@@ -86,6 +91,8 @@ internal sealed partial class CoordinatorState
             if (IsEligibleForCrashIsolationLocked(errorCode))
             {
                 BeginCrashIsolationLocked(detail, errorCode, failure);
+                AttachLatestFailureDiagnosisReferenceLocked();
+                SaveStateLocked();
                 return;
             }
 
@@ -534,7 +541,8 @@ internal sealed partial class CoordinatorState
 
         if (state.Phase == BridgePhase.LOADING && state.ProcessId <= 0 &&
             (launchTask == null || launchTask.IsCompleted) &&
-            (restartTask == null || restartTask.IsCompleted))
+            (restartTask == null || restartTask.IsCompleted) &&
+            Volatile.Read(ref launchInvocationInProgress) == 0)
         {
             FailLaunch("the persisted launch has no verified process identity; no replacement launch was attempted",
                 "LAUNCH_RECOVERY_AMBIGUOUS");
@@ -561,10 +569,12 @@ internal sealed partial class CoordinatorState
                 "PROCESS_EXITED");
             state.Phase = BridgePhase.STOPPED;
             state.Error = "The coordinator-owned RimWorld process is no longer running.";
-            state.ErrorCode = "PROCESS_EXITED";
-            state.MaintenanceReady = false;
-            TryRecordGenerationOutcomeLocked(state.Generation, "STOPPED", "PROCESS_EXITED",
-                "The accepted RimWorld process is no longer running.");
+                state.ErrorCode = "PROCESS_EXITED";
+                state.MaintenanceReady = false;
+                TryRecordGenerationOutcomeLocked(state.Generation, "STOPPED", "PROCESS_EXITED",
+                "The accepted RimWorld process is no longer running.",
+                BuildFailureInputLocked("PROCESS_EXITED", "PROCESS",
+                    "The accepted RimWorld process is no longer running."));
             state.ProcessId = 0;
             state.ProcessStartUtcTicks = 0;
             SaveStateLocked();

@@ -19,6 +19,9 @@ internal sealed partial class CoordinatorState
     internal void InjectFaultForTesting(CoordinatorFaultPoint point) =>
         options.FaultInjector?.Hit(point);
 
+    internal void SetFaultInjectorForTesting(ICoordinatorFaultInjector injector) =>
+        options.FaultInjector = injector;
+
     internal void WaitForWorkersForTesting(TimeSpan timeout)
     {
         Task[] workers;

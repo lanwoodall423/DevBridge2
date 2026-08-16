@@ -810,10 +810,14 @@ internal static partial class OfflineTests
         {
             Fixture = fixture;
             Slot = RuntimeScope.ForRoot(fixture.Root);
+            ICoordinatorFaultInjector faultInjector = options?.FaultInjector;
+            if (options != null)
+                options.FaultInjector = null;
             ManualResetEventSlim started = new(false);
             ServerTask = Task.Run(() => CoordinatorServer.Run(fixture.Root, Slot, null, options,
                 state =>
                 {
+                    state.SetFaultInjectorForTesting(faultInjector);
                     StartedState = state;
                     started.Set();
                 }));

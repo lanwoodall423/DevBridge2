@@ -261,6 +261,17 @@ Copy-RuntimeFile (Join-Path $repoRoot 'CHANGELOG.md') 'CHANGELOG.md' $releaseRoo
 Copy-RuntimeFile (Join-Path $repoRoot 'RimBridgeProtocolCompatibility.json') 'RimBridgeProtocolCompatibility.json' $releaseRoot
 Copy-RuntimeFile (Join-Path $repoRoot 'docs\architecture.md') 'docs/architecture.md' $releaseRoot
 
+$recipeRoot = Join-Path $repoRoot 'TestRecipes'
+if (-not (Test-Path -LiteralPath $recipeRoot -PathType Container)) {
+    throw "Required repository-owned recipe directory was not found: $recipeRoot"
+}
+$recipeFiles = @(Get-ChildItem -LiteralPath $recipeRoot -Recurse -File |
+    Sort-Object FullName)
+foreach ($recipeFile in $recipeFiles) {
+    $relativeRecipePath = [System.IO.Path]::GetRelativePath($recipeRoot, $recipeFile.FullName).Replace('\', '/')
+    Copy-RuntimeFile $recipeFile.FullName ('TestRecipes/' + $relativeRecipePath) $releaseRoot
+}
+
 $packageAboutPath = Join-Path $releaseRoot 'About\About.xml'
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $packageAboutPath) | Out-Null
 $about.ModMetaData.modVersion = $productVersion
@@ -295,6 +306,10 @@ foreach ($path in @(
     'Coordinator/DevBridge.Coordinator.Core.dll', 'Coordinator/DevBridge.Coordinator.deps.json',
     'Coordinator/DevBridge.Coordinator.runtimeconfig.json'
 )) { [void]$allowedPaths.Add($path) }
+foreach ($recipeFile in $recipeFiles) {
+    $relativeRecipePath = [System.IO.Path]::GetRelativePath($recipeRoot, $recipeFile.FullName).Replace('\', '/')
+    [void]$allowedPaths.Add('TestRecipes/' + $relativeRecipePath)
+}
 if ($modBuilt) { [void]$allowedPaths.Add('1.6/Assemblies/DevBridge2.dll') }
 
 foreach ($record in Get-PackageFileRecords $releaseRoot) {

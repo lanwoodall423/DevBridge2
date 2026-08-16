@@ -247,6 +247,7 @@ internal sealed partial class CoordinatorState
     private void LaunchGenerationWorker(int targetGeneration, bool isRestart, string owner = null,
         ModProfile isolationProfile = null, string isolationAttemptId = null)
     {
+        Interlocked.Increment(ref launchInvocationInProgress);
         string launchId = Guid.NewGuid().ToString("N");
         IManagedProcess process = null;
         bool isolationAttempt = !string.IsNullOrWhiteSpace(isolationAttemptId);
@@ -445,23 +446,30 @@ internal sealed partial class CoordinatorState
             InjectFaultForTesting(CoordinatorFaultPoint.AfterStatePersistedBeforeExternalProcessAction);
             launchStarted = Stopwatch.GetTimestamp();
             TraceEvent("process.launch.initiated", detail: isRestart ? "restart" : "initial");
+            Dictionary<string, string> launchEnvironment = new()
+            {
+                ["DEVBRIDGE_ROOT"] = root,
+                ["DEVBRIDGE_LAUNCH_ID"] = launchId,
+                ["DEVBRIDGE_GENERATION"] = targetGeneration.ToString(),
+                ["DEVBRIDGE_QUICKTEST_REQUESTED"] = launchInputs.QuicktestEnabled ? "1" : "0",
+                ["DEVBRIDGE_QUICKTEST_TIMEOUT_SECONDS"] =
+                    launchInputs.QuicktestTimeoutSeconds.ToString(CultureInfo.InvariantCulture),
+                ["DEVBRIDGE_PROFILE_FINGERPRINT"] = state.LaunchProfileFingerprint ?? string.Empty,
+                ["DEVBRIDGE_BASELINE_FINGERPRINT"] = state.BaselineFingerprint ?? string.Empty,
+                ["DEVBRIDGE_PROFILE_MODE"] = isolationProfile?.Mode ?? state.ProfileMode ?? string.Empty
+            };
+            if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("DEVBRIDGE_TEST_RIMWORLD_PATH")))
+            {
+                string signalPath = Path.Combine(root, "Runtime", "fake-rimworld-stop.request");
+                launchEnvironment["DEVBRIDGE_TEST_GRACEFUL_STOP_SIGNAL"] = signalPath;
+                Environment.SetEnvironmentVariable("DEVBRIDGE_TEST_GRACEFUL_STOP_SIGNAL", signalPath);
+            }
             process = processAdapter.Launch(new ProcessLaunchRequest
             {
                 FileName = rimWorldExe,
                 WorkingDirectory = Path.GetDirectoryName(rimWorldExe) ?? root,
                 Arguments = Array.Empty<string>(),
-                Environment = new Dictionary<string, string>
-                {
-                    ["DEVBRIDGE_ROOT"] = root,
-                    ["DEVBRIDGE_LAUNCH_ID"] = launchId,
-                    ["DEVBRIDGE_GENERATION"] = targetGeneration.ToString(),
-                    ["DEVBRIDGE_QUICKTEST_REQUESTED"] = launchInputs.QuicktestEnabled ? "1" : "0",
-                    ["DEVBRIDGE_QUICKTEST_TIMEOUT_SECONDS"] =
-                        launchInputs.QuicktestTimeoutSeconds.ToString(CultureInfo.InvariantCulture),
-                    ["DEVBRIDGE_PROFILE_FINGERPRINT"] = state.LaunchProfileFingerprint ?? string.Empty,
-                    ["DEVBRIDGE_BASELINE_FINGERPRINT"] = state.BaselineFingerprint ?? string.Empty,
-                    ["DEVBRIDGE_PROFILE_MODE"] = isolationProfile?.Mode ?? state.ProfileMode ?? string.Empty
-                }
+                Environment = launchEnvironment
             });
             if (process == null)
                 throw new InvalidOperationException("launch adapter returned no RimWorld process");
@@ -513,6 +521,7 @@ internal sealed partial class CoordinatorState
         finally
         {
             process?.Dispose();
+            Interlocked.Decrement(ref launchInvocationInProgress);
         }
     }
 

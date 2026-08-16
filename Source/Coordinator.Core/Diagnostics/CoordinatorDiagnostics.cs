@@ -44,7 +44,10 @@ internal sealed partial class CoordinatorState
         emit("  DevBridge.cmd history");
         emit("  DevBridge.cmd history show <generation>");
         emit("  DevBridge.cmd history last-good");
+        emit("  DevBridge.cmd logs query [--generation <n>] [--since-launch] [--severity <level>] [--fingerprint <id>] [--component <name>] [--limit <n>] [--trace] --json");
+        emit("  DevBridge.cmd evidence show <id> --json");
         emit("  DevBridge.cmd doctor");
+        emit("  DevBridge.cmd agent capabilities|snapshot|delta|wait-event --json");
         emit("Append --json to a non-session command for one machine-readable result.");
         emit("Plan first: project resolve <alias[,alias...]> --json; inspect the exact closure/fingerprint, then register and restart.");
         emit("Register project intent before testing: project register <alias[,alias...]>; renew it while active and release it when finished.");
@@ -58,7 +61,7 @@ internal sealed partial class CoordinatorState
     private static int Unknown(string command, Action<string> emit)
     {
         emit("Unknown DevBridge command: " + command);
-        emit("Use: status, bridge status/policy/endpoint/tools/call, project resolve/register/status/renew/release, mods status/capture-baseline/restore-baseline, test begin/session/renew/end, stop <lease-id>, ensure-ready <lease-id>, restart [--projects ...|--legacy-production], wait-ready, history [show <generation>|last-good], doctor");
+        emit("Use: status, bridge status/policy/endpoint/tools/call, project resolve/register/status/renew/release, mods status/capture-baseline/restore-baseline, test begin/session/renew/end, stop <lease-id>, ensure-ready <lease-id>, restart [--projects ...|--legacy-production], wait-ready, history [show <generation>|last-good], logs query, evidence show, doctor, agent capabilities|snapshot|delta|wait-event");
         EmitNextCommand(emit, "DevBridge.cmd help");
         return 2;
     }

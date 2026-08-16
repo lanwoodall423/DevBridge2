@@ -59,13 +59,15 @@ internal sealed partial class CoordinatorState
     }
 
     private bool WaitForReady(Action<string> emit, bool requireNoRestart, Func<bool> connected = null,
-        bool waitForMaintenance = false)
+        bool waitForMaintenance = false, Func<bool> budgetAvailable = null)
     {
         DateTime nextProgress = clock.UtcNow;
         bool first = true;
         while (true)
         {
             if (connected != null && !connected())
+                return false;
+            if (budgetAvailable != null && !budgetAvailable())
                 return false;
 
             lock (gate)

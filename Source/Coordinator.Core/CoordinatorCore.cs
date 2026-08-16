@@ -178,6 +178,16 @@ internal sealed class BridgeRequest
     // without persisting a future configuration error into the current state.
     internal string TestInputErrorCode { get; set; }
     internal string TestInputError { get; set; }
+    // Server-side only. Agent commands use a dedicated compact DTO while the
+    // host continues to use the existing broad JsonCommandResponse path.
+    internal AgentResponse AgentResponse { get; set; }
+    // Server-side only. Recipe commands use a compact versioned response and
+    // must not fall through the legacy operational response projection.
+    internal RecipeResponse RecipeResponse { get; set; }
+    // Server-side only. Forensic commands use bounded, dedicated responses so
+    // evidence never falls through the broad operational status projection.
+    internal LogsQueryResponse LogsQueryResponse { get; set; }
+    internal EvidenceShowResponse EvidenceShowResponse { get; set; }
 }
 
 internal enum BridgePhase
@@ -209,6 +219,16 @@ internal sealed class PersistedState
     public string TerminalFailureExceptionType { get; set; }
     public string TerminalFailureExceptionMessage { get; set; }
     public string TerminalFailureDiagnosticDetail { get; set; }
+    public string LatestFailureFingerprint { get; set; }
+    public bool LatestFailureSeenBefore { get; set; }
+    public int LatestFailureGeneration { get; set; }
+    public string LatestFailureSummary { get; set; }
+    public string LatestFailureEvidenceId { get; set; }
+    public string LatestFailureDiagnosisReference { get; set; }
+    public string LatestFailureContextFingerprint { get; set; }
+    public string LatestFailureRecipeId { get; set; }
+    public string LatestFailureComponent { get; set; }
+    public List<FailureOccurrenceSummary> FailureOccurrences { get; set; } = new();
     public string LaunchId { get; set; }
     public int LaunchGeneration { get; set; }
     public int ProcessId { get; set; }
@@ -291,6 +311,13 @@ internal sealed class PersistedState
     public string FrozenBaselineFingerprint { get; set; }
     public List<AggregateGenerationEvidence> AggregateGenerations { get; set; } = new();
     public RimBridgeIntegrationState RimBridge { get; set; } = new();
+
+    // Agent API sequencing is durable only for the lifetime of the current
+    // coordinator process. A new process creates a new epoch and clears the
+    // bounded journal, so an old client cursor can never be accepted silently.
+    public string AgentEpoch { get; set; }
+    public long AgentSequence { get; set; }
+    public List<AgentChangeRecord> AgentChangeJournal { get; set; } = new();
 }
 
 internal sealed class ProjectIntentRegistration
@@ -984,22 +1011,99 @@ internal sealed class CoordinatorOptions
     internal IRimBridgeClient RimBridgeClient { get; init; }
     internal IRimBridgeGenerationVerifier RimBridgeGenerationVerifier { get; init; }
     internal Action BeforeModsConfigWrite { get; init; }
-    internal ICoordinatorFaultInjector FaultInjector { get; init; }
+    internal ICoordinatorFaultInjector FaultInjector { get; set; }
 
-    internal static CoordinatorOptions ForProduction()
+    internal CoordinatorOptions ForScope(string coordinatorRoot, string runtimeSlotId)
+    {
+        return new CoordinatorOptions
+        {
+            ReadinessTimeout = ReadinessTimeout,
+            ProcessInspectionRetryTimeout = ProcessInspectionRetryTimeout,
+            ProcessExitTimeout = ProcessExitTimeout,
+            MaxLaunchAttempts = MaxLaunchAttempts,
+            IsolationMaxAttempts = IsolationMaxAttempts,
+            LeaseDuration = LeaseDuration,
+            LeaseHeartbeatInterval = LeaseHeartbeatInterval,
+            LeaseSessionPollInterval = LeaseSessionPollInterval,
+            ProjectIntentDuration = ProjectIntentDuration,
+            LeaseProgressInterval = LeaseProgressInterval,
+            RimBridgeCallTimeout = RimBridgeCallTimeout,
+            ProcessAdapter = ProcessAdapter,
+            Clock = Clock,
+            RimWorldExecutablePath = RimWorldExecutablePath,
+            ModsConfigPath = ModsConfigPath,
+            CoordinatorRoot = coordinatorRoot,
+            RuntimeSlotId = runtimeSlotId,
+            ProcessStartedUtc = ProcessStartedUtc,
+            InstalledModsRoots = InstalledModsRoots,
+            RimBridgeMode = RimBridgeMode,
+            PlayerLogPath = PlayerLogPath,
+            RimBridgeClient = RimBridgeClient,
+            RimBridgeGenerationVerifier = RimBridgeGenerationVerifier,
+            BeforeModsConfigWrite = BeforeModsConfigWrite,
+            FaultInjector = FaultInjector
+        };
+    }
+
+    internal static CoordinatorOptions ForProduction(string coordinatorRoot = null,
+        string runtimeSlotId = null)
     {
         TimeSpan timeout = TimeSpan.FromMinutes(6);
         string configured = Environment.GetEnvironmentVariable("DEVBRIDGE_READINESS_TIMEOUT_SECONDS");
         if (int.TryParse(configured, out int seconds) && seconds >= 30 && seconds <= 3600)
             timeout = TimeSpan.FromSeconds(seconds);
 
-        return new CoordinatorOptions
+        CoordinatorOptions options = new()
         {
             ReadinessTimeout = timeout,
             RimBridgeMode = RimBridgeModes.Parse(
                 Environment.GetEnvironmentVariable("DEVBRIDGE_RIMBRIDGE_MODE")),
             PlayerLogPath = Environment.GetEnvironmentVariable("DEVBRIDGE_PLAYER_LOG")
         };
+
+        // This is an explicit integration-test seam, not a general executable
+        // selection mechanism. Production remains bound to the real RimWorld
+        // executable unless the caller deliberately supplies the test marker.
+        string fakeExecutable = Environment.GetEnvironmentVariable("DEVBRIDGE_TEST_RIMWORLD_PATH");
+        if (!string.IsNullOrWhiteSpace(fakeExecutable))
+        {
+            string root = coordinatorRoot ?? Environment.GetEnvironmentVariable("DEVBRIDGE_ROOT");
+            string configuredRoots = Environment.GetEnvironmentVariable("DEVBRIDGE_TEST_INSTALLED_MODS_ROOTS");
+            string configuredModsConfig = Environment.GetEnvironmentVariable("DEVBRIDGE_TEST_MODS_CONFIG");
+            string configuredPlayerLog = Environment.GetEnvironmentVariable("DEVBRIDGE_TEST_PLAYER_LOG");
+            string testTimeout = Environment.GetEnvironmentVariable("DEVBRIDGE_TEST_READINESS_TIMEOUT_SECONDS");
+            if (int.TryParse(testTimeout, out int testSeconds) && testSeconds >= 1 && testSeconds <= 60)
+                options = new CoordinatorOptions
+                {
+                    ReadinessTimeout = TimeSpan.FromSeconds(testSeconds),
+                    ProcessInspectionRetryTimeout = TimeSpan.FromSeconds(1),
+                    ProcessExitTimeout = TimeSpan.FromSeconds(1),
+                    RimBridgeCallTimeout = TimeSpan.FromSeconds(1),
+                    RimBridgeMode = options.RimBridgeMode,
+                    PlayerLogPath = options.PlayerLogPath
+                };
+
+            options = new CoordinatorOptions
+            {
+                ReadinessTimeout = options.ReadinessTimeout,
+                ProcessInspectionRetryTimeout = options.ProcessInspectionRetryTimeout,
+                ProcessExitTimeout = options.ProcessExitTimeout,
+                RimBridgeCallTimeout = options.RimBridgeCallTimeout,
+                RimWorldExecutablePath = Path.GetFullPath(fakeExecutable),
+                ModsConfigPath = string.IsNullOrWhiteSpace(configuredModsConfig)
+                    ? Path.Combine(root ?? string.Empty, "ModsConfig.xml") : configuredModsConfig,
+                CoordinatorRoot = root,
+                RuntimeSlotId = runtimeSlotId,
+                InstalledModsRoots = string.IsNullOrWhiteSpace(configuredRoots)
+                    ? Array.Empty<string>()
+                    : configuredRoots.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries),
+                RimBridgeMode = options.RimBridgeMode,
+                PlayerLogPath = string.IsNullOrWhiteSpace(configuredPlayerLog)
+                    ? Path.Combine(root ?? string.Empty, "Player.log") : configuredPlayerLog
+            };
+        }
+
+        return options;
     }
 }
 
@@ -1543,19 +1647,24 @@ internal static class ModProfileResolver
 
         foreach (string path in configuredRoots ?? Array.Empty<string>())
             AddRoot(path);
-        AddRoot(coordinatorRoot);
-        AddRoot(Path.Combine(coordinatorRoot, ".."));
-        AddRoot(Path.Combine(coordinatorRoot, "..", "..", "Data"));
-        AddRoot(Path.Combine(coordinatorRoot, "..", "..", "Data", "Mods"));
-        string workshopOverride = Environment.GetEnvironmentVariable("RIMWORLD_WORKSHOP_PATH");
-        AddRoot(workshopOverride);
-
-        DirectoryInfo cursor = new(Path.GetFullPath(coordinatorRoot));
-        while (cursor != null)
+        bool testOnlyRestrictedDiscovery = !string.IsNullOrWhiteSpace(
+            Environment.GetEnvironmentVariable("DEVBRIDGE_TEST_RIMWORLD_PATH"));
+        if (!testOnlyRestrictedDiscovery)
         {
-            if (string.Equals(cursor.Name, "steamapps", StringComparison.OrdinalIgnoreCase))
-                AddRoot(Path.Combine(cursor.FullName, "workshop", "content", "294100"));
-            cursor = cursor.Parent;
+            AddRoot(coordinatorRoot);
+            AddRoot(Path.Combine(coordinatorRoot, ".."));
+            AddRoot(Path.Combine(coordinatorRoot, "..", "..", "Data"));
+            AddRoot(Path.Combine(coordinatorRoot, "..", "..", "Data", "Mods"));
+            string workshopOverride = Environment.GetEnvironmentVariable("RIMWORLD_WORKSHOP_PATH");
+            AddRoot(workshopOverride);
+
+            DirectoryInfo cursor = new(Path.GetFullPath(coordinatorRoot));
+            while (cursor != null)
+            {
+                if (string.Equals(cursor.Name, "steamapps", StringComparison.OrdinalIgnoreCase))
+                    AddRoot(Path.Combine(cursor.FullName, "workshop", "content", "294100"));
+                cursor = cursor.Parent;
+            }
         }
 
         Dictionary<string, List<InstalledModMetadata>> result =
@@ -1810,6 +1919,24 @@ internal sealed class SystemManagedProcess : IManagedProcess
         {
             if (process.HasExited)
                 return true;
+            // The process-level fake host is a console executable and has no
+            // window handle in headless validation. Its narrowly test-only
+            // signal preserves the same graceful-request/timeout boundary as
+            // a real windowed RimWorld process without changing production
+            // termination defaults.
+            string signalPath = Environment.GetEnvironmentVariable(
+                "DEVBRIDGE_TEST_GRACEFUL_STOP_SIGNAL");
+            if (string.IsNullOrWhiteSpace(signalPath) &&
+                process.StartInfo.Environment.TryGetValue(
+                    "DEVBRIDGE_TEST_GRACEFUL_STOP_SIGNAL", out string childSignalPath))
+                signalPath = childSignalPath;
+            if (!string.IsNullOrWhiteSpace(signalPath))
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(signalPath) ?? ".");
+                File.WriteAllText(signalPath, "stop", Encoding.UTF8);
+                return true;
+            }
+
             return process.CloseMainWindow();
         }
         catch (ProcessInspectionException)
@@ -1995,7 +2122,13 @@ internal sealed partial class CoordinatorState
     private Task restartTask;
     private Task launchTask;
     private Task isolationTask;
+    // Ensure-ready can invoke a launch synchronously while status/waiters are
+    // allowed to observe the durable LOADING transition. Keep recovery from
+    // mistaking that short in-memory window for a coordinator crash.
+    private int launchInvocationInProgress;
     private BridgePhase lastTracedPhase;
+    private Dictionary<string, string> agentObservation;
+    private bool agentObservationInitialized;
 
     internal TimeSpan ReadinessTimeoutForTesting => options.ReadinessTimeout;
     internal DateTime ProcessStartedUtcForTesting => processStartedUtc;
@@ -2151,6 +2284,8 @@ internal sealed partial class CoordinatorState
             lastTracedPhase = state.Phase;
             if (!persistedStateLoadBlocked && NormalizeRimBridgeStateLocked())
                 SaveStateLocked();
+            if (!persistedStateLoadBlocked)
+                InitializeAgentTrackingLocked();
         }
     }
 

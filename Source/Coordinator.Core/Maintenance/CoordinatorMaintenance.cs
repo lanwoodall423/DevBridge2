@@ -301,7 +301,7 @@ internal sealed partial class CoordinatorState
         }
     }
 
-    private int Restart(BridgeRequest request, Action<string> emit)
+    private int Restart(BridgeRequest request, Action<string> emit, Func<bool> budgetAvailable = null)
     {
         RestartArguments restartArguments;
         try
@@ -662,6 +662,12 @@ internal sealed partial class CoordinatorState
         EmitRestartWait(emit);
         while (true)
         {
+            if (budgetAvailable != null && !budgetAvailable())
+            {
+                emit("Restart remains accepted, but the caller recipe budget is exhausted.");
+                EmitNextCommand(emit, "DevBridge.cmd agent wait-event --until ready");
+                return 5;
+            }
             lock (gate)
             {
                 SynchronizeLocked();

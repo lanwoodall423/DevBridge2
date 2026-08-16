@@ -49,6 +49,46 @@ test sessions may remain connected and emit events, but they still have explicit
 clients never wait for a magic substring in arbitrary output. Version, correlation, frame, command,
 argument, and output limits are enforced before state mutation.
 
+The machine-facing agent surface is separate from the legacy JSON response and uses four versioned
+contracts: `devbridge-agent-capabilities/v1`, `devbridge-agent-snapshot/v1`,
+`devbridge-agent-delta/v1`, and `devbridge-agent-event/v1`. The commands are
+`agent capabilities --json`, `agent snapshot --json`, `agent delta --epoch <epoch> --since-seq <n> --json`,
+and `agent wait-event --epoch <epoch> --since-seq <n> [--until <condition>] [--timeout-seconds <n>] --json`.
+The delta cursor is `(epoch, sequence)`. Each coordinator process creates and durably records a fresh
+epoch, starts sequence numbering at zero, and clears the 128-entry field-level ring journal. A cursor
+from another epoch, ahead of the current sequence, or older than the retained ring fails closed; clients
+must take a new snapshot. A successful delta aggregates the latest value for each changed field and does
+not expose raw logs, diagnostics, endpoint host/port, or tokens. Snapshot projects, evidence, errors,
+identities, and event output are bounded; wait-event defaults to 30 seconds and is capped at five minutes.
+The journal is updated only during successful durable state replacement, so diagnostic trace activity does
+not advance the agent sequence. Durable replacement pulses the existing coordinator gate, allowing
+wait-event and legacy state waiters to wake without a polling loop.
+
+For the same state transition, polling requires one request and response per snapshot interval (for example,
+ten polls over ten seconds means 10 requests plus 10 snapshot responses). Wait-event requires one bounded
+request and one terminal response, regardless of how long it remains pending; the pending response is not
+written until a matching change, condition, timeout, shutdown, or disconnect occurs. Both use the existing
+IPC v2 frame limits; the agent projection is deliberately much smaller than the legacy response.
+
+Autonomous test recipes are repository-owned files under `TestRecipes/`. Each file uses the
+`devbridge-test-recipe/v1` schema and is parsed by a strict allow-list: project aliases, typed
+generation inputs, readiness/Quicktest and companion evidence requirements, bounded budgets, and
+policy-approved read-only RimBridge calls. Shell commands, arbitrary argv or environment values,
+filesystem writes, profile mutation, and RimWorld lifecycle tools are not recipe concepts. Discovery
+uses `test recipe list|show|plan`; `agent plan --recipe <id>` returns the versioned
+`devbridge-agent-plan/v1` projection without acquiring a lease, registering intent, saving state,
+restarting, writing ModsConfig, or calling RimBridge. The planner reuses project/profile resolution
+and frozen-generation evidence, so an already-satisfied recipe reports zero estimated launches.
+
+`test recipe run <id>` is a bounded coordinator operation. Caller timeout, launch, attempt, refresh,
+and repeated-failure limits are intersected with stricter coordinator limits. A run joins compatible
+accepted restart work through the existing launch-owner/frozen-generation rules, requests at most one
+replacement launch, uses the existing test-lease and RimBridge policy boundaries, and returns a compact
+versioned result with consumed budget, generation, evidence reference, failure fingerprint, and the
+next safe action. Lease and temporary registration cleanup is ownership-checked; an accepted pending
+restart is left durable for recovery when the caller budget expires. Recipe-run IPC is classified as
+long-running, while list/show/plan remain finite.
+
 The RimBridge client has a separate typed GABP boundary. Its contract and tested surface are in
 [`RimBridgeProtocolCompatibility.json`](../RimBridgeProtocolCompatibility.json): `gabp/1`, typed
 `session/hello`, `tools/list`, `tools/call`, bounded Content-Length framing, exact response IDs, and
@@ -126,6 +166,57 @@ Tokens and authorization secrets are never persisted in ordinary state, status, 
 trace, or release manifests. Error text and opaque evidence use bounded redaction. Raw environment
 variables, arbitrary tool payloads, and host SDK assemblies are not release diagnostics or package
 inputs.
+
+## Development planning and publication
+
+`scripts/dev-plan.ps1` is the source-aware development planner. It accepts
+`-ChangedSince <git-ref>` or an explicit `-ChangedFile` list and emits both a
+human summary and `devbridge-build-plan/v1` JSON. Classification follows the
+actual project graph: Coordinator.Core changes normally build the Coordinator
+host, the three Core files linked by the mod also require `DevBridge2.dll`,
+BridgeTools uses the existing companion project, and docs/tests/recipes do not
+trigger runtime binary builds. `scripts/dev-plan.tests.ps1` locks the minimal
+build/deploy/restart matrix, including mixed changes.
+
+`scripts/dev-publish.ps1` consumes or recomputes that plan. It builds only the
+selected projects, compares SHA-256 bytes before every deployment, replaces
+coordinator artifacts only after `coordinator shutdown`, and deploys BridgeTools
+through the existing canonical sibling path used by `Publish-DevBridge.ps1`.
+Hash-identical output is a no-op. Mod assemblies and RimWorld content report a
+RimWorld restart requirement; a copied file never proves that code already
+loaded in RimWorld. BridgeTools live reload is intentionally reported as
+unknown unless a supported host signal exists. `scripts/dev-publish.tests.ps1`
+covers identical coordinator output, changed coordinator graceful refresh,
+changed mod restart/loaded-code uncertainty, and canonical companion placement.
+
+The coordinator remains a runtime authority, not a build service. `agent
+build-plan --json` is a compact read-only projection of coordinator, mod, and
+BridgeTools disk identities, artifact hashes, and `requiredRefresh`; its
+`loadedStatus` is `unknown-not-proven` for externally loaded mod/companion code.
+Git, build, and deployment decisions remain in PowerShell.
+
+## Process-level fake-host verification
+
+`Source/FakeRimWorld` is a dedicated net8 test executable, not a second runtime or release
+deployment. `scripts/process-e2e.tests.ps1` starts it as the configured child process through the
+production `SystemProcessAdapter` boundary. Every command in this suite goes through the published
+CLI, named-pipe IPC v2, `CoordinatorServer`, and production `Coordinator.Core`; the tests do not call
+`CoordinatorState.Execute` directly. The fake host writes launch- and process-identity-bound
+`readiness.json` and quicktest failure artifacts, bounded `Player.log` output, and supports
+deterministic delayed/never/malformed readiness, crashes, log rotation, graceful/hung termination,
+and the existing GABP `session/hello`, `tools/list`, and `tools/call` contract. Its scenarios also
+cover authentication failure, delayed responses, missing companion tools, and generation-context
+mismatch.
+
+The process suite covers cold start, replacement restart, lease-authorized stop, hung-stop
+fail-closed behavior, coordinator shutdown/recovery, delayed and never-ready launches, crash and
+Quicktest attribution, recipe success/failure/repeat short-circuiting, RimBridge policy and
+companion identity, semantic log compaction, coordinator-only refresh, and mod restart planning.
+Validation reports the scenario count, duration, and `0 real RimWorld launches`. The fake host cannot
+prove Unity loading behavior, real RimWorld UI/main-menu timing, actual Mod assembly load identity,
+or compatibility with an installed RimBridgeServer build. Those require a separate local Windows
+smoke check against the user's real RimWorld installation; the compatibility metadata intentionally
+claims no live RimBridgeServer version without that check.
 
 ## Invariants for future changes
 

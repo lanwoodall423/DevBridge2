@@ -39,6 +39,62 @@ internal sealed class GenerationManifest
 
     [JsonPropertyName("components")]
     public ComponentVersionReport Components { get; set; }
+
+    [JsonPropertyName("failure")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public GenerationFailureEvidence Failure { get; set; }
+
+    [JsonPropertyName("companion")]
+    public GenerationCompanionEvidence Companion { get; set; } = new();
+
+    [JsonPropertyName("recipeContext")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public GenerationRecipeContextEvidence RecipeContext { get; set; }
+}
+
+internal sealed class GenerationFailureEvidence
+{
+    [JsonPropertyName("failureFingerprint")]
+    public string FailureFingerprint { get; set; }
+
+    [JsonPropertyName("seenBefore")]
+    public bool SeenBefore { get; set; }
+
+    [JsonPropertyName("evidenceId")]
+    public string EvidenceId { get; set; }
+
+    [JsonPropertyName("diagnosisReference")]
+    public string DiagnosisReference { get; set; }
+
+    [JsonPropertyName("summary")]
+    public string Summary { get; set; }
+}
+
+internal sealed class GenerationCompanionEvidence
+{
+    [JsonPropertyName("lifecycleState")]
+    public string LifecycleState { get; set; }
+
+    [JsonPropertyName("available")]
+    public bool Available { get; set; }
+
+    [JsonPropertyName("verified")]
+    public bool Verified { get; set; }
+
+    [JsonPropertyName("diagnosticCode")]
+    public string DiagnosticCode { get; set; }
+}
+
+internal sealed class GenerationRecipeContextEvidence
+{
+    [JsonPropertyName("recipeId")]
+    public string RecipeId { get; set; }
+
+    [JsonPropertyName("reproductionContextFingerprint")]
+    public string ReproductionContextFingerprint { get; set; }
+
+    [JsonPropertyName("projectFingerprint")]
+    public string ProjectFingerprint { get; set; }
 }
 
 internal sealed class GenerationLaunchEvidence
@@ -195,6 +251,18 @@ internal sealed class GenerationHistoryRecord
 
     [JsonPropertyName("testInputs")]
     public List<TestInputValue> TestInputs { get; set; } = new();
+
+    [JsonPropertyName("failureFingerprint")]
+    public string FailureFingerprint { get; set; }
+
+    [JsonPropertyName("failureEvidenceId")]
+    public string FailureEvidenceId { get; set; }
+
+    [JsonPropertyName("diagnosisReference")]
+    public string DiagnosisReference { get; set; }
+
+    [JsonPropertyName("failureSeenBefore")]
+    public bool FailureSeenBefore { get; set; }
 }
 
 internal sealed class GenerationHistoryEnvelope
@@ -295,7 +363,8 @@ internal sealed partial class CoordinatorState
     private const string HistoryStoppedStatus = "STOPPED";
 
     private bool TryRecordGenerationOutcomeLocked(int generation, string status,
-        string terminalFailureCode = null, string terminalFailureDetail = null)
+        string terminalFailureCode = null, string terminalFailureDetail = null,
+        FailureFingerprintInput failureInput = null)
     {
         if (generation <= 0)
             return true;
@@ -366,6 +435,14 @@ internal sealed partial class CoordinatorState
         {
             string safeCode = SafeHistoryText(terminalFailureCode);
             string safeDetail = SafeHistoryText(terminalFailureDetail);
+            FailureOccurrenceSummary occurrence = null;
+            if (!string.IsNullOrWhiteSpace(safeCode) &&
+                !string.Equals(safeCode, "PROCESS_STOPPED", StringComparison.Ordinal))
+            {
+                occurrence = RecordFailureOccurrenceLocked(
+                    failureInput ?? BuildFailureInputLocked(safeCode, status, safeDetail),
+                    generation, status, safeDetail);
+            }
             if (record == null)
             {
                 record = new GenerationHistoryRecord
@@ -375,7 +452,11 @@ internal sealed partial class CoordinatorState
                     ObservedUtc = now,
                     TerminalFailureCode = safeCode,
                     TerminalFailureDetail = safeDetail,
-                    TestInputs = semanticInputs
+                    TestInputs = semanticInputs,
+                    FailureFingerprint = occurrence?.FailureFingerprint,
+                    FailureEvidenceId = occurrence?.EvidenceId,
+                    DiagnosisReference = occurrence?.DiagnosisReference,
+                    FailureSeenBefore = occurrence?.SeenBefore ?? false
                 };
                 envelope.Records.Add(record);
                 changed = true;
@@ -392,6 +473,23 @@ internal sealed partial class CoordinatorState
                     record.TerminalFailureCode = safeCode;
                     record.TerminalFailureDetail = safeDetail;
                     record.TestInputs = semanticInputs;
+                    if (occurrence != null)
+                    {
+                        record.FailureFingerprint = occurrence.FailureFingerprint;
+                        record.FailureEvidenceId = occurrence.EvidenceId;
+                        record.DiagnosisReference = occurrence.DiagnosisReference;
+                        record.FailureSeenBefore = occurrence.SeenBefore;
+                    }
+                    changed = true;
+                }
+                else if (occurrence != null &&
+                    (!string.Equals(record.FailureFingerprint, occurrence.FailureFingerprint, StringComparison.Ordinal) ||
+                     !string.Equals(record.FailureEvidenceId, occurrence.EvidenceId, StringComparison.Ordinal)))
+                {
+                    record.FailureFingerprint = occurrence.FailureFingerprint;
+                    record.FailureEvidenceId = occurrence.EvidenceId;
+                    record.DiagnosisReference = occurrence.DiagnosisReference;
+                    record.FailureSeenBefore = occurrence.SeenBefore;
                     changed = true;
                 }
             }
@@ -401,6 +499,32 @@ internal sealed partial class CoordinatorState
         if (changed)
             return TryWriteGenerationHistoryLocked(envelope);
         return true;
+    }
+
+    private void RefreshLatestFailureReferencesInHistoryLocked(int generation)
+    {
+        if (generation <= 0 || string.IsNullOrWhiteSpace(state.LatestFailureFingerprint))
+            return;
+        if (!TryLoadGenerationHistoryLocked(out GenerationHistoryEnvelope envelope,
+                out _, out _))
+            return;
+        GenerationHistoryRecord record = envelope.Records.FirstOrDefault(value =>
+            value.Generation == generation);
+        if (record == null || !string.Equals(record.FailureFingerprint,
+                state.LatestFailureFingerprint, StringComparison.Ordinal))
+            return;
+
+        bool changed = !string.Equals(record.FailureEvidenceId, state.LatestFailureEvidenceId,
+                StringComparison.Ordinal) ||
+            !string.Equals(record.DiagnosisReference, state.LatestFailureDiagnosisReference,
+                StringComparison.Ordinal) ||
+            record.FailureSeenBefore != state.LatestFailureSeenBefore;
+        if (!changed)
+            return;
+        record.FailureEvidenceId = SafeHistoryText(state.LatestFailureEvidenceId);
+        record.DiagnosisReference = SafeHistoryText(state.LatestFailureDiagnosisReference);
+        record.FailureSeenBefore = state.LatestFailureSeenBefore;
+        TryWriteGenerationHistoryLocked(envelope);
     }
 
     private GenerationManifest BuildGenerationManifestLocked(int generation, DateTime acceptedUtc)
@@ -498,7 +622,32 @@ internal sealed partial class CoordinatorState
                 QuicktestTimeoutSeconds = TestGenerationInputs.FromValues(profile.TestInputs, profile.Mode).QuicktestTimeoutSeconds,
                 BridgeReadyRequired = profile.RimBridgeMode == RimBridgeMode.Required
             },
-            Components = ComponentVersions.Current
+            Components = ComponentVersions.Current,
+            Failure = state.LatestFailureGeneration == generation &&
+                !string.IsNullOrWhiteSpace(state.LatestFailureFingerprint)
+                ? new GenerationFailureEvidence
+                {
+                    FailureFingerprint = SafeHistoryText(state.LatestFailureFingerprint),
+                    SeenBefore = state.LatestFailureSeenBefore,
+                    EvidenceId = SafeHistoryText(state.LatestFailureEvidenceId),
+                    DiagnosisReference = SafeHistoryText(state.LatestFailureDiagnosisReference),
+                    Summary = SafeHistoryText(state.LatestFailureSummary)
+                } : null,
+            Companion = new GenerationCompanionEvidence
+            {
+                LifecycleState = SafeHistoryText(state.RimBridge?.LifecycleState.ToString()),
+                Available = state.RimBridge != null && state.RimBridge.LifecycleState != RimBridgeLifecycleState.DISABLED,
+                Verified = state.RimBridge?.CompanionVerified == true,
+                DiagnosticCode = SafeHistoryText(state.RimBridge == null ? null : RimBridgeCompanionDiagnostics.Code(state.RimBridge))
+            },
+            RecipeContext = !string.IsNullOrWhiteSpace(state.LatestFailureRecipeId) &&
+                state.LatestFailureGeneration == generation
+                ? new GenerationRecipeContextEvidence
+                {
+                    RecipeId = SafeHistoryText(state.LatestFailureRecipeId),
+                    ReproductionContextFingerprint = SafeHistoryText(state.LatestFailureContextFingerprint),
+                    ProjectFingerprint = SafeHistoryText(profile.ProfileFingerprint)
+                } : null
         };
     }
 

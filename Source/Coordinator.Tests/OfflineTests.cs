@@ -206,6 +206,24 @@ internal static partial class OfflineTests
         Run("fault injection covers IPC and shutdown boundaries", TestFaultInjectionIpcAndShutdownBoundaries);
         Run("fault injection covers artifacts and recovery", TestFaultInjectionArtifactAndRecoveryBoundaries);
         Run("deterministic coordinator state-machine sequences", TestDeterministicCoordinatorStateMachine);
+        Run("agent capabilities are versioned and bounded", TestAgentCapabilities);
+        Run("agent build plan reports loaded-code uncertainty", TestAgentBuildPlan);
+        Run("agent snapshot is compact and fail-closed", TestAgentSnapshot);
+        Run("agent epoch and delta journal semantics", TestAgentDeltaJournal);
+        Run("agent wait-event wakes on durable state change", TestAgentWaitEvent);
+        Run("agent wait-event timeout and shutdown are terminal", TestAgentWaitEventTimeoutAndShutdown);
+        Run("agent IPC preserves one versioned terminal result", TestAgentIpc);
+        Run("recipe parsing and compact discovery are strict", TestRecipeParsingAndDiscovery);
+        Run("recipe and agent planning are pure and bounded", TestRecipePlanningIsPureAndBounded);
+        Run("satisfied recipe execution avoids restart", TestRecipeAlreadySatisfiedAvoidsRestart);
+        Run("recipe execution uses one launch and enforces caller budget", TestRecipeRunUsesOneLaunchAndEnforcesBudget);
+        Run("recipe budgets cannot weaken coordinator safety limits", TestRecipeRunBudgetCannotWeakenCoordinatorLimit);
+        Run("failure fingerprints normalize noise and preserve context changes", TestFailureFingerprintNormalization);
+        Run("failure occurrences deduplicate with bounded evidence", TestFailureOccurrenceDeduplication);
+        Run("repeated recipe failures short-circuit only equivalent inputs", TestRepeatedRecipeFailureEquivalence);
+        Run("semantic logs are launch-bounded, deduplicated, and smaller", TestSemanticLogsAreBoundedAndCompact);
+        Run("evidence lookup is lazy, bounded, and expires deterministically", TestEvidenceLookupBoundsAndExpiry);
+        Run("forensic commands expose diagnosis references without loaded-code claims", TestForensicCommandsAndDiagnosisReference);
 
         Console.WriteLine(failures == 0 ? "OFFLINE TESTS PASS" : "OFFLINE TESTS FAIL: " + failures);
         return failures == 0 ? 0 : 1;
@@ -476,7 +494,8 @@ internal static partial class OfflineTests
 
         internal CoordinatorState Reload()
         {
-            return new CoordinatorState(Root, new CoordinatorOptions
+            ICoordinatorFaultInjector faultInjector = FaultInjector;
+            CoordinatorState reloaded = new CoordinatorState(Root, new CoordinatorOptions
             {
                 ReadinessTimeout = TimeSpan.FromSeconds(3),
                 ProcessInspectionRetryTimeout = TimeSpan.FromSeconds(2),
@@ -491,8 +510,13 @@ internal static partial class OfflineTests
                 RimBridgeClient = RouteClient,
                 RimBridgeGenerationVerifier = RouteVerifier,
                 BeforeModsConfigWrite = BeforeModsConfigWrite,
-                FaultInjector = FaultInjector
+                // The fixture applies fault plans after construction so the
+                // coordinator's process-scoped epoch initialization remains
+                // outside operation-boundary fault tests.
+                FaultInjector = null
             });
+            reloaded.SetFaultInjectorForTesting(faultInjector);
+            return reloaded;
         }
 
         public void Dispose()

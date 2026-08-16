@@ -130,7 +130,11 @@ internal sealed partial class CoordinatorState
         if (persistedStateLoadBlocked)
             return;
 
-        bool changed = false;
+        BeginAgentEpochLocked();
+        // The epoch is process-scoped. Persist the fresh epoch even when the
+        // rest of the legacy state needs no normalization so a crash cannot
+        // leave an old cursor silently durable.
+        bool changed = true;
         if (state.SchemaVersion != DevBridgeSchemaVersions.RuntimeState)
         {
             state.SchemaVersion = DevBridgeSchemaVersions.RuntimeState;
@@ -170,6 +174,17 @@ internal sealed partial class CoordinatorState
         state.FrozenTestInputs ??= new List<TestInputValue>();
         state.AggregateGenerations ??= new List<AggregateGenerationEvidence>();
         state.CrashIsolationHistory ??= new List<CrashIsolationIncident>();
+        state.FailureOccurrences ??= new List<FailureOccurrenceSummary>();
+        if (state.FailureOccurrences.Count > FailureEvidenceLimits.MaxOccurrences)
+        {
+            state.FailureOccurrences = state.FailureOccurrences
+                .Where(value => value != null)
+                .OrderByDescending(value => value.LastSeenUtc)
+                .ThenByDescending(value => value.LastSeenGeneration)
+                .Take(FailureEvidenceLimits.MaxOccurrences)
+                .ToList();
+            changed = true;
+        }
         if (state.CrashIsolation != null)
         {
             if (string.IsNullOrWhiteSpace(state.CrashIsolation.Status))
@@ -613,6 +628,7 @@ internal sealed partial class CoordinatorState
         if (persistedStateLoadBlocked)
             return;
 
+        UpdateAgentJournalLocked();
         TracePhaseTransitionIfNeededLocked();
         long started = Stopwatch.GetTimestamp();
         TraceEvent("state.save.started");
@@ -628,6 +644,7 @@ internal sealed partial class CoordinatorState
                     CoordinatorFaultPoint.AfterStateDurableReplacement));
             TraceEvent("state.save.completed", durationMs: ElapsedMilliseconds(started),
                 success: true);
+            Monitor.PulseAll(gate);
         }
         catch (Exception exception)
         {

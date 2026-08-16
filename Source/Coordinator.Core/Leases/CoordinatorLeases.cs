@@ -15,7 +15,7 @@ namespace DevBridge.Coordinator;
 internal sealed partial class CoordinatorState
 {
     private int BeginLease(BridgeRequest request, Action<string> emit, Func<bool> connected,
-        Action<TestLease> acquired = null)
+        Action<TestLease> acquired = null, Func<bool> budgetAvailable = null)
     {
         emit("Agent/session: " + request.Agent);
         bool startInitialLaunch;
@@ -122,7 +122,8 @@ internal sealed partial class CoordinatorState
             return 0;
         }
 
-        if (!WaitForReady(emit, requireNoRestart: true, connected: connected, waitForMaintenance: true))
+        if (!WaitForReady(emit, requireNoRestart: true, connected: connected, waitForMaintenance: true,
+                budgetAvailable: budgetAvailable))
             return 4;
 
         if (!connected())

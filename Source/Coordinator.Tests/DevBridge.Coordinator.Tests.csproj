@@ -43,5 +43,8 @@
     <Compile Include="CoordinatorFaultAndModelTests.cs" />
     <Compile Include="CoordinatorStateMachineTests.cs" />
     <Compile Include="BridgeToolsDeploymentTests.cs" />
+    <Compile Include="AgentSurfaceTests.cs" />
+    <Compile Include="AutonomousRecipesTests.cs" />
+    <Compile Include="FailureEvidenceTests.cs" />
   </ItemGroup>
 </Project>

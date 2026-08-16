@@ -541,11 +541,11 @@ internal static partial class OfflineTests
 
     private sealed class FakeClock : ICoordinatorClock
     {
-        private DateTime now;
-        internal FakeClock(DateTime start) => now = start;
-        public DateTime UtcNow => now;
-        public void Sleep(TimeSpan duration) => now = now.Add(duration);
-        internal void Advance(TimeSpan duration) => now = now.Add(duration);
+        private long nowTicks;
+        internal FakeClock(DateTime start) => nowTicks = start.Ticks;
+        public DateTime UtcNow => new(Volatile.Read(ref nowTicks), DateTimeKind.Utc);
+        public void Sleep(TimeSpan duration) => Interlocked.Add(ref nowTicks, duration.Ticks);
+        internal void Advance(TimeSpan duration) => Interlocked.Add(ref nowTicks, duration.Ticks);
     }
 
     private sealed class FakeProcessAdapter : IProcessAdapter

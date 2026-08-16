@@ -165,6 +165,11 @@ internal static partial class OfflineTests
         Assert(stillBlocked.State == "WAITING_FOR_BRIDGE" && stillBlocked.ActiveTests == 1 &&
             fixture.Adapter.LaunchCalls == 0, "an unexpired lease must still block the owned process restart");
         fixture.Clock.Advance(TimeSpan.FromSeconds(1));
+        // The production coordinator prunes expired leases when it observes
+        // ordinary status traffic and pulses the restart worker.  Drive that
+        // same bounded wake-up explicitly so this test does not depend on a
+        // one-second scheduler timeout under a loaded CI runner.
+        fixture.State.CreateJsonResponse(Request("status"), 0, Array.Empty<string>());
 
         Assert(restart.Wait(TimeSpan.FromSeconds(2)) && restart.Result == 0 && fixture.Adapter.LaunchCalls == 1,
             "an abandoned lease must release the queued restart within the bounded interval");
@@ -189,6 +194,7 @@ internal static partial class OfflineTests
             "ending one shared lease must not release a restart blocked by another lease");
 
         fixture.Clock.Advance(TimeSpan.FromMinutes(1));
+        fixture.State.CreateJsonResponse(Request("status"), 0, Array.Empty<string>());
         Assert(restart.Wait(TimeSpan.FromSeconds(2)) && restart.Result == 0 && fixture.Adapter.LaunchCalls == 1,
             "the queued restart must resume once after the final shared lease expires");
         Assert(fixture.State.Execute(Request("status"), _ => { }, () => true) == 0,

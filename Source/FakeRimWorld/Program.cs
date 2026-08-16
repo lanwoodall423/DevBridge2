@@ -76,6 +76,8 @@ internal static class Program
         if (readyDelay > 0)
             await Task.Delay(readyDelay, stop.Token);
 
+        await WaitForReadyGate(scenario, stop.Token);
+
         WriteReadiness(runtime, launchId, generation, processId, processStartIdentity, scenario);
         Append(logPath, "[FakeRimWorld] readiness accepted");
 
@@ -109,6 +111,19 @@ internal static class Program
         {
         }
         return 0;
+    }
+
+    private static async Task WaitForReadyGate(FakeScenario scenario, CancellationToken token)
+    {
+        if (string.IsNullOrWhiteSpace(scenario.ReadyGatePath))
+            return;
+
+        string waitingPath = string.IsNullOrWhiteSpace(scenario.ReadyWaitingPath)
+            ? scenario.ReadyGatePath + ".waiting"
+            : scenario.ReadyWaitingPath;
+        File.WriteAllText(waitingPath, "ready-waiting", Encoding.UTF8);
+        while (!File.Exists(scenario.ReadyGatePath))
+            await Task.Delay(25, token);
     }
 
     private static async Task RotateLogAfterDelay(string path, int delayMs, CancellationToken token)
@@ -233,6 +248,8 @@ internal sealed class FakeScenario
     public bool CompanionGenerationMismatch { get; set; }
     public int ResponseDelayMs { get; set; }
     public string? PlayerLogPath { get; set; }
+    public string? ReadyGatePath { get; set; }
+    public string? ReadyWaitingPath { get; set; }
 
     public static FakeScenario Load(string runtime)
     {

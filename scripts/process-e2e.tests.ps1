@@ -74,6 +74,8 @@ function New-Fixture {
     $runtime = Join-Path $root 'Runtime'
     $modsRoot = Join-Path $root 'InstalledMods'
     $logPath = Join-Path $root 'Player.log'
+    $readyGatePath = Join-Path $runtime 'ready.gate'
+    $readyWaitingPath = $readyGatePath + '.waiting'
     New-Item -ItemType Directory -Force -Path $runtime, $modsRoot | Out-Null
 
     foreach ($packageId in $alwaysOnPackages) {
@@ -96,6 +98,10 @@ $activeMods
     }
     foreach ($key in $ScenarioOverrides.Keys) {
         $scenario[$key] = $ScenarioOverrides[$key]
+    }
+    if ($ScenarioName -eq 'ready-delayed' -and -not $scenario.Contains('readyGatePath')) {
+        $scenario['readyGatePath'] = $readyGatePath
+        $scenario['readyWaitingPath'] = $readyWaitingPath
     }
     Write-Utf8File (Join-Path $runtime 'fake-rimworld-scenario.json') (($scenario | ConvertTo-Json -Depth 8))
 
@@ -120,6 +126,8 @@ $activeMods
         Slot = $slot
         LogPath = $logPath
         ScenarioPath = Join-Path $runtime 'fake-rimworld-scenario.json'
+        ReadyGatePath = $readyGatePath
+        ReadyWaitingPath = $readyWaitingPath
         FakeExecutable = $fakeExe
         LastResponseBeforeCleanup = $null
     }
@@ -158,7 +166,7 @@ function Get-DiagnosticArtifactPaths {
         (Join-Path $Root 'Player.log'),
         (Join-Path $Root 'ModsConfig.xml')
     )) {
-        if (Test-Path -LiteralPath $path) { $paths.Add((Resolve-Path -LiteralPath $path).Path) }
+        $paths.Add([IO.Path]::GetFullPath($path))
     }
     if (Test-Path -LiteralPath $runtime -PathType Container) {
         Get-ChildItem -LiteralPath $runtime -Filter 'e2e-result-*.json' -File -ErrorAction SilentlyContinue |
@@ -205,6 +213,9 @@ function Format-BridgeFailure {
         $artifactText = Get-DiagnosticArtifactText $path
         if ($null -ne $artifactText) {
             $lines.Add("  bounded contents: $artifactText")
+        }
+        elseif (-not (Test-Path -LiteralPath $path)) {
+            $lines.Add('  status: missing')
         }
     }
     return ($lines -join "`n")
@@ -324,6 +335,16 @@ function Wait-GameState {
         Start-Sleep -Milliseconds 50
     } while ([DateTime]::UtcNow -lt $deadline)
     throw "Timed out waiting for gameState=$Expected."
+}
+
+function Wait-File {
+    param([Parameter(Mandatory = $true)][string]$Path, [int]$TimeoutMs = 5000)
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    do {
+        if (Test-Path -LiteralPath $Path -PathType Leaf) { return }
+        Start-Sleep -Milliseconds 25
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Timed out waiting for synchronization file: $Path"
 }
 
 function Get-FakePid {
@@ -498,13 +519,20 @@ $results.Add((Invoke-Case 'delayed readiness is observable through agent wait-ev
         $restart = Start-Process -FilePath $coordinatorExe -ArgumentList @('--root', $fixture.Root,
             '--runtime-slot', $fixture.Slot, 'restart', '--projects', 'none', '--json') -PassThru -WindowStyle Hidden
         try {
-            Start-Sleep -Milliseconds 100
+            Wait-File $fixture.ReadyWaitingPath
             $cursor = Invoke-Bridge -Root $fixture.Root -Slot $fixture.Slot -Arguments @('agent', 'snapshot')
-            Assert-Success $cursor 'agent snapshot'
+            Assert-Success $cursor 'agent snapshot before readiness release'
+            $cursorSequence = [int64]$cursor.Json.sequence
+            $cursorEpoch = [string]$cursor.Json.epoch
+            New-Item -ItemType File -Force -Path $fixture.ReadyGatePath | Out-Null
             $event = Invoke-Bridge -Root $fixture.Root -Slot $fixture.Slot -Arguments @(
-                'agent', 'wait-event', '--since-seq', [string]$cursor.Json.sequence,
-                '--epoch', [string]$cursor.Json.epoch, '--until', 'ready', '--timeout-ms', '3000')
+                'agent', 'wait-event', '--since-seq', [string]$cursorSequence,
+                '--epoch', $cursorEpoch, '--until', 'ready', '--timeout-ms', '3000')
             Assert-Success $event 'agent wait-event'
+            if ([string]$event.Json.result -ne 'condition-met' -or
+                [int64]$event.Json.toSeq -le $cursorSequence) {
+                throw "Agent wait-event did not observe a later ready transition: $($event.Output)"
+            }
         } finally {
             Wait-Process -Id $restart.Id -Timeout 5 -ErrorAction SilentlyContinue
         }

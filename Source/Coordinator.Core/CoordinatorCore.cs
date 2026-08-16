@@ -105,7 +105,7 @@ internal static class RuntimeScope
             "' for '" + CanonicalizeRootPath(root) +
             "'. The legacy slot has only 32 bits of identity and cannot be rebound automatically. " +
             "Use the coordinator build that created this state to perform a graceful 'coordinator shutdown', " +
-            "then retry with the current build; preserve Runtime/state.json and do not delete it.";
+            "then run 'coordinator migrate-legacy-slot' with the current build; preserve Runtime/state.json and do not delete it.";
     }
 
     internal static string ResolveTicketSlot(string root, string ticketId)

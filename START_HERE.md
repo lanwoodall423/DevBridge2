@@ -88,6 +88,20 @@ the current `Coordinator\DevBridge.Coordinator.exe` with the current environment
 `restart`, `wait-ready`, or test session may be disconnected while the coordinator drains; reconnect with
 `status`/`wait-ready` and do not resubmit the accepted operation.
 
+If the current build refuses to start because `Runtime/state.json` contains a legacy 8-hex-character runtime
+slot, do not delete or hand-edit the state. Use the coordinator build that created it to run
+`DevBridge.cmd coordinator shutdown`, install the current coordinator, then run:
+
+```text
+DevBridge.cmd coordinator migrate-legacy-slot --json
+DevBridge.cmd status --json
+```
+
+The migration only proceeds when the legacy and current slot owners are both absent, the persisted RimWorld
+process identity is absent, and no active lease or lifecycle operation remains. It writes an exact
+`Runtime/state.json.legacy-slot-*.bak` backup and atomically updates the top-level slot and any matching scope
+tickets. It is idempotent; unsafe or ambiguous preconditions return a stable machine-readable error.
+
 Use `DevBridge.cmd stop <lease-id>` instead when the goal is assembly or ModsConfig maintenance: `stop`
 intentionally terminates the owned RimWorld process and opens the exclusive `STOPPED` maintenance window.
 

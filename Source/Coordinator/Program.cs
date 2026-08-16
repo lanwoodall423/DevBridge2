@@ -41,6 +41,12 @@ internal static class Program
                 return 2;
             }
 
+            // Legacy runtime-slot state cannot be loaded by the normal client
+            // path. This guarded local maintenance command must run before
+            // ResolveEffectiveSlot rejects the old namespace.
+            if (CoordinatorLegacySlotMigration.IsCommand(parsed.Command))
+                return CoordinatorLegacySlotMigration.Run(root, parsed.Command);
+
             return CoordinatorClient.Run(root, parsed.Command, parsed.RuntimeSlotId, parsed.TicketId);
         }
         catch (Exception exception)
@@ -52,7 +58,7 @@ internal static class Program
 
     private static void PrintUsage()
     {
-        Console.WriteLine("DevBridge commands: status | bridge status | bridge policy | bridge endpoint | bridge tools | bridge call <tool-name> [JSON arguments] [--lease <lease-id>] | project register <alias[,alias...]> | project status | project renew <registration-id> | project release <registration-id> | mods status | mods capture-baseline | mods restore-baseline | test begin | test session | test renew <lease-id> | test end <lease-id> | stop <lease-id> | coordinator shutdown | ensure-ready <lease-id> | restart [--projects none|alias[,alias...]] [--legacy-production] | wait-ready | history [show <generation>|last-good] | doctor");
+        Console.WriteLine("DevBridge commands: status | bridge status | bridge policy | bridge endpoint | bridge tools | bridge call <tool-name> [JSON arguments] [--lease <lease-id>] | project register <alias[,alias...]> | project status | project renew <registration-id> | project release <registration-id> | mods status | mods capture-baseline | mods restore-baseline | test begin | test session | test renew <lease-id> | test end <lease-id> | stop <lease-id> | coordinator shutdown | coordinator migrate-legacy-slot | ensure-ready <lease-id> | restart [--projects none|alias[,alias...]] [--legacy-production] | wait-ready | history [show <generation>|last-good] | doctor");
         Console.WriteLine("Append --json to a non-session command for machine-readable output.");
     }
 }

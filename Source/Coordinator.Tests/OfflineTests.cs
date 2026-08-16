@@ -189,6 +189,7 @@ internal static partial class OfflineTests
         Run("oversized and malformed IPC requests are mutation-free", TestOversizedAndMalformedRequestsAreMutationFree);
         Run("runtime namespace identities are canonical and collision-resistant", TestRuntimeNamespaceInvariants);
         Run("durable identifiers are widened with safe legacy handling", TestIdentifierStrengthAndLegacyCompatibility);
+        Run("legacy runtime slots migrate atomically and fail closed", TestLegacyRuntimeSlotMigration);
         Run("two coordinators cannot own one runtime slot", TestTwoCoordinatorsCannotOwnSameSlot);
         Run("finite commands have bounded terminal responses", TestFiniteCommandsHaveBoundedTerminalResponses);
         Run("durable wait response policy remains unbounded", TestDurableWaitResponsePolicyRemainsUnbounded);

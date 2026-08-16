@@ -19,6 +19,7 @@
   <ItemGroup>
     <Compile Include="Program.cs" />
     <Compile Include="CoordinatorIpcProtocol.cs" />
+    <Compile Include="CoordinatorLegacySlotMigration.cs" />
     <Compile Include="AssemblyInfo.cs" />
     <ProjectReference Include="..\Coordinator.Core\DevBridge.Coordinator.Core.csproj" />
   </ItemGroup>

@@ -29,7 +29,9 @@ DevBridge.cmd test begin
 
 Use `DevBridge.cmd test end <lease-id>` when the test lease is finished. Use `doctor --json` after a
 refusal or unexpected state. `coordinator shutdown` gracefully reloads the host while preserving
-durable state.
+durable state. If an older build reports a legacy runtime slot, first run that build's
+`coordinator shutdown`, then run `DevBridge.cmd coordinator migrate-legacy-slot --json` with the current
+build. The migration is guarded, creates an exact state backup, and atomically updates the namespace.
 
 ## Build and release
 

@@ -150,9 +150,13 @@ Runtime scope names are derived with separate helpers: `CanonicalizeRootPath` an
 normalize a root path, while `HashOpaqueIdentifier` hashes runtime slots without calling
 `Path.GetFullPath`. New runtime slots are `slot-` plus 24 uppercase SHA-256 hex characters (96 bits),
 and pipe/mutex names include the canonical root and use the same 96-bit practical hash length. A state
-file containing the old 8-hex-character runtime slot is rejected before startup with guidance to use the
-older coordinator to perform a graceful `coordinator shutdown`, preserve `Runtime/state.json`, and then
-retry; it is never silently rebound to a different namespace.
+file containing the old 8-hex-character runtime slot is rejected before startup. The supported migration is:
+use the older coordinator to perform a graceful `coordinator shutdown`, preserve `Runtime/state.json`, install
+the current build, and run `DevBridge.cmd coordinator migrate-legacy-slot --json`. The migration acquires both
+slot ownership mutexes, requires no live persisted RimWorld identity, active lease, or active lifecycle operation,
+copies an exact `Runtime/state.json.legacy-slot-*.bak` backup, and atomically updates the top-level slot plus
+matching scope tickets. It is idempotent and fails with a stable error code rather than silently rebinding an
+ambiguous artifact.
 
 The Coordinator source boundary is deliberate:
 

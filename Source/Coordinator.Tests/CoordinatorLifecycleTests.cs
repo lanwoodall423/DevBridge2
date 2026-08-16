@@ -544,6 +544,68 @@ internal static partial class OfflineTests
             "legacy persisted runtime slots did not fail with actionable migration guidance");
     }
 
+    private static void TestLegacyRuntimeSlotMigration()
+    {
+        using Fixture fixture = new(new PersistedState
+        {
+            Generation = 7,
+            Phase = BridgePhase.ERROR,
+            ErrorCode = "LEGACY_SLOT_TEST",
+            Error = "preserve this durable diagnostic",
+            ProcessId = 0,
+            ScopeTickets = new List<ScopeTicket>()
+        });
+        string oldSlot = RuntimeScope.LegacyForRoot(fixture.Root);
+        string currentSlot = RuntimeScope.ForRoot(fixture.Root);
+        PersistedState legacy = ReadPersistedState(fixture.Root);
+        legacy.CoordinatorRoot = fixture.Root;
+        legacy.RuntimeSlotId = oldSlot;
+        legacy.Phase = BridgePhase.ERROR;
+        legacy.ProcessId = 0;
+        legacy.ProcessStartUtcTicks = 0;
+        legacy.Leases = new List<TestLease>();
+        legacy.ScopeTickets = new List<ScopeTicket>
+        {
+            new() { Id = "ticket-preserved", RuntimeSlotId = oldSlot, CoordinatorRoot = fixture.Root }
+        };
+        fixture.WriteState(legacy);
+        string statePath = Path.Combine(fixture.Root, "Runtime", "state.json");
+        byte[] original = File.ReadAllBytes(statePath);
+
+        CoordinatorLegacySlotMigrationResult migrated = CoordinatorLegacySlotMigration.TryMigrate(fixture.Root);
+        Assert(migrated.Success && !migrated.AlreadyMigrated && migrated.OldRuntimeSlotId == oldSlot &&
+               migrated.RuntimeSlotId == currentSlot && migrated.MigratedScopeTicketCount == 1 &&
+               migrated.BackupPath != null,
+            "legacy migration did not report the exact old/new slot mapping");
+        string backupPath = Path.Combine(fixture.Root, migrated.BackupPath);
+        Assert(File.Exists(backupPath) && File.ReadAllBytes(backupPath).SequenceEqual(original),
+            "legacy migration did not preserve an exact backup of the original state");
+
+        PersistedState after = ReadPersistedState(fixture.Root);
+        Assert(after.RuntimeSlotId == currentSlot && after.Generation == legacy.Generation &&
+               after.Phase == legacy.Phase && after.ErrorCode == legacy.ErrorCode &&
+               after.Error == legacy.Error && after.ScopeTickets.Count == 1 &&
+               after.ScopeTickets[0].RuntimeSlotId == currentSlot &&
+               after.ScopeTickets[0].Id == legacy.ScopeTickets[0].Id,
+            "legacy migration changed durable state beyond runtime-slot ownership");
+        Assert(RuntimeScope.ResolveEffectiveSlot(fixture.Root, null, null) == currentSlot,
+            "the current coordinator could not resolve the migrated runtime slot");
+
+        CoordinatorLegacySlotMigrationResult repeated = CoordinatorLegacySlotMigration.TryMigrate(fixture.Root);
+        Assert(repeated.Success && repeated.AlreadyMigrated && repeated.BackupPath == null,
+            "legacy migration was not idempotent after the atomic replacement");
+
+        legacy.RuntimeSlotId = oldSlot;
+        legacy.ProcessId = Environment.ProcessId;
+        legacy.ProcessStartUtcTicks = Process.GetCurrentProcess().StartTime.ToUniversalTime().Ticks;
+        fixture.WriteState(legacy);
+        byte[] beforeRunningProcessFailure = File.ReadAllBytes(statePath);
+        CoordinatorLegacySlotMigrationResult blocked = CoordinatorLegacySlotMigration.TryMigrate(fixture.Root);
+        Assert(!blocked.Success && blocked.ErrorCode == "MIGRATION_PROCESS_RUNNING" &&
+               File.ReadAllBytes(statePath).SequenceEqual(beforeRunningProcessFailure),
+            "migration did not fail closed when the persisted RimWorld process identity was still running");
+    }
+
     private static void TestTwoCoordinatorsCannotOwnSameSlot()
     {
         using Fixture fixture = Fixture.ReadyWithLease();

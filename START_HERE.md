@@ -2,6 +2,16 @@
 
 Use `DevBridge.cmd` from the installed mod root.
 
+For repository changes, run the standard offline engineering gate from the repository root:
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\validate.ps1
+```
+
+It builds Coordinator.Core, the Coordinator host, Coordinator.Tests, and BridgeTools, then runs the
+complete offline suite. RimWorld-dependent mod compilation remains a separate local/release gate;
+see `MAINTENANCE.md`.
+
 ## Rules
 
 - Do not launch RimWorld yourself.
@@ -72,7 +82,7 @@ Use `DevBridge.cmd` from the installed mod root.
 
 To reload a newly published coordinator binary or changed coordinator environment/configuration without
 stopping RimWorld, run `DevBridge.cmd coordinator shutdown` (or append `--json`). The command flushes its
-response and terminal marker before the slot mutex and named pipe are released; durable `Runtime/state.json`,
+response and terminal result before the slot mutex and named pipe are released; durable `Runtime/state.json`,
 leases, and the RimWorld process are preserved. A later `DevBridge.cmd status` or other command lazily starts
 the current `Coordinator\DevBridge.Coordinator.exe` with the current environment. An already accepted long
 `restart`, `wait-ready`, or test session may be disconnected while the coordinator drains; reconnect with
@@ -182,7 +192,7 @@ The tool returns this token-free schema (nullable values are `null` when unavail
   "profileMode": "projects",
   "processId": 1234,
   "processStartUtcTicks": 638000000000000000,
-  "devBridge2ModVersion": "1.2.4",
+  "devBridge2ModVersion": "<product-version>",
   "rimBridgeIntegrationSchemaVersion": "rimbridge-integration/v1",
   "errorCode": null,
   "error": null

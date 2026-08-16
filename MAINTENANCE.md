@@ -1,6 +1,172 @@
 # DevBridge2 maintenance
 
-The coordinator is a small named-pipe server/client in `Source/Coordinator/Program.cs`. One server owns `Runtime/state.json`, active leases, and the RimWorld process. CLI invocations connect to that server, so a caller timing out does not cancel a pending restart.
+## Engineering gate
+
+Run the repository-owned offline validation command before submitting a change:
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\validate.ps1
+```
+
+It restores and builds the Release Coordinator, Coordinator.Tests, and BridgeTools projects, runs the
+complete offline coordinator suite (including version/schema consistency and coordinator lifecycle
+regressions), checks diff whitespace, verifies that coordinator build products are not tracked, and
+verifies that BridgeTools does not emit `RimBridgeServer.Sdk.dll`. GitHub Actions runs the same gate on
+pull requests and pushes to `main`.
+
+The standard gate deliberately does not build `Source\Mod\DevBridge2.csproj`: that project requires the
+proprietary `Assembly-CSharp.dll` and `UnityEngine.CoreModule.dll` from a local RimWorld installation.
+Mod compilation, live deployment, and host integration are separate release/local gates. For a local mod
+build, provide the installed managed directory explicitly:
+
+```powershell
+dotnet build .\Source\Mod\DevBridge2.csproj -c Release -p:RimWorldManagedDir="<RimWorld root>\RimWorldWin64_Data\Managed"
+```
+
+Never commit generated contents from `Coordinator_build\`, `Coordinator\` (keep only `.gitkeep`),
+`Runtime\`, `BridgeTools\`, `Source\**\bin\`, `Source\**\obj\`, or `1.6\Assemblies\` (keep only its
+intentional placeholder). Never commit or deploy `RimBridgeServer.Sdk.dll`; the live RimBridge host
+supplies it.
+
+## Version, toolchain, and release policy
+
+`Source\Directory.Build.props` is the single authoritative product-version source. Assembly versions
+derive from that property. `About\About.xml` and the explicit release heading in `CHANGELOG.md` must
+match it; the release script renders the package About metadata from that value rather than copying an
+unverified version. Do not add product-version literals to tests or individual project files.
+
+The repository pins the exact .NET SDK in `global.json` (`8.0.424`, no roll-forward). The only current
+NuGet dependency is the compile-time `RimBridgeServer.Sdk` package for BridgeTools, locked in
+`Source\BridgeTools\packages.lock.json`. To intentionally update dependencies, run
+`scripts\validate.ps1 -UpdatePackages`, review the resolved version/content hash and compatibility
+contract, then run the normal locked gate and the release dry run. CI and release use locked restore.
+
+New protocol/hosting/diagnostic files must opt into nullable analysis with `#nullable enable` (or a
+nullable-enabled project). The current incremental boundary is the GABP DTO contract and coordinator
+IPC protocol; legacy Core, host, Mod, and test files remain nullable-disabled until migrated in focused
+follow-up changes. Do not blanket-suppress nullable warnings. The remaining migration is:
+
+- migrate Core lifecycle/persistence/diagnostic files in cohesive ownership slices;
+- migrate host command/process glue after each slice has warning-clean tests;
+- migrate net472 Mod/BridgeTools files only with framework-compatible annotations;
+- remove project-level nullable-disabled settings when each slice is complete.
+
+Run a deterministic package build with:
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\release.ps1 `
+  -RimWorldManagedDir "<RimWorld root>\RimWorldWin64_Data\Managed"
+```
+
+It requires a clean tree, reruns the locked validation gate, publishes the coordinator, rebuilds
+BridgeTools, optionally builds the Mod when the managed assemblies are present, renders a clean
+`artifacts\release\DevBridge2-<version>` directory, and writes `release-manifest.json` plus
+`SHA256SUMS.txt`. A dirty inspection is allowed only with `-DryRun -AllowDirty`; its identity is marked
+`.dirty` and must not be published. No release binaries are written into normal source directories.
+
+## Build identity and coordinator IPC
+
+Every running coordinator reports a `coordinatorBuild` object in `status --json`, `doctor --json`, and
+the terminal result of every versioned named-pipe request. When a deployed `Coordinator\DevBridge.Coordinator.dll`
+is present, the same responses also include `publishedCoordinatorBuild` and
+`coordinatorBuildMatchesPublished`, so a running process can be compared with the published files without
+opening them manually. The identity includes `productVersion`,
+`informationalVersion`, `sourceRevision`, `dirty`, `buildConfiguration`, `processStartedUtc`, and the
+coordinator protocol version/contract. Deployed mod and BridgeTools assemblies are reported as
+`modBuild` and `bridgeToolsBuild` in the doctor component version section when they are present.
+Published clean builds use the source revision in the informational version; local worktree builds are
+marked with `+<revision>.dirty`, so a dirty build cannot present itself as the clean published revision.
+
+Coordinator named-pipe IPC is version 2. Requests, events, and terminal results are distinct JSON
+envelopes correlated by `requestId`; finite commands produce one terminal result, while `wait-ready`,
+`restart`, and test sessions may remain connected and emit events. The compatibility boundary is
+intentionally bumped: v1 and other unsupported clients fail immediately with an incompatible-protocol
+error and are not silently parsed. The version is sourced from
+`DevBridgeSchemaVersions.CoordinatorProtocolMajor`; update clients and coordinators together. IPC
+diagnostics never include RimBridge credentials. The server uses the .NET `CurrentUserOnly` named-pipe
+option: the coordinator control plane is trusted only within the Windows account that launched it, and
+is not a machine-wide or `Everyone` endpoint. The coordinator still validates every request and owns a
+maximum of 16 concurrent clients.
+
+IPC input and output are bounded before dispatch: the maximum frame is 256 KiB, a request is 128 KiB,
+commands are 128 characters, there are at most 64 arguments, each argument is at most 4 KiB, event
+messages are at most 16 KiB, JSON-buffered event output is capped at 1,024 messages/128 KiB, and result
+payloads are at most 192 KiB. Stable errors include
+`FRAME_TOO_LARGE`, `REQUEST_TOO_LARGE`, `COMMAND_TOO_LONG`, `ARGUMENT_COUNT_EXCEEDED`,
+`ARGUMENT_TOO_LONG`, `REQUEST_METADATA_TOO_LARGE`, `INCOMPATIBLE_PROTOCOL`, and `OUTPUT_TOO_LARGE`.
+Oversized or malformed frames do not enter coordinator state or launch logic.
+
+### Coordinator operational trace
+
+The coordinator writes best-effort JSON Lines to `Runtime/coordinator-events.jsonl`. Each entry has a
+stable `timestampUtc` and `event`, plus bounded `requestId`, `operationId`, `command`, `runtimeSlotId`,
+`generation`, `phase`, `durationMs`, `success`, `errorCode`, `category`, and (for the startup event) a
+safe `buildIdentity` projection. The same IPC `requestId` is retained from request acceptance through
+dispatch, persistence/lifecycle work, response serialization, and the terminal result. A recovery worker
+uses an operation ID when no client request exists.
+
+The active file is capped at 512 KiB. Rotation retains at most `coordinator-events.jsonl.1` through
+`.3`, so the trace is bounded to the current file plus three retained files. Writes are serialized for
+ordering, but diagnostics are fail-open: a write or rotation failure disables tracing for that coordinator
+instance and never changes lifecycle state, persistence decisions, or process-safety behavior.
+
+Use the trace when a finite command has an unexpected result or disconnect: locate its `requestId`, then
+check that `command.dispatch.completed`, `state.save.completed`, and `ipc.terminal_result.write` occur
+in the expected order. `lifecycle.phase.transition`, process launch/termination, history/manifest, and
+shutdown events provide the surrounding boundary evidence. Trace entries intentionally contain no
+RimBridge token, authorization secret, raw environment variable, argument list, tool payload, endpoint
+credential, or raw exception message. Text projections are redacted and capped; route events contain
+only a safe operation category and machine-readable error code.
+
+### Deterministic model and crash-injection tests
+
+The offline executable extends the case-based suite with five fixed state-machine seeds
+(`13579BDF`, `2468ACE1`, `0051A7E5`, `C0FFEE42`, and `7F4A7C15`). The standard run executes 32
+operations per seed (160 generated operations); `DEVBRIDGE_MODEL_STRESS=1` runs 72 operations per
+seed for local stress testing. Operations include lease, project, lifecycle, recovery, readiness,
+ModsConfig, generation-history, endpoint, companion, shutdown/restart, and malformed-input actions.
+Every step checks process ownership cardinality, maintenance absence, READY evidence, monotonic
+generations, target-generation validity, finite launch budgets, exact lease ownership, immutable
+generation manifests, mutation-free rejected requests, secret absence, and one-result IPC completion.
+Failures print the seed, step, and bounded operation/output trace so the case can be reproduced.
+
+The same suite exposes inert-by-default coordinator fault points around durable state writes and
+atomic replacement, process action/state persistence, STOPPED-before-result, terminal-result teardown,
+history/manifest writes, ModsConfig transitions, project aggregate freezing, crash-isolation attempt
+persistence, and graceful coordinator shutdown. Tests restart from the resulting Runtime directory and
+assert the fail-closed recovery contract for restart, stop, ensure-ready, baseline capture/restore,
+generated ModsConfig installation, generation history, project freeze, crash isolation, and endpoint
+invalidation. Production options leave the injector unset; a diagnostic or persistence failure never
+selects an unsafe fallback action.
+
+Durable identifiers use the complete value for authorization, persistence, and equality. New leases are
+`lease-` plus a 128-bit uppercase GUID; generated project registrations use a deterministic 96-bit
+hash suffix; request IDs and launch IDs retain full GUID-width values. Existing short persisted lease
+IDs remain valid until released or expired so operators do not lose an authorization capability during an
+upgrade; they are never used as a prefix match. Explicit caller-supplied registration/ticket IDs and
+content-derived launch request keys retain their existing semantics.
+
+Runtime scope names are derived with separate helpers: `CanonicalizeRootPath` and `HashCanonicalPath`
+normalize a root path, while `HashOpaqueIdentifier` hashes runtime slots without calling
+`Path.GetFullPath`. New runtime slots are `slot-` plus 24 uppercase SHA-256 hex characters (96 bits),
+and pipe/mutex names include the canonical root and use the same 96-bit practical hash length. A state
+file containing the old 8-hex-character runtime slot is rejected before startup with guidance to use the
+older coordinator to perform a graceful `coordinator shutdown`, preserve `Runtime/state.json`, and then
+retry; it is never silently rebound to a different namespace.
+
+The Coordinator source boundary is deliberate:
+
+- `Source/Coordinator.Core/DevBridge.Coordinator.Core.csproj` owns transport-independent state,
+  lifecycle, leases, persistence, profiles, recovery, generation history, ModsConfig ownership,
+  process abstractions, diagnostics, and RimBridge integration logic.
+- `Source/Coordinator/DevBridge.Coordinator.csproj` is the executable host. It owns `Program`, argument
+  parsing, the named-pipe client/server, framing, and process startup glue, and references Core.
+- `Source/Coordinator.Tests/DevBridge.Coordinator.Tests.csproj` references both assemblies. It must not
+  link Coordinator implementation files with `Compile Include`; the BridgeTools contract sources linked
+  there are intentional shared test support and are not Coordinator core.
+
+One host server owns `Runtime/state.json`, active leases, and the RimWorld process. CLI invocations
+connect to that server, so a caller timing out does not cancel a pending restart.
 
 The RimWorld assembly is `Source/Mod/DevBridge2Mod.cs`. It reads the launch identity and
 `DEVBRIDGE_QUICKTEST_REQUESTED`, starts the built-in Dev Quicktest from the main menu after a normal
@@ -28,7 +194,7 @@ DevBridge.cmd coordinator shutdown
 DevBridge.cmd status --json
 ```
 
-`coordinator shutdown` completes the requester response and terminal marker before releasing the per-slot
+`coordinator shutdown` completes the requester response and terminal result before releasing the per-slot
 mutex and pipe. It preserves `Runtime/state.json`, leases, and the current RimWorld process; it is the normal
 way to reload the coordinator binary, environment variables, or configuration. A connected long-running
 command may be drained and should reconnect rather than resubmit its accepted durable operation.
@@ -45,8 +211,8 @@ dotnet build Source\Mod\DevBridge2.csproj -c Release -p:RimWorldManagedDir="<Rim
 ```
 
 The mod build output is `1.6\Assemblies\DevBridge2.dll`.
-`CHANGELOG.md`'s latest declared release is the version source of truth (`1.2.4`); the packaged mod
-metadata and coordinator/mod assembly project versions are kept aligned with it.
+`Source\Directory.Build.props` is the authoritative product-version source. The packaged mod metadata,
+CHANGELOG release heading, and coordinator/mod/BridgeTools assembly versions are kept aligned with it.
 
 ## RimBridgeServer coexistence
 
@@ -99,6 +265,34 @@ authenticates with GABP and requires matching launch ID, generation, and PID. A 
 `BRIDGETOOLS_STALE_BINARY`; status additionally reports bounded companion categories such as
 `TOOL_NOT_REGISTERED`, `TOOL_CALL_FAILED`, `GENERATION_CONTEXT_INCOMPLETE`, and
 `ENDPOINT_UNAVAILABLE`. These categories never contain credentials or tokens.
+
+### GABP/RimBridge compatibility contract
+
+The supported client contract is centralized in
+[`RimBridgeProtocolCompatibility.json`](RimBridgeProtocolCompatibility.json) and implemented by the
+typed DTOs in `Source\Coordinator.Core\Integrations\RimBridge\RimBridgeProtocolContract.cs`.
+The repository currently claims only the `gabp/1` envelope (GABP major 1), verified by offline wire
+fixtures. It claims no live RimBridgeServer version until a local host smoke test has passed. The
+BridgeTools compile contract is `RimBridgeServer.Sdk` `2.0.0`; that SDK is a compile-time host
+override and is never bundled with the mod, coordinator, or BridgeTools output. The companion remains
+optional, and endpoint-only operation remains supported.
+
+The client intentionally keeps a small local DTO/framing implementation instead of adding
+`Gabp.Runtime` as a runtime dependency: the coordinator is net8, the optional companion is net472 and
+host-loaded, and the typed boundary keeps deployment independent of proprietary host assemblies.
+
+The contract covers authenticated `session/hello` fields (`token`, `bridgeVersion`, `platform`,
+`launchId`) and optional typed `clientInfo`, `tools/list` with `{}` and a `tools` array result,
+`tools/call` with typed `name` and JSON-object `arguments`, GABP error mappings, Content-Length
+framing limits, and response version/request correlation. Other GABP versions, malformed framing,
+invalid envelopes, and mismatched response IDs are intentionally unsupported and fail boundedly.
+
+When upgrading RimBridgeServer or its SDK, update the tested-version declaration and SDK version in
+the JSON contract, update the typed fixtures for any shape change, run the complete
+`scripts\validate.ps1` gate (including BridgeTools compilation), and perform the optional local live
+smoke test against the exact host assembly before claiming that host version as supported. A version
+change without matching metadata and contract tests is rejected by the validation script. Do not add
+the proprietary host assembly to source control or CI.
 
 ### Routed RimBridge workflow
 

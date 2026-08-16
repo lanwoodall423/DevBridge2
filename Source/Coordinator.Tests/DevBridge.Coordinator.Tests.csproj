@@ -13,41 +13,15 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Include="..\Coordinator\Program.cs" Link="Coordinator.Program.cs" />
-    <Compile Include="..\Coordinator\Commands\CoordinatorCommands.cs" Link="Commands\CoordinatorCommands.cs" />
-    <Compile Include="..\Coordinator\Diagnostics\CoordinatorDiagnostics.cs" Link="Diagnostics\CoordinatorDiagnostics.cs" />
-    <Compile Include="..\Coordinator\Diagnostics\CoordinatorDoctor.cs" Link="Diagnostics\CoordinatorDoctor.cs" />
-    <Compile Include="..\Coordinator\Diagnostics\DoctorModels.cs" Link="Diagnostics\DoctorModels.cs" />
-    <Compile Include="..\Coordinator\Diagnostics\CoordinatorJson.cs" Link="Diagnostics\CoordinatorJson.cs" />
-    <Compile Include="..\Coordinator\Integrations\CoordinatorRimBridgeCommands.cs" Link="Integrations\CoordinatorRimBridgeCommands.cs" />
-    <Compile Include="..\Coordinator\Leases\CoordinatorLeases.cs" Link="Leases\CoordinatorLeases.cs" />
-    <Compile Include="..\Coordinator\Lifecycle\CoordinatorLifecycle.cs" Link="Lifecycle\CoordinatorLifecycle.cs" />
-    <Compile Include="..\Coordinator\Maintenance\CoordinatorMaintenance.cs" Link="Maintenance\CoordinatorMaintenance.cs" />
-    <Compile Include="..\Coordinator\Maintenance\CoordinatorModsConfig.cs" Link="Maintenance\CoordinatorModsConfig.cs" />
-    <Compile Include="..\Coordinator\Process\CoordinatorProcess.cs" Link="Process\CoordinatorProcess.cs" />
-    <Compile Include="..\Coordinator\Process\CoordinatorProcessIdentity.cs" Link="Process\CoordinatorProcessIdentity.cs" />
-    <Compile Include="..\Coordinator\Profiles\CoordinatorProfiles.cs" Link="Profiles\CoordinatorProfiles.cs" />
-    <Compile Include="..\Coordinator\Profiles\CoordinatorProjectResolution.cs" Link="Profiles\CoordinatorProjectResolution.cs" />
-    <Compile Include="..\Coordinator\Profiles\TestGenerationInputs.cs" Link="Profiles\TestGenerationInputs.cs" />
-    <Compile Include="..\Coordinator\Profiles\ProjectResolutionModels.cs" Link="Profiles\ProjectResolutionModels.cs" />
-    <Compile Include="..\Coordinator\Readiness\CoordinatorReadiness.cs" Link="Readiness\CoordinatorReadiness.cs" />
-    <Compile Include="..\Coordinator\Recovery\CoordinatorRecovery.cs" Link="Recovery\CoordinatorRecovery.cs" />
-    <Compile Include="..\Coordinator\State\CoordinatorPersistence.cs" Link="State\CoordinatorPersistence.cs" />
-    <Compile Include="..\Coordinator\State\DevBridgeSchemaVersions.cs" Link="State\DevBridgeSchemaVersions.cs" />
-    <Compile Include="..\Coordinator\State\CoordinatorGenerationHistory.cs" Link="State\CoordinatorGenerationHistory.cs" />
-    <Compile Include="..\Coordinator\Commands\CoordinatorHistoryCommands.cs" Link="Commands\CoordinatorHistoryCommands.cs" />
-    <Compile Include="..\Coordinator\Diagnostics\ComponentVersions.cs" Link="Diagnostics\ComponentVersions.cs" />
-    <Compile Include="..\Coordinator\RimBridgeIntegration.cs" Link="RimBridgeIntegration.cs" />
-    <Compile Include="..\Coordinator\ModsConfigOwnership.cs" Link="ModsConfigOwnership.cs" />
-    <Compile Include="..\Coordinator\Integrations\RimBridge\IRimBridgeClient.cs" Link="Integrations\RimBridge\IRimBridgeClient.cs" />
-    <Compile Include="..\Coordinator\Integrations\RimBridge\RimBridgeCallResult.cs" Link="Integrations\RimBridge\RimBridgeCallResult.cs" />
-    <Compile Include="..\Coordinator\Integrations\RimBridge\RimBridgeClient.cs" Link="Integrations\RimBridge\RimBridgeClient.cs" />
-    <Compile Include="..\Coordinator\Integrations\RimBridge\RimBridgeConnection.cs" Link="Integrations\RimBridge\RimBridgeConnection.cs" />
-    <Compile Include="..\Coordinator\Integrations\RimBridge\RimBridgePolicy.cs" Link="Integrations\RimBridge\RimBridgePolicy.cs" />
+    <ProjectReference Include="..\Coordinator.Core\DevBridge.Coordinator.Core.csproj" />
+    <ProjectReference Include="..\Coordinator\DevBridge.Coordinator.csproj" />
+
+    <!-- These are deliberately shared BridgeTools contract sources. The tests
+         exercise the same serialization/policy types used by the companion
+         project; they are not Coordinator core implementation. -->
     <Compile Include="..\BridgeTools\DevBridgeGenerationContext.cs" Link="DevBridgeGenerationContext.cs" />
     <Compile Include="..\BridgeTools\DevBridgeControlPolicy.cs" Link="DevBridgeControlPolicy.cs" />
-    <Compile Include="..\Coordinator\QuicktestActivationCore.cs" Link="QuicktestActivationCore.cs" />
-    <Compile Include="..\Coordinator\QuicktestFailureArtifact.cs" Link="QuicktestFailureArtifact.cs" />
+
     <Compile Include="OfflineTests.cs" />
     <Compile Include="ReadinessTests.cs" />
     <Compile Include="MaintenanceTests.cs" />
@@ -55,6 +29,7 @@
     <Compile Include="QuicktestTests.cs" />
     <Compile Include="ProfilesTests.cs" />
     <Compile Include="RimBridgeTests.cs" />
+    <Compile Include="RimBridgeProtocolContractTests.cs" />
     <Compile Include="GenerationAndModsConfigTests.cs" />
     <Compile Include="RecoveryTests.cs" />
     <Compile Include="VersionAndSchemaTests.cs" />
@@ -64,6 +39,9 @@
     <Compile Include="TestGenerationInputTests.cs" />
     <Compile Include="DevBridgeWrapperTests.cs" />
     <Compile Include="CoordinatorLifecycleTests.cs" />
+    <Compile Include="CoordinatorTraceTests.cs" />
+    <Compile Include="CoordinatorFaultAndModelTests.cs" />
+    <Compile Include="CoordinatorStateMachineTests.cs" />
     <Compile Include="BridgeToolsDeploymentTests.cs" />
   </ItemGroup>
 </Project>

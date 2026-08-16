@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "dependencies": {
+    ".NETFramework,Version=v4.7.2": {
+      "RimBridgeServer.Sdk": {
+        "type": "Direct",
+        "requested": "[2.0.0, )",
+        "resolved": "2.0.0",
+        "contentHash": "6Ru2NQRTkaU0Cr1PRowXz2L4ciEfP3I1Cz4VHF+iyuI5PJyX4CroLWXrS6NDJwAHMv9hGPVWaUTFH/W+UE/F7A=="
+      }
+    }
+  }
+}

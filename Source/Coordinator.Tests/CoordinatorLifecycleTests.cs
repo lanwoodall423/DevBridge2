@@ -2,6 +2,7 @@ using System.Text.Json;
 using System.IO.Pipes;
 using System.Diagnostics;
 using System.Text;
+using DevBridge2;
 
 namespace DevBridge.Coordinator;
 
@@ -12,8 +13,6 @@ internal static partial class OfflineTests
         using Fixture fixture = Fixture.ReadyWithLease();
         List<string> received = RunNamedPipeCommand(fixture, "stop", "T001");
 
-        Assert(received.Count(value => value.StartsWith("__DEVBRIDGE_END__|", StringComparison.Ordinal)) == 1,
-            "stop did not receive exactly one terminal marker");
         Assert(received.Any(value => value.Contains("gameState=STOPPED", StringComparison.Ordinal)),
             "stop did not receive its terminal state message");
         PersistedState state = ReadPersistedState(fixture.Root);
@@ -26,16 +25,12 @@ internal static partial class OfflineTests
         using Fixture fixture = Fixture.ReadyWithLease();
         List<string> received = RunNamedPipeCommand(fixture, "stop", "T001", "--json");
 
-        List<string> markers = received.Where(value => value.StartsWith("__DEVBRIDGE_END__|",
-            StringComparison.Ordinal)).ToList();
-        Assert(markers.Count == 1 && markers[0] == "__DEVBRIDGE_END__|0",
-            "stop --json did not receive exactly one successful terminal marker");
-        List<string> json = received.Where(value => !value.StartsWith("__DEVBRIDGE_END__|",
-            StringComparison.Ordinal)).ToList();
-        Assert(json.Count == 1, "stop --json did not receive one JSON response");
-        using JsonDocument document = JsonDocument.Parse(json[0]);
+        Assert(received.Count == 1, "stop --json did not receive one JSON response");
+        using JsonDocument document = JsonDocument.Parse(received[0]);
         Assert(document.RootElement.GetProperty("state").GetString() == "STOPPED",
             "stop --json response did not report STOPPED");
+        Assert(document.RootElement.GetProperty("coordinatorBuild").GetProperty("sourceRevision").GetString() != null,
+            "stop --json response did not report coordinator build identity");
         PersistedState state = ReadPersistedState(fixture.Root);
         Assert(state.Phase == BridgePhase.STOPPED && state.MaintenanceReady && state.ProcessId == 0,
             "stop --json did not persist the terminal maintenance state");
@@ -59,15 +54,18 @@ internal static partial class OfflineTests
     {
         using Fixture fixture = Fixture.ReadyWithLease();
         using CoordinatorHarness harness = CoordinatorHarness.Start(fixture);
-        List<string> received = harness.Send("coordinator", "shutdown", "--json");
-
-        int marker = received.FindIndex(value => value.StartsWith("__DEVBRIDGE_END__|",
-            StringComparison.Ordinal));
-        int json = received.FindIndex(value => value.StartsWith("{", StringComparison.Ordinal));
-        Assert(marker > json && marker >= 0 && harness.MarkerObservedBeforeServerExit,
-            "shutdown must flush its response and end marker before releasing the server");
-        Assert(received[marker] == "__DEVBRIDGE_END__|0", "shutdown returned a failure marker");
-        using JsonDocument document = JsonDocument.Parse(received[json]);
+        BridgeRequest request = NewProtocolRequest("coordinator", "shutdown");
+        request.Json = true;
+        List<CoordinatorIpcFrame> frames = SendRawProtocolRequest(harness, request);
+        Assert(frames.Count(frame => frame.Type == CoordinatorIpcProtocol.ResultType) == 1,
+            "shutdown must produce exactly one terminal result");
+        int resultIndex = frames.FindIndex(frame => frame.Type == CoordinatorIpcProtocol.ResultType);
+        Assert(resultIndex >= 0 && harness.ServerTask.Wait(TimeSpan.FromSeconds(5)),
+            "shutdown must flush its result before releasing the server");
+        Assert(resultIndex == frames.Count - 1, "shutdown result must be the final IPC frame");
+        Assert(frames[resultIndex].ExitCode == 0, "shutdown returned a failure result");
+        Assert(frames[resultIndex].Payload.HasValue, "shutdown result omitted its JSON payload");
+        using JsonDocument document = JsonDocument.Parse(frames[resultIndex].Payload.Value.GetRawText());
         Assert(document.RootElement.GetProperty("success").GetBoolean(),
             "shutdown JSON response was not successful");
         Assert(fixture.Adapter.TerminationRequests == 0,
@@ -203,6 +201,499 @@ internal static partial class OfflineTests
             "status must have a bounded terminal response");
     }
 
+    private static void TestVersionedIpcRequestIdAndTerminalResult()
+    {
+        using Fixture fixture = Fixture.ReadyWithLease();
+        using CoordinatorHarness harness = CoordinatorHarness.Start(fixture);
+        BridgeRequest request = NewProtocolRequest("status");
+        List<CoordinatorIpcFrame> frames = SendRawProtocolRequest(harness, request);
+
+        Assert(CoordinatorIpcProtocol.IsValidRequestId(request.RequestId),
+            "the request did not carry a stable requestId");
+        Assert(frames.Count > 0 && frames.All(value => value.ProtocolVersion == CoordinatorIpcProtocol.Version),
+            "IPC response frames did not carry the supported protocol version");
+        Assert(frames.All(value => value.RequestId == request.RequestId),
+            "IPC response frames did not preserve requestId correlation");
+        Assert(frames.Count(value => value.Type == CoordinatorIpcProtocol.ResultType) == 1,
+            "finite status did not produce exactly one terminal result");
+        CoordinatorIpcFrame result = frames.Single(value => value.Type == CoordinatorIpcProtocol.ResultType);
+        Assert(result.ExitCode == 0 && result.CoordinatorBuild != null,
+            "terminal result did not include exitCode and coordinator build metadata");
+    }
+
+    private static void TestVersionedIpcEventsAndSingleResult()
+    {
+        using Fixture fixture = Fixture.ReadyWithLease();
+        using CoordinatorHarness harness = CoordinatorHarness.Start(fixture);
+        List<CoordinatorIpcFrame> frames = SendRawProtocolRequest(harness,
+            NewProtocolRequest("stop", "T001"));
+
+        int resultIndex = frames.FindIndex(value => value.Type == CoordinatorIpcProtocol.ResultType);
+        Assert(resultIndex > 0, "stop did not emit an event before its terminal result");
+        Assert(frames.Take(resultIndex).All(value => value.Type == CoordinatorIpcProtocol.EventType),
+            "an IPC result was confused with an event");
+        Assert(frames.Count(value => value.Type == CoordinatorIpcProtocol.ResultType) == 1 &&
+               resultIndex == frames.Count - 1,
+            "stop did not end with exactly one terminal result");
+        Assert(frames[resultIndex].ExitCode == 0,
+            "stop terminal result was not successful");
+    }
+
+    private static void TestVersionedIpcLongRunningSession()
+    {
+        using Fixture fixture = Fixture.ReadyWithLease();
+        Exception failure = RunAgainstFakeServer(fixture, new[] { "test", "session" }, (request, writer) =>
+        {
+            writer.WriteLine(JsonSerializer.Serialize(
+                CoordinatorIpcProtocol.Event(request.RequestId, "session event"), Program.JsonOptions));
+            Thread.Sleep(TimeSpan.FromSeconds(2.2));
+            writer.WriteLine(JsonSerializer.Serialize(
+                CoordinatorIpcProtocol.Result(request.RequestId, 0, null, null), Program.JsonOptions));
+        });
+        Assert(failure == null,
+            "a long-running session was incorrectly subject to the finite response timeout");
+    }
+
+    private static void TestVersionedIpcJsonAndHumanClients()
+    {
+        using (Fixture jsonFixture = Fixture.ReadyWithLease())
+        {
+            List<string> json = RunNamedPipeCommand(jsonFixture, "status", "--json");
+            Assert(json.Count == 1 && json[0].StartsWith("{", StringComparison.Ordinal),
+                "JSON client did not receive one JSON payload");
+            using JsonDocument document = JsonDocument.Parse(json[0]);
+            Assert(document.RootElement.GetProperty("coordinatorBuild").GetProperty("protocolContract")
+                .GetString() == DevBridgeSchemaVersions.CoordinatorProtocolContract,
+                "JSON client payload did not expose the v2 coordinator protocol contract");
+        }
+
+        using (Fixture humanFixture = Fixture.ReadyWithLease())
+        {
+            List<string> messages = RunNamedPipeCommand(humanFixture, "stop", "T001");
+            Assert(messages.Any(value => value.Contains("gameState=STOPPED", StringComparison.Ordinal)),
+                "human client did not receive event messages");
+        }
+    }
+
+    private static void TestVersionedIpcMalformedRequest()
+    {
+        using Fixture fixture = Fixture.ReadyWithLease();
+        using CoordinatorHarness harness = CoordinatorHarness.Start(fixture);
+        List<string> lines = SendRawLine(harness, "{not-json");
+        Assert(lines.Count == 1, "malformed request did not receive one bounded protocol response");
+        CoordinatorIpcFrame frame = DeserializeFrame(lines[0]);
+        Assert(frame.Type == CoordinatorIpcProtocol.ResultType && frame.ExitCode == 2,
+            "malformed request did not receive a terminal failure result");
+        Assert(frame.Payload.HasValue && frame.Payload.Value.GetProperty("errorCode").GetString() == "MALFORMED_REQUEST",
+            "malformed request failure did not identify its protocol error");
+    }
+
+    private static void TestVersionedIpcUnsupportedProtocol()
+    {
+        using Fixture fixture = Fixture.ReadyWithLease();
+        using CoordinatorHarness harness = CoordinatorHarness.Start(fixture);
+        BridgeRequest legacy = NewProtocolRequest("status");
+        legacy.ProtocolVersion = 1;
+        List<string> lines = SendRawLine(harness, JsonSerializer.Serialize(legacy, Program.JsonOptions));
+        CoordinatorIpcFrame frame = DeserializeFrame(lines.Single());
+        Assert(frame.Type == CoordinatorIpcProtocol.ResultType && frame.RequestId == legacy.RequestId &&
+               frame.Payload.HasValue && frame.Payload.Value.GetProperty("errorCode").GetString() ==
+               "INCOMPATIBLE_PROTOCOL" && frame.Payload.Value.GetProperty("error").GetString()
+                   .Contains("supported v2", StringComparison.Ordinal),
+            "unsupported protocol did not fail immediately with a clear machine-readable compatibility error");
+    }
+
+    private static void TestVersionedIpcMismatchedRequestId()
+    {
+        using Fixture fixture = Fixture.ReadyWithLease();
+        Exception failure = RunAgainstFakeServer(fixture, new[] { "status" }, (request, writer) =>
+        {
+            CoordinatorIpcFrame frame = CoordinatorIpcProtocol.Result("wrong-request-id", 0, null, null);
+            writer.WriteLine(JsonSerializer.Serialize(frame, Program.JsonOptions));
+        });
+        Assert(failure is IOException && failure.Message.Contains("requestId", StringComparison.Ordinal),
+            "client accepted a response with a mismatched requestId");
+    }
+
+    private static void TestVersionedIpcDisconnectBeforeResult()
+    {
+        using Fixture fixture = Fixture.ReadyWithLease();
+        Exception failure = RunAgainstFakeServer(fixture, new[] { "status" }, (request, writer) => { });
+        Assert(failure is IOException && failure.Message.Contains("terminal IPC result", StringComparison.Ordinal),
+            "client did not fail clearly when the server disconnected before a result");
+    }
+
+    private static void TestVersionedIpcDuplicateResult()
+    {
+        CoordinatorIpcFrame result = CoordinatorIpcProtocol.Result("request-1", 0, null, null);
+        Assert(CoordinatorIpcProtocol.TryValidateResponse(result, "request-1", false, out _),
+            "the first terminal result was rejected");
+        Assert(!CoordinatorIpcProtocol.TryValidateResponse(result, "request-1", true, out string error) &&
+               error.Contains("duplicate terminal result", StringComparison.Ordinal),
+            "duplicate terminal results were not rejected deterministically");
+    }
+
+    private static void TestCoordinatorBuildIdentity()
+    {
+        string productVersion = ComponentVersions.Current.CoordinatorVersion;
+        DateTime started = new(2026, 8, 16, 12, 34, 56, DateTimeKind.Utc);
+        CoordinatorBuildIdentity first = CoordinatorBuildIdentity.FromInformationalVersion(
+            productVersion + "+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "Release", started);
+        CoordinatorBuildIdentity second = CoordinatorBuildIdentity.FromInformationalVersion(
+            productVersion + "+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "Release", started);
+        Assert(first.ProductVersion == second.ProductVersion &&
+               first.SourceRevision != second.SourceRevision &&
+               first.InformationalVersion != second.InformationalVersion,
+            "different published revisions were not distinguishable");
+        Assert(first.ProcessStartedUtc == started && first.CoordinatorProtocolVersion ==
+            DevBridgeSchemaVersions.CoordinatorProtocolMajor,
+            "build identity did not retain process start or protocol metadata");
+        CoordinatorBuildIdentity dirty = CoordinatorBuildIdentity.FromInformationalVersion(
+            productVersion + "+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.dirty", "Debug", started);
+        Assert(dirty.Dirty && dirty.SourceRevision == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" &&
+               dirty.BuildConfiguration == "Debug",
+            "dirty build identity did not preserve revision and configuration without claiming a clean build");
+        CoordinatorIpcFrame identityResult = CoordinatorIpcProtocol.Result(
+            "request-identity", 0, null, first, second, false);
+        string identityJson = JsonSerializer.Serialize(identityResult, Program.JsonOptions);
+        using JsonDocument identityDocument = JsonDocument.Parse(identityJson);
+        Assert(identityDocument.RootElement.GetProperty("coordinatorBuild").GetProperty("sourceRevision")
+                   .GetString() == first.SourceRevision &&
+               identityDocument.RootElement.GetProperty("publishedCoordinatorBuild")
+                   .GetProperty("sourceRevision").GetString() == second.SourceRevision &&
+               !identityDocument.RootElement.GetProperty("coordinatorBuildMatchesPublished").GetBoolean(),
+            "IPC result metadata did not distinguish running and published coordinator revisions");
+
+        using Fixture fixture = Fixture.ReadyWithLease();
+        using CoordinatorHarness harness = CoordinatorHarness.Start(fixture);
+        List<string> status = harness.Send("status", "--json");
+        using JsonDocument document = JsonDocument.Parse(status.Single());
+        JsonElement build = document.RootElement.GetProperty("coordinatorBuild");
+        Assert(build.GetProperty("sourceRevision").GetString() != null &&
+               build.GetProperty("informationalVersion").GetString().Contains("+", StringComparison.Ordinal) &&
+               build.GetProperty("processStartedUtc").GetString() != null &&
+               build.GetProperty("coordinatorProtocolVersion").GetInt32() ==
+               DevBridgeSchemaVersions.CoordinatorProtocolMajor,
+            "status --json did not expose the running coordinator build identity");
+
+        using Fixture doctorFixture = new(new PersistedState { Phase = BridgePhase.STOPPED });
+        using CoordinatorHarness doctorHarness = CoordinatorHarness.Start(doctorFixture);
+        List<string> doctor = doctorHarness.Send("doctor", "--json");
+        doctorHarness.Shutdown();
+        using JsonDocument doctorDocument = JsonDocument.Parse(doctor.Single());
+        JsonElement doctorBuild = doctorDocument.RootElement.GetProperty("components")
+            .GetProperty("coordinatorBuild");
+        Assert(doctorBuild.GetProperty("protocolContract").GetString() ==
+               DevBridgeSchemaVersions.CoordinatorProtocolContract &&
+               doctorBuild.GetProperty("sourceRevision").GetString() != null &&
+               doctorBuild.GetProperty("processStartedUtc").GetString() != null,
+            "doctor --json did not expose the coordinator build identity in its version section");
+    }
+
+    private static void TestCoordinatorPipeTrustBoundaryAndLimits()
+    {
+        Assert((CoordinatorPipeSecurity.ServerOptions & PipeOptions.CurrentUserOnly) != 0,
+            "the production coordinator pipe is not restricted to the current Windows user");
+        Assert(CoordinatorServer.MaxConcurrentClients > 0 &&
+               CoordinatorServer.MaxConcurrentClients <= 16,
+            "coordinator client concurrency is not explicitly bounded");
+
+        BridgeRequest request = NewProtocolRequest("status");
+        request.Command = new string('c', CoordinatorIpcProtocol.MaxCommandLength + 1);
+        Assert(!CoordinatorIpcProtocol.TryValidateRequest(request, out string errorCode, out _) &&
+               errorCode == "COMMAND_TOO_LONG", "long commands did not receive a stable limit error");
+
+        request = NewProtocolRequest("status", new string('a', CoordinatorIpcProtocol.MaxArgumentLength + 1));
+        Assert(!CoordinatorIpcProtocol.TryValidateRequest(request, out errorCode, out _) &&
+               errorCode == "ARGUMENT_TOO_LONG", "long arguments did not receive a stable limit error");
+
+        request = NewProtocolRequest("status");
+        request.Arguments = Enumerable.Repeat("a", CoordinatorIpcProtocol.MaxArgumentCount + 1).ToList();
+        Assert(!CoordinatorIpcProtocol.TryValidateRequest(request, out errorCode, out _) &&
+               errorCode == "ARGUMENT_COUNT_EXCEEDED", "too many arguments did not receive a stable limit error");
+
+        CoordinatorIpcFrame boundedEvent = CoordinatorIpcProtocol.Event("request",
+            new string('e', CoordinatorIpcProtocol.MaxEventMessageLength + 100));
+        Assert(boundedEvent.Message.Length == CoordinatorIpcProtocol.MaxEventMessageLength,
+            "event output was not bounded before serialization");
+
+        CoordinatorIpcFrame boundedResult = CoordinatorIpcProtocol.Result("request", 0,
+            new { output = new string('p', CoordinatorIpcProtocol.MaxOutputPayloadLength + 100) }, null);
+        Assert(boundedResult.ExitCode == 2 && boundedResult.Payload.HasValue &&
+               boundedResult.Payload.Value.GetProperty("errorCode").GetString() == "OUTPUT_TOO_LARGE",
+            "oversized result payload did not become a bounded machine-readable failure");
+    }
+
+    private static void TestOversizedAndMalformedRequestsAreMutationFree()
+    {
+        using Fixture fixture = new(new PersistedState { Phase = BridgePhase.STOPPED });
+        using CoordinatorHarness harness = CoordinatorHarness.Start(fixture);
+        string secret = "rimbridge-secret-must-not-appear";
+        List<string> oversized = SendRawLine(harness,
+            new string('x', CoordinatorIpcProtocol.MaxRequestLength + 20) + secret);
+        CoordinatorIpcFrame oversizedFrame = DeserializeFrame(oversized.Single());
+        Assert(oversizedFrame.Payload.HasValue &&
+               oversizedFrame.Payload.Value.GetProperty("errorCode").GetString() == "REQUEST_TOO_LARGE" &&
+               !oversized.Single().Contains(secret, StringComparison.Ordinal),
+            "oversized request did not receive a bounded redacted error");
+
+        List<string> malformed = SendRawLine(harness,
+            "{\"protocolVersion\":2,\"requestId\":\"bad\",\"type\":\"request\",\"command\":\"status\",\"arguments\":[\"" +
+            secret + "\"]");
+        CoordinatorIpcFrame malformedFrame = DeserializeFrame(malformed.Single());
+        Assert(malformedFrame.Payload.HasValue &&
+               malformedFrame.Payload.Value.GetProperty("errorCode").GetString() == "MALFORMED_REQUEST" &&
+               !malformed.Single().Contains(secret, StringComparison.Ordinal),
+            "malformed request did not receive a bounded redacted error");
+
+        harness.Shutdown();
+        PersistedState state = ReadPersistedState(fixture.Root);
+        Assert(state.Phase == BridgePhase.STOPPED && state.Generation == 0 &&
+               fixture.Adapter.LaunchCalls == 0,
+            "malformed or oversized IPC input mutated state or started RimWorld");
+    }
+
+    private static void TestRuntimeNamespaceInvariants()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "DevBridge2-namespace-" + Guid.NewGuid().ToString("N"), "Root");
+        string otherRoot = Path.Combine(Path.GetDirectoryName(root), "Other");
+        Directory.CreateDirectory(root);
+        Directory.CreateDirectory(otherRoot);
+        string previousDirectory = Directory.GetCurrentDirectory();
+        try
+        {
+            Directory.SetCurrentDirectory(Path.GetTempPath());
+            string firstSlot = RuntimeScope.ForRoot(root);
+            string firstPipe = PipeNames.ForSlot(root, firstSlot);
+            string firstMutex = PipeNames.MutexForSlot(root, firstSlot);
+            string opaqueHash = RuntimeScope.HashOpaqueIdentifier("slot-runtime-opaque");
+
+            Directory.SetCurrentDirectory(Path.GetDirectoryName(root));
+            string secondSlot = RuntimeScope.ForRoot(root.ToLowerInvariant());
+            Assert(firstSlot == secondSlot && firstPipe == PipeNames.ForSlot(root, secondSlot) &&
+                   firstMutex == PipeNames.MutexForSlot(root, secondSlot),
+                "root namespace names changed with working directory or Windows case normalization");
+            Assert(firstSlot.Length == "slot-".Length + RuntimeScope.RuntimeSlotHashHexLength &&
+                   firstPipe.Length > RuntimeScope.RuntimeSlotHashHexLength &&
+                   firstMutex.Length > RuntimeScope.RuntimeSlotHashHexLength,
+                "runtime namespace identifiers were not widened to the practical 96-bit length");
+
+            Directory.SetCurrentDirectory(Path.GetTempPath());
+            string opaqueFromTemp = RuntimeScope.HashOpaqueIdentifier("slot-runtime-opaque");
+            Directory.SetCurrentDirectory(Path.GetDirectoryName(root));
+            string opaqueFromParent = RuntimeScope.HashOpaqueIdentifier("slot-runtime-opaque");
+            Assert(opaqueHash == opaqueFromTemp && opaqueHash == opaqueFromParent,
+                "opaque runtime slot hashing depended on the process working directory");
+
+            string otherSlot = RuntimeScope.ForRoot(otherRoot);
+            Assert(firstSlot != otherSlot &&
+                   firstPipe != PipeNames.ForSlot(otherRoot, otherSlot) &&
+                   firstMutex != PipeNames.MutexForSlot(otherRoot, otherSlot),
+                "different roots shared coordinator ownership identities");
+            Assert(PipeNames.ForRoot(root) == PipeNames.ForSlot(root, firstSlot),
+                "wrapper and direct server startup did not derive the same pipe name");
+        }
+        finally
+        {
+            Directory.SetCurrentDirectory(previousDirectory);
+            try { Directory.Delete(Path.GetDirectoryName(root), true); } catch { }
+        }
+    }
+
+    private static void TestIdentifierStrengthAndLegacyCompatibility()
+    {
+        using Fixture fixture = new(new PersistedState
+        {
+            Generation = 1,
+            Phase = BridgePhase.STOPPED,
+            MaintenanceReady = true
+        });
+        int begin = fixture.State.Execute(Request("test", "new-agent", 77, "begin"), _ => { }, () => true);
+        PersistedState acquired = ReadPersistedState(fixture.Root);
+        Assert(begin == 0 && acquired.Leases.Count == 1 && acquired.Leases[0].Id.StartsWith("lease-", StringComparison.Ordinal) &&
+               acquired.Leases[0].Id.Length >= "lease-".Length + 32,
+            "new durable lease IDs were not full-width capabilities");
+
+        using Fixture legacyLeaseFixture = Fixture.MaintenanceWithLease();
+        int renew = legacyLeaseFixture.State.Execute(Request("test", "holder", 77, "renew", "T001"), _ => { }, () => true);
+        PersistedState legacyLease = ReadPersistedState(legacyLeaseFixture.Root);
+        Assert(renew == 0 && legacyLease.Leases.Any(value => value.Id == "T001"),
+            "an existing short persisted lease was not retained safely for backward compatibility");
+
+        using Fixture legacySlotFixture = new(new PersistedState { Phase = BridgePhase.STOPPED });
+        string legacySlot = RuntimeScope.LegacyForRoot(legacySlotFixture.Root);
+        File.WriteAllText(Path.Combine(legacySlotFixture.Root, "Runtime", "state.json"),
+            JsonSerializer.Serialize(new PersistedState
+            {
+                CoordinatorRoot = legacySlotFixture.Root,
+                RuntimeSlotId = legacySlot,
+                Phase = BridgePhase.STOPPED
+            }, Program.JsonOptions));
+        Exception failure = null;
+        try
+        {
+            RuntimeScope.ResolveEffectiveSlot(legacySlotFixture.Root, null, null);
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
+        }
+        Assert(failure is InvalidOperationException && failure.Message.Contains("legacy runtime slot", StringComparison.Ordinal) &&
+               failure.Message.Contains("coordinator shutdown", StringComparison.Ordinal) &&
+               failure.Message.Contains("do not delete", StringComparison.Ordinal),
+            "legacy persisted runtime slots did not fail with actionable migration guidance");
+    }
+
+    private static void TestTwoCoordinatorsCannotOwnSameSlot()
+    {
+        using Fixture fixture = Fixture.ReadyWithLease();
+        using CoordinatorHarness first = CoordinatorHarness.Start(fixture);
+        Task<int> competitor = Task.Run(() => CoordinatorServer.Run(fixture.Root, first.Slot));
+        Assert(competitor.Wait(TimeSpan.FromSeconds(3)) && competitor.Result == 0,
+            "a second coordinator did not fail closed on the existing slot mutex");
+        first.Shutdown();
+    }
+
+    private static BridgeRequest NewProtocolRequest(string command, params string[] arguments)
+    {
+        return new BridgeRequest
+        {
+            ProtocolVersion = CoordinatorIpcProtocol.Version,
+            RequestId = CoordinatorIpcProtocol.NewRequestId(),
+            Type = CoordinatorIpcProtocol.RequestType,
+            Command = command,
+            Arguments = arguments.ToList(),
+            Agent = "holder",
+            ClientProcessId = Environment.ProcessId,
+            Json = false
+        };
+    }
+
+    private static List<CoordinatorIpcFrame> SendRawProtocolRequest(CoordinatorHarness harness,
+        BridgeRequest request)
+    {
+        request.CoordinatorRoot ??= harness.Fixture.Root;
+        request.RuntimeSlotId ??= harness.Slot;
+        using NamedPipeClientStream pipe = new(".", PipeNames.ForSlot(harness.Fixture.Root, harness.Slot),
+            PipeDirection.InOut, PipeOptions.Asynchronous);
+        pipe.Connect(2000);
+        using StreamReader reader = new(pipe, Encoding.UTF8, false, 4096, leaveOpen: true);
+        using StreamWriter writer = new(pipe, new UTF8Encoding(false), 4096, leaveOpen: true);
+        writer.AutoFlush = true;
+        writer.WriteLine(JsonSerializer.Serialize(request, Program.JsonOptions));
+
+        List<CoordinatorIpcFrame> frames = new();
+        string line;
+        while ((line = CoordinatorIpcProtocol.ReadFrameLine(reader)) != null)
+        {
+            frames.Add(DeserializeFrame(line));
+            if (frames[^1].Type == CoordinatorIpcProtocol.ResultType)
+                break;
+        }
+        return frames;
+    }
+
+    private static List<string> SendRawLine(CoordinatorHarness harness, string line)
+    {
+        using NamedPipeClientStream pipe = new(".", PipeNames.ForSlot(harness.Fixture.Root, harness.Slot),
+            PipeDirection.InOut, PipeOptions.Asynchronous);
+        pipe.Connect(2000);
+        using StreamReader reader = new(pipe, Encoding.UTF8, false, 4096, leaveOpen: true);
+        using StreamWriter writer = new(pipe, new UTF8Encoding(false), 4096, leaveOpen: true);
+        writer.AutoFlush = true;
+        writer.WriteLine(line);
+
+        List<string> lines = new();
+        string response;
+        while ((response = CoordinatorIpcProtocol.ReadFrameLine(reader)) != null)
+        {
+            lines.Add(response);
+            try
+            {
+                if (DeserializeFrame(response).Type == CoordinatorIpcProtocol.ResultType)
+                    break;
+            }
+            catch (JsonException)
+            {
+                // Unsupported protocol v1 deliberately receives a bounded
+                // human-readable compatibility error rather than a v2 frame.
+                break;
+            }
+        }
+        return lines;
+    }
+
+    private static CoordinatorIpcFrame DeserializeFrame(string line)
+    {
+        return JsonSerializer.Deserialize<CoordinatorIpcFrame>(line, Program.JsonOptions)
+            ?? throw new InvalidOperationException("IPC test frame was null");
+    }
+
+    private static Exception RunAgainstFakeServer(Fixture fixture, IReadOnlyList<string> command,
+        Action<BridgeRequest, StreamWriter> responder)
+    {
+        string slot = RuntimeScope.ForRoot(fixture.Root);
+        using NamedPipeServerStream server = new(PipeNames.ForSlot(fixture.Root, slot), PipeDirection.InOut, 1,
+            PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+        Exception serverFailure = null;
+        Task serverTask = Task.Run(() =>
+        {
+            try
+            {
+                server.WaitForConnection();
+                using (StreamReader reader = new(server, Encoding.UTF8, false, 4096, leaveOpen: true))
+                using (StreamWriter writer = new(server, new UTF8Encoding(false), 4096, leaveOpen: true))
+                {
+                    writer.AutoFlush = true;
+                    string requestLine = CoordinatorIpcProtocol.ReadFrameLine(reader);
+                    BridgeRequest request = JsonSerializer.Deserialize<BridgeRequest>(requestLine, Program.JsonOptions);
+                    responder(request, writer);
+                }
+
+                try
+                {
+                    server.Dispose();
+                }
+                catch (Exception exception) when (exception is IOException || exception is ObjectDisposedException)
+                {
+                    // A fake server disconnect is expected when the client
+                    // rejects a response or is waiting for a terminal result.
+                }
+            }
+            catch (Exception exception)
+            {
+                serverFailure = exception;
+            }
+        });
+
+        Exception clientFailure = null;
+        try
+        {
+            CoordinatorClient.Run(fixture.Root, command, slot, null, null,
+                TimeSpan.FromSeconds(2));
+        }
+        catch (Exception exception)
+        {
+            clientFailure = exception;
+        }
+        finally
+        {
+            try
+            {
+                server.Dispose();
+            }
+            catch (Exception exception) when (exception is IOException || exception is ObjectDisposedException)
+            {
+                // A fake server disconnect is part of the test contract.
+            }
+            serverTask.Wait(TimeSpan.FromSeconds(3));
+        }
+
+        if (serverFailure != null)
+            throw new InvalidOperationException($"fake IPC server failed: {serverFailure.Message}", serverFailure);
+        return clientFailure;
+    }
+
     private static void TestSimultaneousShutdownClientsAreBoundedAndDurable()
     {
         using Fixture fixture = Fixture.ReadyWithLease();
@@ -222,8 +713,8 @@ internal static partial class OfflineTests
                 "long-running restart client was not accepted before shutdown");
 
             List<string> shutdown = harness.Send("coordinator", "shutdown");
-            Assert(shutdown.Any(value => value == "__DEVBRIDGE_END__|0"),
-                "shutdown client did not receive a terminal response");
+            Assert(shutdown.Any(value => value.Contains("Coordinator shutdown accepted", StringComparison.Ordinal)),
+                "shutdown client did not receive its terminal event");
             Assert(harness.ServerTask.Wait(TimeSpan.FromSeconds(5)),
                 "simultaneous shutdown clients left the coordinator running");
             try
@@ -272,7 +763,7 @@ internal static partial class OfflineTests
         internal string Slot { get; }
         internal Task<int> ServerTask { get; }
         internal CoordinatorState StartedState { get; private set; }
-        internal bool MarkerObservedBeforeServerExit { get; private set; }
+        internal bool SkipShutdownOnDispose { get; set; }
 
         internal static CoordinatorHarness Start(Fixture fixture) =>
             new(fixture, TestOptions(fixture));
@@ -290,9 +781,6 @@ internal static partial class OfflineTests
                 int exitCode = CoordinatorClient.Run(Fixture.Root, command, Slot, null, value =>
                 {
                     received.Add(value);
-                    if (value.StartsWith("__DEVBRIDGE_END__|", StringComparison.Ordinal) &&
-                        !ServerTask.IsCompleted)
-                        MarkerObservedBeforeServerExit = true;
                 });
                 Assert(exitCode == 0, "named-pipe command returned " + exitCode);
                 return received;
@@ -313,9 +801,55 @@ internal static partial class OfflineTests
 
         public void Dispose()
         {
+            if (SkipShutdownOnDispose)
+            {
+                if (ServerTask.IsFaulted)
+                {
+                    try
+                    {
+                        ServerTask.GetAwaiter().GetResult();
+                    }
+                    catch (Exception exception) when (exception is CoordinatorFaultInjectedException ||
+                               exception is AggregateException aggregate &&
+                               aggregate.Flatten().InnerExceptions.All(value =>
+                                   value is CoordinatorFaultInjectedException))
+                    {
+                        // The caller already observed the expected injected
+                        // server death and deliberately skipped a new IPC call.
+                    }
+                }
+                return;
+            }
+            if (ServerTask.IsFaulted)
+            {
+                try
+                {
+                    ServerTask.GetAwaiter().GetResult();
+                }
+                catch (Exception exception) when (exception is CoordinatorFaultInjectedException ||
+                           exception is AggregateException aggregate &&
+                           aggregate.Flatten().InnerExceptions.All(value =>
+                               value is CoordinatorFaultInjectedException))
+                {
+                    // Fault-injection tests deliberately terminate the host at a
+                    // named boundary; observe and consume only that expected
+                    // server-task failure during harness cleanup.
+                }
+                return;
+            }
             try
             {
                 Shutdown();
+            }
+            catch (Exception exception) when (exception is CoordinatorFaultInjectedException ||
+                       exception is AggregateException aggregate &&
+                       aggregate.Flatten().InnerExceptions.All(value =>
+                           value is CoordinatorFaultInjectedException))
+            {
+                // A fault can race the IsCompleted check while cleanup is
+                // issuing its final shutdown request. It is still the named
+                // injected failure, not an additional test failure.
+                return;
             }
             catch
             {
@@ -341,7 +875,8 @@ internal static partial class OfflineTests
             PlayerLogPath = fixture.PlayerLogPath ?? Path.Combine(fixture.Root, "Player.log"),
             RimBridgeClient = fixture.RouteClient,
             RimBridgeGenerationVerifier = fixture.RouteVerifier,
-            BeforeModsConfigWrite = fixture.BeforeModsConfigWrite
+            BeforeModsConfigWrite = fixture.BeforeModsConfigWrite,
+            FaultInjector = fixture.FaultInjector
         };
     }
 }

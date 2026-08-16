@@ -1,0 +1,24 @@
+<Project>
+  <!--
+    The .NET SDK supplies SourceRevisionId from Git. Mark a worktree build as
+    dirty before the SDK writes AssemblyInformationalVersion so a local build
+    cannot look like a clean published revision.
+  -->
+  <Target Name="DevBridgeMarkDirtySourceRevision"
+          BeforeTargets="AddSourceRevisionToInformationalVersion"
+          Condition="'$(DevBridgeBuildDirty)' == '' or '$(SourceRevisionId)' == ''">
+    <Exec Command="git status --porcelain --untracked-files=all"
+          ConsoleToMSBuild="true"
+          IgnoreExitCode="true"
+          StandardOutputImportance="Low"
+          StandardErrorImportance="Low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="_DevBridgeGitStatus" />
+    </Exec>
+    <PropertyGroup>
+      <DevBridgeBuildDirty Condition="'$(DevBridgeBuildDirty)' == '' and '$(_DevBridgeGitStatus)' != ''">true</DevBridgeBuildDirty>
+      <DevBridgeBuildDirty Condition="'$(DevBridgeBuildDirty)' == ''">false</DevBridgeBuildDirty>
+      <SourceRevisionId Condition="'$(SourceRevisionId)' == ''">unknown</SourceRevisionId>
+      <SourceRevisionId Condition="'$(DevBridgeBuildDirty)' == 'true'">$(SourceRevisionId).dirty</SourceRevisionId>
+    </PropertyGroup>
+  </Target>
+</Project>

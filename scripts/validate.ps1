@@ -51,11 +51,11 @@ Invoke-Required 'Build Coordinator Release' 'dotnet' @(
 Invoke-Required 'Build Coordinator.Tests Release' 'dotnet' @(
     'build', $testsProject, '--configuration', 'Release', '--no-restore', '--nologo'
 )
-Invoke-Required 'Run complete offline coordinator test suite' 'dotnet' @(
-    'run', '--project', $testsProject, '--configuration', 'Release', '--no-build', '--no-restore'
-)
 Invoke-Required 'Build BridgeTools Release' 'dotnet' @(
     'build', $bridgeToolsProject, '--configuration', 'Release', '--no-restore', '--nologo'
+)
+Invoke-Required 'Run complete offline coordinator test suite' 'dotnet' @(
+    'run', '--project', $testsProject, '--configuration', 'Release', '--no-build', '--no-restore'
 )
 
 Invoke-Required 'Check working-tree whitespace' 'git' @('diff', '--check')

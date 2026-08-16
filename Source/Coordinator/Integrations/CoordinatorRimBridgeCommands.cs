@@ -671,6 +671,13 @@ internal sealed partial class CoordinatorState
             (string.IsNullOrWhiteSpace(bridge.CompanionErrorCode)
                 ? string.Empty
                 : " [" + bridge.CompanionErrorCode + "]"));
+        string companionDiagnosticCode = RimBridgeCompanionDiagnostics.Code(bridge);
+        string companionDiagnosticReason = RimBridgeCompanionDiagnostics.Reason(bridge);
+        if (!string.IsNullOrWhiteSpace(companionDiagnosticCode))
+            emit("Companion diagnostic: " + companionDiagnosticCode +
+                (string.IsNullOrWhiteSpace(companionDiagnosticReason)
+                    ? string.Empty
+                    : " - " + DiagnosticRedactor.Text(companionDiagnosticReason)));
         if (!string.IsNullOrWhiteSpace(bridge.ErrorCode))
             emit("Bridge error: " + bridge.ErrorCode +
                 (string.IsNullOrWhiteSpace(bridge.Error) ? string.Empty : " - " + bridge.Error));

@@ -52,7 +52,7 @@ internal static class Program
 
     private static void PrintUsage()
     {
-        Console.WriteLine("DevBridge commands: status | bridge status | bridge policy | bridge endpoint | bridge tools | bridge call <tool-name> [JSON arguments] [--lease <lease-id>] | project register <alias[,alias...]> | project status | project renew <registration-id> | project release <registration-id> | mods status | mods capture-baseline | mods restore-baseline | test begin | test session | test renew <lease-id> | test end <lease-id> | stop <lease-id> | ensure-ready <lease-id> | restart [--projects none|alias[,alias...]] [--legacy-production] | wait-ready | history [show <generation>|last-good] | doctor");
+        Console.WriteLine("DevBridge commands: status | bridge status | bridge policy | bridge endpoint | bridge tools | bridge call <tool-name> [JSON arguments] [--lease <lease-id>] | project register <alias[,alias...]> | project status | project renew <registration-id> | project release <registration-id> | mods status | mods capture-baseline | mods restore-baseline | test begin | test session | test renew <lease-id> | test end <lease-id> | stop <lease-id> | coordinator shutdown | ensure-ready <lease-id> | restart [--projects none|alias[,alias...]] [--legacy-production] | wait-ready | history [show <generation>|last-good] | doctor");
         Console.WriteLine("Append --json to a non-session command for machine-readable output.");
     }
 }
@@ -227,8 +227,18 @@ internal sealed class BridgeRequest
 
 internal static class CoordinatorClient
 {
+    // Test-only seams keep the lazy-start contract observable without spawning
+    // a second test runner. Production always uses the process path and starter
+    // from the current invocation.
+    internal static Func<string> ProcessPathProviderForTests { get; set; }
+    internal static Action<ProcessStartInfo> ProcessStarterForTests { get; set; }
+
+    internal static void StartServerForTests(string root, string runtimeSlotId, string ticketId) =>
+        StartServer(root, runtimeSlotId, ticketId);
+
     internal static int Run(string root, IReadOnlyList<string> command, string runtimeSlotId = null,
-        string ticketId = null)
+        string ticketId = null, Action<string> receivedLine = null,
+        TimeSpan? terminalResponseTimeout = null)
     {
         string effectiveSlot = runtimeSlotId ?? RuntimeScope.ResolveTicketSlot(root, ticketId) ?? RuntimeScope.ForRoot(root);
         bool json = command.Any(argument => string.Equals(argument, "--json", StringComparison.OrdinalIgnoreCase));
@@ -296,9 +306,29 @@ internal static class CoordinatorClient
             };
             writer.WriteLine(JsonSerializer.Serialize(request, Program.JsonOptions));
 
-            string line;
-            while ((line = reader.ReadLine()) != null)
+            bool bounded = CoordinatorResponsePolicy.IsFinite(normalizedCommand[0],
+                normalizedCommand.Skip(1).ToList());
+            using CancellationTokenSource responseTimeout = bounded
+                ? new CancellationTokenSource(terminalResponseTimeout ?? CoordinatorResponsePolicy.FiniteTimeout)
+                : null;
+            while (true)
             {
+                string line;
+                try
+                {
+                    line = responseTimeout == null
+                        ? reader.ReadLine()
+                        : reader.ReadLineAsync(responseTimeout.Token).AsTask().GetAwaiter().GetResult();
+                }
+                catch (OperationCanceledException) when (responseTimeout?.IsCancellationRequested == true)
+                {
+                    throw new IOException(CoordinatorResponsePolicy.TimeoutMessage(
+                        normalizedCommand[0]));
+                }
+
+                if (line == null)
+                    break;
+                receivedLine?.Invoke(line);
                 if (line.StartsWith("__DEVBRIDGE_END__|", StringComparison.Ordinal))
                 {
                     string code = line.Substring("__DEVBRIDGE_END__|".Length);
@@ -325,7 +355,7 @@ internal static class CoordinatorClient
 
     private static void StartServer(string root, string runtimeSlotId, string ticketId)
     {
-        string processPath = Environment.ProcessPath;
+        string processPath = ProcessPathProviderForTests?.Invoke() ?? Environment.ProcessPath;
         if (string.IsNullOrWhiteSpace(processPath))
             throw new InvalidOperationException("the coordinator process path is unavailable");
 
@@ -334,8 +364,12 @@ internal static class CoordinatorClient
             UseShellExecute = false,
             CreateNoWindow = true,
             WorkingDirectory = root,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true
+            // A detached coordinator must not inherit redirected pipes that no
+            // process drains. A full stdout/stderr buffer otherwise freezes the
+            // server after a diagnostic write, leaving clients without an end
+            // marker even when the durable operation already completed.
+            RedirectStandardOutput = false,
+            RedirectStandardError = false
         };
 
         if (string.Equals(Path.GetFileNameWithoutExtension(processPath), "dotnet",
@@ -365,16 +399,35 @@ internal static class CoordinatorClient
             start.ArgumentList.Add("--ticket");
             start.ArgumentList.Add(ticketId);
         }
-        Process.Start(start)?.Dispose();
+        if (ProcessStarterForTests != null)
+            ProcessStarterForTests(start);
+        else
+            Process.Start(start)?.Dispose();
     }
 }
 
 internal static class CoordinatorServer
 {
-    internal static int Run(string root, string runtimeSlotId = null, string ticketId = null)
+    private const int MaxPipeInstances = 16;
+    private static readonly TimeSpan ShutdownClientGracePeriod = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan ShutdownWorkerGracePeriod = TimeSpan.FromSeconds(10);
+
+    private sealed class ClientSession
+    {
+        internal ClientSession(NamedPipeServerStream pipe) => Pipe = pipe;
+
+        internal NamedPipeServerStream Pipe { get; }
+        internal Task Handler { get; set; }
+        internal ManualResetEventSlim Completed { get; } = new(false);
+        internal bool IsShutdownRequest { get; set; }
+        internal bool TerminalWritten { get; set; }
+    }
+
+    internal static int Run(string root, string runtimeSlotId = null, string ticketId = null,
+        CoordinatorOptions optionsOverride = null, Action<CoordinatorState> started = null)
     {
         string slot = runtimeSlotId ?? RuntimeScope.ResolveTicketSlot(root, ticketId) ?? RuntimeScope.ForRoot(root);
-        using Mutex mutex = new(false, PipeNames.MutexForSlot(slot));
+        Mutex mutex = new(false, PipeNames.MutexForSlot(slot));
         bool ownsMutex;
         try
         {
@@ -386,91 +439,220 @@ internal static class CoordinatorServer
         }
 
         if (!ownsMutex)
+        {
+            mutex.Dispose();
             return 0;
+        }
 
-        CoordinatorOptions production = CoordinatorOptions.ForProduction();
-        CoordinatorState state = new(root, new CoordinatorOptions
+        CoordinatorState state = null;
+        try
         {
-            CoordinatorRoot = root,
-            RuntimeSlotId = slot,
-            ReadinessTimeout = production.ReadinessTimeout,
-            RimBridgeMode = production.RimBridgeMode,
-            PlayerLogPath = production.PlayerLogPath
-        });
-        state.StartRecoveryWork();
+            CoordinatorOptions production = optionsOverride ?? CoordinatorOptions.ForProduction();
+            state = new(root, optionsOverride ?? new CoordinatorOptions
+            {
+                CoordinatorRoot = root,
+                RuntimeSlotId = slot,
+                ReadinessTimeout = production.ReadinessTimeout,
+                RimBridgeMode = production.RimBridgeMode,
+                PlayerLogPath = production.PlayerLogPath
+            });
+            state.StartRecoveryWork();
+            started?.Invoke(state);
 
-        while (true)
+            using CancellationTokenSource acceptShutdown = new();
+            List<ClientSession> clients = new();
+            object clientsGate = new();
+            bool shutdownRequested = false;
+            ClientSession shutdownRequester = null;
+
+            void RequestShutdown(ClientSession requester)
+            {
+                lock (clientsGate)
+                {
+                    if (!shutdownRequested)
+                    {
+                        shutdownRequested = true;
+                        shutdownRequester = requester;
+                        acceptShutdown.Cancel();
+                    }
+                }
+            }
+
+            while (!acceptShutdown.IsCancellationRequested)
+            {
+                NamedPipeServerStream server = null;
+                try
+                {
+                    server = new NamedPipeServerStream(PipeNames.ForSlot(root, slot), PipeDirection.InOut,
+                        MaxPipeInstances, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+                    server.WaitForConnectionAsync(acceptShutdown.Token).GetAwaiter().GetResult();
+                    if (acceptShutdown.IsCancellationRequested)
+                        break;
+
+                    ClientSession session = new(server);
+                    server = null;
+                    lock (clientsGate)
+                        clients.Add(session);
+                    session.Handler = Task.Run(() => HandleClient(state, session, RequestShutdown));
+                }
+                catch (OperationCanceledException) when (acceptShutdown.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (ObjectDisposedException) when (acceptShutdown.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception exception)
+                {
+                    if (acceptShutdown.IsCancellationRequested)
+                        break;
+                    Console.Error.WriteLine("DevBridge server pipe error: " + exception.Message);
+                    Thread.Sleep(250);
+                }
+                finally
+                {
+                    server?.Dispose();
+                }
+            }
+
+            if (shutdownRequested)
+                FinishShutdown(state, clients, shutdownRequester);
+            else
+                state.RequestShutdown();
+            return 0;
+        }
+        finally
         {
-            NamedPipeServerStream server = null;
-            try
+            state?.Shutdown(ShutdownWorkerGracePeriod);
+            if (ownsMutex)
             {
-                server = new NamedPipeServerStream(PipeNames.ForSlot(root, slot), PipeDirection.InOut, 16,
-                    PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
-                server.WaitForConnection();
-                NamedPipeServerStream connected = server;
-                server = null;
-                _ = Task.Run(() => HandleClient(state, connected));
+                try { mutex.ReleaseMutex(); } catch (ApplicationException) { }
             }
-            catch (Exception exception)
-            {
-                Console.Error.WriteLine("DevBridge server pipe error: " + exception.Message);
-                Thread.Sleep(250);
-            }
-            finally
-            {
-                server?.Dispose();
-            }
+            mutex.Dispose();
         }
     }
 
-    private static void HandleClient(CoordinatorState state, NamedPipeServerStream pipe)
+    private static void FinishShutdown(CoordinatorState state, List<ClientSession> clients,
+        ClientSession shutdownRequester)
     {
-        using (pipe)
-        using (StreamReader reader = new(pipe, Encoding.UTF8, false, 4096, leaveOpen: true))
-        using (StreamWriter writer = new(pipe, new UTF8Encoding(false), 4096, leaveOpen: true))
+        state.RequestShutdown();
+        DateTime graceDeadline = DateTime.UtcNow.Add(ShutdownClientGracePeriod);
+        while (DateTime.UtcNow < graceDeadline)
         {
-            writer.AutoFlush = true;
-            ClientOutput output = new(writer);
-            BridgeRequest request = null;
-            try
-            {
-                string requestLine = reader.ReadLine();
-                if (string.IsNullOrWhiteSpace(requestLine))
-                {
-                    output.Write("Invalid empty coordinator request.");
-                    output.Write("__DEVBRIDGE_END__|2");
-                    return;
-                }
+            ClientSession[] pending = clients.Where(value => !value.Completed.IsSet &&
+                (value.IsShutdownRequest || value == shutdownRequester)).ToArray();
+            if (pending.Length == 0)
+                break;
+            int remaining = Math.Max(1, (int)(graceDeadline - DateTime.UtcNow).TotalMilliseconds);
+            Task[] handlers = pending.Select(value => value.Handler).Where(value => value != null).ToArray();
+            if (handlers.Length == 0 || Task.WaitAll(handlers, Math.Min(remaining, 100)))
+                continue;
+        }
 
-                request = JsonSerializer.Deserialize<BridgeRequest>(requestLine, Program.JsonOptions);
-                if (request == null || string.IsNullOrWhiteSpace(request.Command))
-                {
-                    output.Write("Invalid coordinator request.");
-                    output.Write("__DEVBRIDGE_END__|2");
-                    return;
-                }
-                request.Arguments ??= new List<string>();
-                request.Agent = string.IsNullOrWhiteSpace(request.Agent) ? "unknown-agent" : request.Agent.Trim();
+        // A long-running command that was already accepted is deliberately
+        // disconnected at shutdown. Its durable state remains authoritative;
+        // the client receives the bounded reconnect guidance from CoordinatorClient.
+        foreach (ClientSession session in clients)
+        {
+            if (!session.IsShutdownRequest && session != shutdownRequester)
+                session.Pipe.Dispose();
+        }
 
-                List<string> buffered = request.Json ? new List<string>() : null;
-                Action<string> emit = request.Json ? buffered.Add : output.Write;
-                int exitCode = state.Execute(request, emit, () => output.Connected && pipe.IsConnected);
-                if (request.Json)
-                    output.Write(JsonSerializer.Serialize(state.CreateJsonResponse(request, exitCode, buffered),
-                        Program.JsonOptions));
-                output.Write("__DEVBRIDGE_END__|" + exitCode);
-            }
-            catch (Exception exception)
+        DateTime handlerDeadline = DateTime.UtcNow.Add(ShutdownClientGracePeriod);
+        while (DateTime.UtcNow < handlerDeadline && clients.Any(value =>
+            !value.Completed.IsSet && value != shutdownRequester))
+        {
+            foreach (ClientSession session in clients.Where(value =>
+                !value.Completed.IsSet && value != shutdownRequester))
+                session.Pipe.Dispose();
+            Thread.Sleep(25);
+        }
+
+        // The requester is never disconnected after a successful terminal
+        // write. This ordering is what makes `coordinator shutdown --json`
+        // reliable even when another client is in a durable wait.
+        if (shutdownRequester != null && !shutdownRequester.Completed.IsSet)
+        {
+            DateTime requesterDeadline = DateTime.UtcNow.Add(ShutdownClientGracePeriod);
+            while (DateTime.UtcNow < requesterDeadline && !shutdownRequester.Completed.IsSet)
+                shutdownRequester.Completed.Wait(25);
+            if (!shutdownRequester.Completed.IsSet)
+                shutdownRequester.Pipe.Dispose();
+        }
+    }
+
+    private static bool IsShutdownRequest(BridgeRequest request)
+    {
+        return request != null && string.Equals(request.Command, "coordinator",
+            StringComparison.OrdinalIgnoreCase) && request.Arguments.Count > 0 &&
+            (string.Equals(request.Arguments[0], "shutdown", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(request.Arguments[0], "reload", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static void HandleClient(CoordinatorState state, ClientSession session,
+        Action<ClientSession> requestShutdown)
+    {
+        NamedPipeServerStream pipe = session.Pipe;
+        try
+        {
+            using (pipe)
+            using (StreamReader reader = new(pipe, Encoding.UTF8, false, 4096, leaveOpen: true))
+            using (StreamWriter writer = new(pipe, new UTF8Encoding(false), 4096, leaveOpen: true))
             {
-                if (request?.Json == true)
+                writer.AutoFlush = true;
+                ClientOutput output = new(writer, CoordinatorResponsePolicy.WriteTimeout);
+                BridgeRequest request = null;
+                bool terminalWritten = false;
+                try
                 {
-                    output.Write(JsonSerializer.Serialize(JsonCommandResponse.Failure(
-                        request.Command, exception.Message, "Run: DevBridge.cmd doctor"), Program.JsonOptions));
+                    string requestLine = reader.ReadLine();
+                    if (string.IsNullOrWhiteSpace(requestLine))
+                    {
+                        output.Write("Invalid empty coordinator request.");
+                        terminalWritten = output.Write("__DEVBRIDGE_END__|2");
+                        return;
+                    }
+
+                    request = JsonSerializer.Deserialize<BridgeRequest>(requestLine, Program.JsonOptions);
+                    if (request == null || string.IsNullOrWhiteSpace(request.Command))
+                    {
+                        output.Write("Invalid coordinator request.");
+                        terminalWritten = output.Write("__DEVBRIDGE_END__|2");
+                        return;
+                    }
+                    request.Arguments ??= new List<string>();
+                    request.Agent = string.IsNullOrWhiteSpace(request.Agent) ? "unknown-agent" : request.Agent.Trim();
+                    session.IsShutdownRequest = IsShutdownRequest(request);
+
+                    List<string> buffered = request.Json ? new List<string>() : null;
+                    Action<string> emit = request.Json ? buffered.Add : value => { output.Write(value); };
+                    int exitCode = state.Execute(request, emit, () => output.Connected && pipe.IsConnected);
+                    if (request.Json)
+                        output.Write(JsonSerializer.Serialize(state.CreateJsonResponse(request, exitCode, buffered),
+                            Program.JsonOptions));
+                    terminalWritten = output.Write("__DEVBRIDGE_END__|" + exitCode);
+                    session.TerminalWritten = terminalWritten;
+                    if (session.IsShutdownRequest && exitCode == 0 && terminalWritten)
+                        requestShutdown(session);
                 }
-                else
-                    output.Write("DevBridge coordinator error: " + exception.Message);
-                output.Write("__DEVBRIDGE_END__|2");
+                catch (Exception exception)
+                {
+                    if (!terminalWritten && request?.Json == true)
+                    {
+                        output.Write(JsonSerializer.Serialize(JsonCommandResponse.Failure(
+                            request.Command, exception.Message, "Run: DevBridge.cmd doctor"), Program.JsonOptions));
+                    }
+                    else if (!terminalWritten)
+                        output.Write("DevBridge coordinator error: " + exception.Message);
+                    if (!terminalWritten)
+                        terminalWritten = output.Write("__DEVBRIDGE_END__|2");
+                }
             }
+        }
+        finally
+        {
+            session.Completed.Set();
         }
     }
 }
@@ -478,31 +660,58 @@ internal static class CoordinatorServer
 internal sealed class ClientOutput
 {
     private readonly StreamWriter writer;
+    private readonly TimeSpan writeTimeout;
 
-    internal ClientOutput(StreamWriter writer)
+    internal ClientOutput(StreamWriter writer, TimeSpan writeTimeout)
     {
         this.writer = writer;
+        this.writeTimeout = writeTimeout;
     }
 
     internal bool Connected { get; private set; } = true;
 
-    internal void Write(string line)
+    internal bool Write(string line)
     {
         if (!Connected)
-            return;
+            return false;
 
         try
         {
-            writer.WriteLine(line ?? string.Empty);
+            writer.WriteLineAsync(line ?? string.Empty).WaitAsync(writeTimeout)
+                .GetAwaiter().GetResult();
+            return true;
         }
-        catch (IOException)
+        catch (Exception exception) when (exception is IOException || exception is ObjectDisposedException ||
+                                           exception is TimeoutException || exception is InvalidOperationException)
         {
             Connected = false;
+            return false;
         }
-        catch (ObjectDisposedException)
-        {
-            Connected = false;
-        }
+    }
+}
+
+internal static class CoordinatorResponsePolicy
+{
+    internal static readonly TimeSpan FiniteTimeout = TimeSpan.FromSeconds(60);
+    internal static readonly TimeSpan WriteTimeout = TimeSpan.FromSeconds(10);
+
+    internal static bool IsFinite(string command, IReadOnlyList<string> arguments)
+    {
+        if (string.Equals(command, "wait-ready", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(command, "restart", StringComparison.OrdinalIgnoreCase))
+            return false;
+        if (string.Equals(command, "test", StringComparison.OrdinalIgnoreCase) && arguments.Count > 0 &&
+            (string.Equals(arguments[0], "begin", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(arguments[0], "session", StringComparison.OrdinalIgnoreCase)))
+            return false;
+        return true;
+    }
+
+    internal static string TimeoutMessage(string command)
+    {
+        return "The coordinator did not complete the finite '" + command +
+            "' response within the response deadline. The operation may already be accepted; " +
+            "reconnect with 'DevBridge.cmd status' or 'DevBridge.cmd doctor'. No durable operation was cancelled or rolled back.";
     }
 }
 
@@ -2317,17 +2526,69 @@ internal sealed partial class CoordinatorState
     private readonly IRimBridgeGenerationVerifier rimBridgeGenerationVerifier;
     private readonly object gate = new();
     private readonly object lifecycleGate = new();
+    private readonly CancellationTokenSource shutdownCancellation = new();
     private PersistedState state;
     private bool persistedStateLoadBlocked;
+    private int shutdownRequested;
     private Task restartTask;
     private Task launchTask;
     private Task isolationTask;
+
+    internal TimeSpan ReadinessTimeoutForTesting => options.ReadinessTimeout;
 
     private sealed class MaintenanceValidation
     {
         internal bool Safe { get; init; }
         internal string ErrorCode { get; init; }
         internal string Error { get; init; }
+    }
+
+    internal bool ShutdownRequested => Volatile.Read(ref shutdownRequested) != 0;
+    internal CancellationToken ShutdownToken => shutdownCancellation.Token;
+
+    internal void RequestShutdown()
+    {
+        if (Interlocked.Exchange(ref shutdownRequested, 1) != 0)
+            return;
+
+        shutdownCancellation.Cancel();
+        lock (gate)
+            Monitor.PulseAll(gate);
+    }
+
+    private void ThrowIfShutdownRequested()
+    {
+        if (ShutdownRequested)
+            throw new OperationCanceledException(shutdownCancellation.Token);
+    }
+
+    internal void Shutdown(TimeSpan timeout)
+    {
+        RequestShutdown();
+        DateTime deadline = DateTime.UtcNow.Add(timeout);
+        while (DateTime.UtcNow < deadline)
+        {
+            Task[] tasks;
+            lock (gate)
+            {
+                tasks = new[] { restartTask, launchTask, isolationTask }
+                    .Where(value => value != null && !value.IsCompleted).Distinct().ToArray();
+            }
+
+            if (tasks.Length == 0)
+                return;
+
+            int remaining = Math.Max(1, (int)(deadline - DateTime.UtcNow).TotalMilliseconds);
+            try
+            {
+                Task.WaitAll(tasks, Math.Min(remaining, 100));
+            }
+            catch (AggregateException)
+            {
+                // Worker failures are already represented in durable state. A
+                // coordinator refresh must still release its slot mutex.
+            }
+        }
     }
 
     private sealed class RestartArguments

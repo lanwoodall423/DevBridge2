@@ -36,6 +36,7 @@ internal sealed partial class CoordinatorState
         emit("  DevBridge.cmd test renew <lease-id>");
         emit("  DevBridge.cmd test end <lease-id>");
         emit("  DevBridge.cmd stop <lease-id>");
+        emit("  DevBridge.cmd coordinator shutdown  (refresh the coordinator only; RimWorld and durable state remain unchanged)");
         emit("  DevBridge.cmd ensure-ready <lease-id>");
         emit("  DevBridge.cmd restart [--projects none|alias[,alias...]]");
         emit("  DevBridge.cmd restart --legacy-production  (explicit human production compatibility; never an automatic fallback)");

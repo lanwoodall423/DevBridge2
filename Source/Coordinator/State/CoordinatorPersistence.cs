@@ -546,6 +546,8 @@ internal sealed partial class CoordinatorState
         state.RimBridge.CompanionVerificationTimestampUtc = null;
         state.RimBridge.CompanionErrorCode = null;
         state.RimBridge.CompanionError = null;
+        state.RimBridge.CompanionDiagnosticCode = null;
+        state.RimBridge.CompanionDiagnosticReason = null;
         if (options.RimBridgeMode == RimBridgeMode.Off)
         {
             state.RimBridge.ErrorCode = null;

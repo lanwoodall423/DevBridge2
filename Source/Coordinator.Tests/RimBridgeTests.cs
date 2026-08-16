@@ -782,6 +782,11 @@ internal static partial class OfflineTests
         Assert(match.Status == RimBridgeCompanionVerificationStatus.Match,
             "matching companion identity must be accepted");
 
+        RimBridgeCompanionVerification hostSerialized = VerifyCompanionContext(
+            "launch-context", 17, 700, "launch-context", 17, 700, pascalCase: true);
+        Assert(hostSerialized.Status == RimBridgeCompanionVerificationStatus.Match,
+            "host-serialized PascalCase companion identity must be accepted");
+
         RimBridgeCompanionVerification generationMismatch = VerifyCompanionContext(
             "launch-context", 18, 700, "launch-context", 17, 700);
         Assert(generationMismatch.Status == RimBridgeCompanionVerificationStatus.Mismatch &&
@@ -837,7 +842,8 @@ internal static partial class OfflineTests
 
     private static RimBridgeCompanionVerification VerifyCompanionContext(
         string reportedLaunchId, int reportedGeneration, int reportedProcessId,
-        string expectedLaunchId, int expectedGeneration, int expectedProcessId)
+        string expectedLaunchId, int expectedGeneration, int expectedProcessId,
+        bool pascalCase = false)
     {
         TcpListener listener = new(IPAddress.Loopback, 0);
         listener.Start();
@@ -858,21 +864,33 @@ internal static partial class OfflineTests
                     result = new { agentId = "test-agent" }
                 });
                 ReadTestFrame(stream);
+                Dictionary<string, object> context = pascalCase
+                    ? new Dictionary<string, object>
+                    {
+                        ["Success"] = true,
+                        ["Available"] = true,
+                        ["SchemaVersion"] = RimBridgeIntegrationConstants.CompanionSchemaVersion,
+                        ["LaunchId"] = reportedLaunchId,
+                        ["Generation"] = reportedGeneration,
+                        ["ProcessId"] = reportedProcessId,
+                        ["RimBridgeIntegrationSchemaVersion"] = "rimbridge-integration/v1"
+                    }
+                    : new Dictionary<string, object>
+                    {
+                        ["success"] = true,
+                        ["available"] = true,
+                        ["schemaVersion"] = RimBridgeIntegrationConstants.CompanionSchemaVersion,
+                        ["launchId"] = reportedLaunchId,
+                        ["generation"] = reportedGeneration,
+                        ["processId"] = reportedProcessId,
+                        ["rimBridgeIntegrationSchemaVersion"] = "rimbridge-integration/v1"
+                    };
                 WriteTestFrame(stream, new
                 {
                     v = "gabp/1",
                     type = "response",
                     id = "context",
-                    result = new
-                    {
-                        success = true,
-                        available = true,
-                        schemaVersion = RimBridgeIntegrationConstants.CompanionSchemaVersion,
-                        launchId = reportedLaunchId,
-                        generation = reportedGeneration,
-                        processId = reportedProcessId,
-                        rimBridgeIntegrationSchemaVersion = "rimbridge-integration/v1"
-                    }
+                    result = context
                 });
             }
             catch (Exception exception)

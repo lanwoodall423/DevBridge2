@@ -2,7 +2,7 @@ using RimBridgeServer.Sdk;
 
 namespace DevBridge2.BridgeTools;
 
-public static class DevBridgeGenerationTools
+public sealed class DevBridgeGenerationTools
 {
     [Tool("devbridge/get_generation_context",
         Title = "Get DevBridge generation context",
@@ -23,7 +23,7 @@ public static class DevBridgeGenerationTools
     [ToolResponse("rimBridgeIntegrationSchemaVersion", "string", "DevBridge/RimBridge integration schema", Always = true)]
     [ToolResponse("errorCode", "string", "Bounded context error code", Nullable = true)]
     [ToolResponse("error", "string", "Bounded context diagnostic", Nullable = true)]
-    public static DevBridgeGenerationContextPayload GetGenerationContext()
+    public DevBridgeGenerationContextPayload GetGenerationContext()
     {
         return DevBridgeGenerationContext.Read();
     }
@@ -49,7 +49,7 @@ public static class DevBridgeGenerationTools
     [ToolResponse("externalMutation", "object", "Non-secret external-mutation evidence", Nullable = true)]
     [ToolResponse("errorCode", "string", "Bounded policy error code", Nullable = true)]
     [ToolResponse("error", "string", "Bounded policy diagnostic", Nullable = true)]
-    public static DevBridgeControlPolicyPayload GetControlPolicy()
+    public DevBridgeControlPolicyPayload GetControlPolicy()
     {
         return DevBridgeControlPolicy.Read();
     }

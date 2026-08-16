@@ -2,8 +2,9 @@ Runtime/*
 !Runtime/.gitkeep
 Coordinator/*
 !Coordinator/.gitkeep
+BridgeTools/*
+!BridgeTools/.gitkeep
 1.6/Assemblies/*
 !1.6/Assemblies/.gitkeep
 Source/**/bin/
 Source/**/obj/
-

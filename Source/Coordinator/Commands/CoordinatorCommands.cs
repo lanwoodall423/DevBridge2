@@ -20,6 +20,7 @@ internal sealed partial class CoordinatorState
         request.Arguments ??= new List<string>();
         string command = (request.Command ?? string.Empty).Trim().ToLowerInvariant();
         if (persistedStateLoadBlocked && command != "doctor" && command != "history" &&
+            command != "coordinator" &&
             !IsProjectResolveCommand(request))
         {
             string errorCode;
@@ -49,11 +50,27 @@ internal sealed partial class CoordinatorState
             "restart" => Restart(request, emit),
             "stop" => Stop(request, emit),
             "ensure-ready" => EnsureReady(request, emit),
+            "coordinator" => CoordinatorControl(arguments, emit),
             "project" or "projects" or "intent" => ProjectIntent(arguments, request, emit),
             "test" => Test(arguments, request, emit, connected),
             "help" => Help(emit),
             _ => Unknown(command, emit)
         };
+    }
+
+    private static int CoordinatorControl(IReadOnlyList<string> arguments, Action<string> emit)
+    {
+        if (arguments.Count != 1 ||
+            (!string.Equals(arguments[0], "shutdown", StringComparison.OrdinalIgnoreCase) &&
+             !string.Equals(arguments[0], "reload", StringComparison.OrdinalIgnoreCase)))
+        {
+            emit("Usage: DevBridge.cmd coordinator shutdown");
+            return 2;
+        }
+
+        emit("Coordinator shutdown accepted. Durable state and the RimWorld process are unchanged.");
+        emit("The next command will lazily start the current coordinator binary and environment.");
+        return 0;
     }
 
     private bool TryResolveScope(BridgeRequest request, Action<string> emit)

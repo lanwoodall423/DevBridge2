@@ -14,8 +14,14 @@
     <Deterministic>true</Deterministic>
     <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <RimBridgeSdkPath Condition="'$(RimBridgeSdkPath)' == ''"></RimBridgeSdkPath>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="RimBridgeServer.Sdk" Version="2.0.0" PrivateAssets="all" ExcludeAssets="runtime" />
+    <Reference Include="RimBridgeServer.Sdk" Condition="'$(RimBridgeSdkPath)' != '' and Exists('$(RimBridgeSdkPath)')">
+      <HintPath>$(RimBridgeSdkPath)</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <PackageReference Include="RimBridgeServer.Sdk" Version="2.0.0" PrivateAssets="all" ExcludeAssets="runtime"
+                      Condition="'$(RimBridgeSdkPath)' == '' or !Exists('$(RimBridgeSdkPath)')" />
   </ItemGroup>
 </Project>

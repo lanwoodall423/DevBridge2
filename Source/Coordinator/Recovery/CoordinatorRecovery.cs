@@ -256,7 +256,8 @@ internal sealed partial class CoordinatorState
 
     private void StartIsolationWorkerLocked()
     {
-        if (!IsolationActiveLocked() || (isolationTask != null && !isolationTask.IsCompleted))
+        if (ShutdownRequested || !IsolationActiveLocked() ||
+            (isolationTask != null && !isolationTask.IsCompleted))
             return;
         isolationTask = Task.Run(IsolationWorker);
     }
@@ -532,7 +533,9 @@ internal sealed partial class CoordinatorState
             startTicks = state.ProcessStartUtcTicks;
         }
 
+        ThrowIfShutdownRequested();
         (bool stopped, string stopCode, string stopError) = StopOwnedProcess(processId, startTicks);
+        ThrowIfShutdownRequested();
         if (!stopped)
         {
             errorCode = stopCode;
@@ -657,6 +660,7 @@ internal sealed partial class CoordinatorState
             {
                 while (true)
                 {
+                    ThrowIfShutdownRequested();
                     ModProfile profile = null;
                     string attemptId = null;
                     string kind = null;
@@ -720,6 +724,7 @@ internal sealed partial class CoordinatorState
                         }
                         if (!retainFinalControl)
                         {
+                            ThrowIfShutdownRequested();
                             if (!StopIsolationProcess(out string stopCode, out string stopError))
                             {
                                 lock (gate)
@@ -763,6 +768,7 @@ internal sealed partial class CoordinatorState
                         return;
                     }
 
+                    ThrowIfShutdownRequested();
                     if (!PrepareIsolationAttempt(profile, attemptId, targetGeneration,
                             out string prepareErrorCode, out string prepareError))
                     {
@@ -786,11 +792,18 @@ internal sealed partial class CoordinatorState
                         continue;
                     }
 
+                    ThrowIfShutdownRequested();
                     LaunchGenerationWorker(targetGeneration, isRestart: true,
                         owner: "isolation@" + runtimeSlotId, isolationProfile: profile,
                         isolationAttemptId: attemptId);
                 }
             }
+        }
+        catch (OperationCanceledException) when (ShutdownRequested)
+        {
+            // Leave the persisted isolation attempt recoverable. Shutdown is
+            // not an environmental isolation failure and never kills RimWorld
+            // merely to refresh the coordinator binary.
         }
         catch (ProfileException exception)
         {

@@ -54,7 +54,7 @@ internal sealed partial class CoordinatorState
 
     private bool StartInitialLaunchLocked(string owner = null)
     {
-        if (launchTask != null && !launchTask.IsCompleted)
+        if (ShutdownRequested || (launchTask != null && !launchTask.IsCompleted))
             return true;
         if (ExternalMutationBlocksLaunchLocked(null, "Initial launch"))
             return false;
@@ -107,15 +107,21 @@ internal sealed partial class CoordinatorState
         FreezeAggregateLocked(profile, registrations, target, owner, "initial-" + target);
         launchTask = Task.Run(() =>
         {
+            if (ShutdownRequested)
+                return;
             lock (lifecycleGate)
+            {
+                if (ShutdownRequested)
+                    return;
                 LaunchGenerationWorker(target, isRestart: false, owner: owner);
+            }
         });
         return true;
     }
 
     private void StartRestartWorkerLocked(int targetGeneration, string owner = null)
     {
-        if (restartTask != null && !restartTask.IsCompleted)
+        if (ShutdownRequested || (restartTask != null && !restartTask.IsCompleted))
             return;
         if (ExternalMutationBlocksLaunchLocked(null, "Restart"))
             return;
@@ -140,7 +146,7 @@ internal sealed partial class CoordinatorState
 
     private void StartMonitorLaunchLocked(int targetGeneration)
     {
-        if (launchTask != null && !launchTask.IsCompleted)
+        if (ShutdownRequested || (launchTask != null && !launchTask.IsCompleted))
             return;
 
         launchTask = Task.Run(() => MonitorLaunchWorker(targetGeneration));
@@ -159,6 +165,8 @@ internal sealed partial class CoordinatorState
             {
                 while (true)
                 {
+                    if (ShutdownRequested)
+                        return;
                     lock (gate)
                     {
                         PruneStaleLeasesLocked();
@@ -211,7 +219,9 @@ internal sealed partial class CoordinatorState
                         return;
                 }
 
+                ThrowIfShutdownRequested();
                 (bool stopped, string stopErrorCode, string stopError) = StopOwnedProcess(oldProcessId, oldStartTicks);
+                ThrowIfShutdownRequested();
                 if (!stopped)
                 {
                     FailLaunch(stopError, stopErrorCode);
@@ -219,6 +229,12 @@ internal sealed partial class CoordinatorState
                 }
                 LaunchGenerationWorker(targetGeneration, isRestart: true, owner: owner);
             }
+        }
+        catch (OperationCanceledException) when (ShutdownRequested)
+        {
+            // Keep the durable restart/launch intent intact. A later
+            // coordinator instance will resume it; shutdown never turns a
+            // cancellation into a launch failure or stops RimWorld.
         }
         catch (Exception exception)
         {
@@ -236,6 +252,7 @@ internal sealed partial class CoordinatorState
         bool isolationAttempt = !string.IsNullOrWhiteSpace(isolationAttemptId);
         try
         {
+            ThrowIfShutdownRequested();
             owner ??= "coordinator@" + runtimeSlotId;
             lock (gate)
             {
@@ -410,6 +427,7 @@ internal sealed partial class CoordinatorState
 
             // A process may have appeared after the pre-write census. Check again at the
             // launch boundary so an external RimWorld start cannot become a duplicate launch.
+            ThrowIfShutdownRequested();
             EnsureNoMatchingRimWorldProcess();
             lock (gate)
             {
@@ -460,6 +478,21 @@ internal sealed partial class CoordinatorState
 
             MonitorLaunchUntilReady(process, processId, processStartTicks, launchId, targetGeneration);
         }
+        catch (OperationCanceledException) when (ShutdownRequested)
+        {
+            // LOADING plus the persisted launch identity is intentionally left
+            // recoverable. Do not call FailLaunch and do not terminate a process
+            // merely because this coordinator instance is exiting.
+            lock (gate)
+            {
+                if (state.Phase == BridgePhase.LOADING && state.ProcessId <= 0)
+                {
+                    state.Phase = BridgePhase.RESTARTING;
+                    SaveStateLocked();
+                    Monitor.PulseAll(gate);
+                }
+            }
+        }
         catch (Exception exception)
         {
             string detail = DescribeLaunchFailure(exception, process);
@@ -475,6 +508,7 @@ internal sealed partial class CoordinatorState
     {
         try
         {
+            ThrowIfShutdownRequested();
             int processId;
             long startTicks;
             string launchId;
@@ -505,6 +539,10 @@ internal sealed partial class CoordinatorState
             }
             MonitorLaunchUntilReady(process, processId, startTicks, launchId, targetGeneration);
         }
+        catch (OperationCanceledException) when (ShutdownRequested)
+        {
+            // The persisted LOADING state is recovered by the next coordinator.
+        }
         catch (Exception exception)
         {
             FailLaunch(exception is ProcessInspectionException ? ProcessInspection.Message :
@@ -521,7 +559,7 @@ internal sealed partial class CoordinatorState
             deadline = state.LaunchStartedUtc.ToUniversalTime().Add(options.ReadinessTimeout);
         DateTime? inspectionFailureStartedUtc = null;
 
-        while (clock.UtcNow < deadline)
+        while (!ShutdownRequested && clock.UtcNow < deadline)
         {
             try
             {
@@ -602,6 +640,8 @@ internal sealed partial class CoordinatorState
             }
             catch (ProcessInspectionException)
             {
+                if (ShutdownRequested)
+                    return;
                 inspectionFailureStartedUtc ??= clock.UtcNow;
                 TimeSpan elapsed = clock.UtcNow - inspectionFailureStartedUtc.Value;
                 if (elapsed >= options.ProcessInspectionRetryTimeout)
@@ -614,6 +654,9 @@ internal sealed partial class CoordinatorState
 
             clock.Sleep(TimeSpan.FromSeconds(1));
         }
+
+        if (ShutdownRequested)
+            return;
 
         if (inspectionFailureStartedUtc.HasValue)
             throw ProcessInspection.Failure();
@@ -730,6 +773,8 @@ internal sealed partial class CoordinatorState
                 state.RimBridge.CompanionVerificationTimestampUtc = clock.UtcNow;
                 state.RimBridge.CompanionErrorCode = companion.Code;
                 state.RimBridge.CompanionError = companion.Error;
+                state.RimBridge.CompanionDiagnosticCode = companion.DiagnosticCode;
+                state.RimBridge.CompanionDiagnosticReason = companion.DiagnosticReason;
 
                 if (companion.Status == RimBridgeCompanionVerificationStatus.Mismatch ||
                     companion.Status == RimBridgeCompanionVerificationStatus.Invalid)

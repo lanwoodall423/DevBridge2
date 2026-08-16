@@ -29,6 +29,9 @@ $alwaysOnPackages = @(
     'astryl.moderndevtools',
     'brrainz.rimbridgeserver'
 )
+$diagnosticTextLimit = 4000
+$script:CurrentFixture = $null
+$script:LastBridgeResponse = $null
 
 if (-not (Test-Path -LiteralPath $coordinatorExe -PathType Leaf) -or
     -not (Test-Path -LiteralPath $fakeExe -PathType Leaf)) {
@@ -109,14 +112,114 @@ $activeMods
     $env:DEVBRIDGE_RIMBRIDGE_MODE = $RimBridgeMode
     $env:DEVBRIDGE_AGENT = 'process-e2e'
 
-    return [pscustomobject]@{
+    $fixture = [pscustomobject]@{
         Name = $Name
+        ScenarioName = $ScenarioName
         Root = $root
         Runtime = $runtime
         Slot = $slot
         LogPath = $logPath
         ScenarioPath = Join-Path $runtime 'fake-rimworld-scenario.json'
         FakeExecutable = $fakeExe
+        LastResponseBeforeCleanup = $null
+    }
+    $script:CurrentFixture = $fixture
+    return $fixture
+}
+
+function Limit-DiagnosticText {
+    param([AllowEmptyString()][string]$Text,
+        [int]$Limit = $diagnosticTextLimit)
+    if ([string]::IsNullOrEmpty($Text)) { return '<empty>' }
+    $normalized = $Text.Trim()
+    if ($normalized.Length -le $Limit) { return $normalized }
+    return $normalized.Substring(0, $Limit) + "`n...[truncated to $Limit characters]"
+}
+
+function Format-Command {
+    param([Parameter(Mandatory = $true)][string[]]$Arguments)
+    return (($Arguments | ForEach-Object {
+        $value = [string]$_
+        if ($value -match '[\s"]') { '"' + $value.Replace('"', '\"') + '"' } else { $value }
+    }) -join ' ')
+}
+
+function Get-DiagnosticArtifactPaths {
+    param([Parameter(Mandatory = $true)][string]$Root)
+    $runtime = Join-Path $Root 'Runtime'
+    $paths = [System.Collections.Generic.List[string]]::new()
+    foreach ($path in @(
+        $Root,
+        $runtime,
+        (Join-Path $runtime 'coordinator-events.jsonl'),
+        (Join-Path $runtime 'state.json'),
+        (Join-Path $runtime 'readiness.json'),
+        (Join-Path $runtime 'quicktest-failure.json'),
+        (Join-Path $Root 'Player.log'),
+        (Join-Path $Root 'ModsConfig.xml')
+    )) {
+        if (Test-Path -LiteralPath $path) { $paths.Add((Resolve-Path -LiteralPath $path).Path) }
+    }
+    if (Test-Path -LiteralPath $runtime -PathType Container) {
+        Get-ChildItem -LiteralPath $runtime -Filter 'e2e-result-*.json' -File -ErrorAction SilentlyContinue |
+            ForEach-Object { $paths.Add($_.FullName) }
+    }
+    return @($paths | Select-Object -Unique)
+}
+
+function Get-DiagnosticArtifactText {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    try {
+        return Limit-DiagnosticText ([IO.File]::ReadAllText($Path))
+    } catch {
+        return "<could not read: $($_.Exception.Message)>"
+    }
+}
+
+function Format-BridgeFailure {
+    param([Parameter(Mandatory = $true)][string]$Scenario,
+        [string]$HostScenario,
+        [Parameter(Mandatory = $true)][string]$Stage,
+        [Parameter(Mandatory = $true)][string]$ExceptionMessage,
+        $Response,
+        [Parameter(Mandatory = $true)][string]$Root)
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add("scenario: $Scenario")
+    if (-not [string]::IsNullOrWhiteSpace($HostScenario)) {
+        $lines.Add("fake host scenario: $HostScenario")
+    }
+    $lines.Add("stage: $Stage")
+    $lines.Add("exception: $(Limit-DiagnosticText $ExceptionMessage)")
+    if ($null -ne $Response) {
+        $lines.Add("command: $($Response.Command)")
+        $lines.Add("exit code: $($Response.ExitCode)")
+        $lines.Add("result path: $($Response.ResultPath)")
+        $lines.Add("result: $(Limit-DiagnosticText ([string]$Response.Output))")
+        $lines.Add("child stdout: $(Limit-DiagnosticText ([string]$Response.Stdout))")
+        $lines.Add("child stderr: $(Limit-DiagnosticText ([string]$Response.Stderr))")
+    }
+    $lines.Add('runtime artifacts:')
+    foreach ($path in @(Get-DiagnosticArtifactPaths $Root)) {
+        $lines.Add("- $path")
+        $artifactText = Get-DiagnosticArtifactText $path
+        if ($null -ne $artifactText) {
+            $lines.Add("  bounded contents: $artifactText")
+        }
+    }
+    return ($lines -join "`n")
+}
+
+function Read-BoundedProcessStream {
+    param([Parameter(Mandatory = $true)]$Task,
+        [Parameter(Mandatory = $true)][string]$Name)
+    try {
+        if (-not $Task.Wait(2000)) {
+            return "<$Name stream did not close within 2000 ms>"
+        }
+        return [string]$Task.GetAwaiter().GetResult()
+    } catch {
+        return "<$Name read failed: $($_.Exception.Message)>"
     }
 }
 
@@ -148,22 +251,46 @@ function Invoke-Bridge {
     $start.RedirectStandardError = $true
     $start.Environment['DEVBRIDGE_TEST_RESULT_FILE'] = $resultPath
     foreach ($argument in $cliArguments) { [void]$start.ArgumentList.Add([string]$argument) }
+    $command = Format-Command (@($start.FileName) + $cliArguments)
     $process = [System.Diagnostics.Process]::Start($start)
     $stdoutDrain = $process.StandardOutput.ReadToEndAsync()
     $stderrDrain = $process.StandardError.ReadToEndAsync()
-    if (-not $process.WaitForExit(65000)) {
-        try { $process.Kill() } catch { }
-        throw "CLI command timed out: $($Arguments -join ' ')"
+    $timedOut = -not $process.WaitForExit(65000)
+    if ($timedOut) {
+        try { $process.Kill($true) } catch { try { $process.Kill() } catch { } }
+        try { $process.WaitForExit(5000) } catch { }
     }
-    $exitCode = $process.ExitCode
+    $exitCode = if ($timedOut) { 'TIMEOUT' } else { $process.ExitCode }
+    $stdout = Read-BoundedProcessStream $stdoutDrain 'stdout'
+    $stderr = Read-BoundedProcessStream $stderrDrain 'stderr'
     $process.Dispose()
     $output = if (Test-Path -LiteralPath $resultPath) {
         [System.IO.File]::ReadAllText($resultPath).Trim()
     } else { '' }
-    Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue
     $json = $null
     try { $json = Get-JsonResponse -Text $output } catch { }
-    return [pscustomobject]@{ Output = $output; ExitCode = $exitCode; Json = $json }
+    $response = [pscustomobject]@{
+        Command = $command
+        Output = $output
+        Stdout = $stdout
+        Stderr = $stderr
+        ExitCode = $exitCode
+        Json = $json
+        ResultPath = $resultPath
+        Stage = $null
+    }
+    $failed = $timedOut -or $exitCode -ne 0 -or $null -eq $json -or
+        (($json.PSObject.Properties.Name -contains 'success') -and -not [bool]$json.success)
+    if (-not $failed) {
+        Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue
+    }
+    $script:LastBridgeResponse = $response
+    if ($timedOut) {
+        throw (Format-BridgeFailure -Scenario $script:CurrentFixture.Name `
+            -HostScenario $script:CurrentFixture.ScenarioName -Stage 'CLI timeout' `
+            -ExceptionMessage 'CLI command timed out after 65000 ms.' -Response $response -Root $Root)
+    }
+    return $response
 }
 
 function Assert-Success {
@@ -172,6 +299,7 @@ function Assert-Success {
     if ($Response.ExitCode -ne 0 -or $null -eq $Response.Json -or
         ($Response.Json.PSObject.Properties.Name -contains 'success' -and
             -not [bool]$Response.Json.success)) {
+        $Response.Stage = $Context
         throw "$Context failed (exit $($Response.ExitCode)): $($Response.Output)"
     }
 }
@@ -232,6 +360,7 @@ function Shutdown-Coordinator {
 
 function Remove-Fixture {
     param([Parameter(Mandatory = $true)]$Fixture)
+    $Fixture.LastResponseBeforeCleanup = $script:LastBridgeResponse
     $processId = 0
     try {
         $status = Get-Status $Fixture
@@ -243,22 +372,54 @@ function Remove-Fixture {
     if ($processId -gt 0) {
         Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
     }
-    Remove-Item -LiteralPath $Fixture.Root -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+function Complete-Fixture {
+    param([Parameter(Mandatory = $true)]$Fixture,
+        [Parameter(Mandatory = $true)][bool]$Preserve)
+    if (-not $Preserve -and -not $KeepRoots) {
+        Remove-Item -LiteralPath $Fixture.Root -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Invoke-Case {
     param([Parameter(Mandatory = $true)][string]$Name,
         [Parameter(Mandatory = $true)][scriptblock]$Body)
     $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $script:CurrentFixture = $null
+    $script:LastBridgeResponse = $null
     try {
         & $Body
         $timer.Stop()
+        if ($null -ne $script:CurrentFixture) {
+            Complete-Fixture $script:CurrentFixture $false
+        }
         Write-Host ("PASS {0} ({1} ms)" -f $Name, $timer.ElapsedMilliseconds)
         return [pscustomobject]@{ Name = $Name; Passed = $true; DurationMs = $timer.ElapsedMilliseconds; Error = $null }
     } catch {
         $timer.Stop()
-        Write-Host ("FAIL {0} ({1} ms): {2}" -f $Name, $timer.ElapsedMilliseconds, $_.Exception.Message)
-        return [pscustomobject]@{ Name = $Name; Passed = $false; DurationMs = $timer.ElapsedMilliseconds; Error = $_.Exception.Message }
+        $fixture = $script:CurrentFixture
+        $response = if ($null -ne $fixture -and $null -ne $fixture.LastResponseBeforeCleanup) {
+            $fixture.LastResponseBeforeCleanup
+        } else { $script:LastBridgeResponse }
+        $stage = if ($null -ne $response -and -not [string]::IsNullOrWhiteSpace([string]$response.Stage)) {
+            [string]$response.Stage
+        } else { 'scenario assertion' }
+        $root = if ($null -ne $fixture) { $fixture.Root } else { $repoRoot }
+        $hostScenario = if ($null -ne $fixture) { $fixture.ScenarioName } else { $null }
+        $report = Format-BridgeFailure -Scenario $Name -HostScenario $hostScenario -Stage $stage `
+            -ExceptionMessage $_.Exception.Message -Response $response -Root $root
+        if ($null -ne $fixture) {
+            Complete-Fixture $fixture $true
+        }
+        Write-Host ("FAIL {0} ({1} ms):`n{2}" -f $Name, $timer.ElapsedMilliseconds, $report)
+        return [pscustomobject]@{
+            Name = $Name
+            Passed = $false
+            DurationMs = $timer.ElapsedMilliseconds
+            Error = $report
+            ArtifactPaths = @(Get-DiagnosticArtifactPaths $root)
+        }
     }
 }
 
@@ -524,7 +685,10 @@ Write-Host "PROCESS E2E: $passed passed, $failed failed, $duration ms total, 0 r
 Write-Host ("Scenarios: " + (($results | ForEach-Object Name) -join ', '))
 
 if ($failed -gt 0) {
-    throw "Process-level E2E failed: $failed scenario(s)."
+    $failureSummary = ($results | Where-Object { -not $_.Passed } | ForEach-Object {
+        "[$($_.Name)] artifacts: $($_.ArtifactPaths -join ', ')"
+    }) -join "`n"
+    throw "Process-level E2E failed: $failed scenario(s).`n$failureSummary"
 }
 
 if (-not $KeepRoots) {

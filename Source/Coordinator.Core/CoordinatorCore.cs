@@ -162,6 +162,9 @@ internal sealed class BridgeRequest
     public string McpRequestId { get; set; }
     [JsonPropertyName("sessionId")]
     public string SessionId { get; set; }
+    // Server-side only. Recipe requests may carry an optional caller-owned
+    // workflow correlation without changing DevBridge's lifecycle IDs.
+    internal string WorkflowId { get; set; }
     // Server-side only.  This is populated after dispatch so the normal JSON
     // response can carry a routed result without making route state durable.
     internal RimBridgeRouteResult RimBridgeRouteResult { get; set; }

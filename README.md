@@ -4,6 +4,9 @@ DevBridge2 is a Windows/.NET developer coordinator for RimWorld. It owns safe lo
 operations, test leases, readiness evidence, ModsConfig profiles, generation history, recovery, and
 optional authenticated RimBridgeServer routing. It is designed for multiple agents sharing one local
 RimWorld installation; it does not replace RimBridgeServer's live-game tools.
+When RimTest is present, it is the normal agent entry point. DevBridge2 remains the sole lifecycle
+owner: agents must not start RimWorld independently through GABS, and profile/ModsConfig mutations
+remain with DevBridge2 while it owns a generation.
 
 ## Support and requirements
 
@@ -64,5 +67,6 @@ the optional companion DLL, wrapper, compatibility contract, and concise documen
 
 More operational guidance is in [`START_HERE.md`](START_HERE.md) and [`MAINTENANCE.md`](MAINTENANCE.md).
 The ownership and state model is summarized in [`docs/architecture.md`](docs/architecture.md).
+The optional cross-stack workflow correlation contract is summarized in [`docs/correlation.md`](docs/correlation.md).
 
 There is currently no explicit root `LICENSE` file; licensing must be resolved before a public release.

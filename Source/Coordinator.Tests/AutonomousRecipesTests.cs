@@ -44,6 +44,12 @@ internal static partial class OfflineTests
                unknownShow.ErrorCode == "TEST_RECIPE_NOT_FOUND",
             "unknown recipes must return a stable compact error");
 
+        RecipeResponse correlated = ExecuteRecipe(fixture, "run", "quicktest-smoke",
+            "--workflow-id", "rw-offline-correlation", "--max-rimworld-launches", "0");
+        Assert(correlated is RecipeRunResponse correlatedRun &&
+               correlatedRun.WorkflowId == "rw-offline-correlation",
+            "recipe runs must preserve the optional workflow correlation id");
+
         WriteRecipe(fixture, "quicktest-smoke", SmokeRecipe.Replace(
             "\"schemaVersion\": \"devbridge-test-recipe/v1\"",
             "\"schemaVersion\": \"devbridge-test-recipe/v9\"", StringComparison.Ordinal));

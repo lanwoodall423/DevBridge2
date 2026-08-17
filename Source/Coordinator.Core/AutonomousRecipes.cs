@@ -156,8 +156,11 @@ internal sealed class RecipeCatalog
                 return false;
             }
             using JsonDocument document = JsonDocument.Parse(File.ReadAllText(path),
-                new JsonDocumentOptions { CommentHandling = JsonCommentHandling.Disallow,
-                    MaxDepth = 16 });
+                new JsonDocumentOptions
+                {
+                    CommentHandling = JsonCommentHandling.Disallow,
+                    MaxDepth = 16
+                });
             return TryParse(document.RootElement, out recipe, out errorCode, out error);
         }
         catch (JsonException)
@@ -382,7 +385,7 @@ internal sealed class RecipeCatalog
             }
             if (budgetElement.TryGetProperty("timeoutSeconds", out timeoutElement))
             {
-                if (root.TryGetProperty("timeoutSeconds", out _ ) ||
+                if (root.TryGetProperty("timeoutSeconds", out _) ||
                     !TryBoundedInt(timeoutElement, 1, 900, out int budgetTimeout))
                     return Failure("TEST_RECIPE_BUDGET_INVALID", "timeoutSeconds may be declared only once.",
                         out errorCode, out error);
@@ -636,8 +639,8 @@ internal sealed class RecipeListResponse : RecipeResponse
 {
     [JsonPropertyName("schemaVersion")] public string SchemaVersion { get; init; } = DevBridgeSchemaVersions.TestRecipeList;
     [JsonPropertyName("recipes")] public List<RecipeListItem> Recipes { get; init; } = new();
-    [JsonPropertyName("errorCode")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string ErrorCode { get; init; }
-    [JsonPropertyName("error")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string Error { get; init; }
+    [JsonPropertyName("errorCode")][JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string ErrorCode { get; init; }
+    [JsonPropertyName("error")][JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string Error { get; init; }
 }
 
 internal sealed class RecipeListItem
@@ -649,9 +652,9 @@ internal sealed class RecipeListItem
 internal sealed class RecipeShowResponse : RecipeResponse
 {
     [JsonPropertyName("schemaVersion")] public string SchemaVersion { get; init; } = DevBridgeSchemaVersions.TestRecipeShow;
-    [JsonPropertyName("recipe")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public RecipeInfo Recipe { get; init; }
-    [JsonPropertyName("errorCode")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string ErrorCode { get; init; }
-    [JsonPropertyName("error")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string Error { get; init; }
+    [JsonPropertyName("recipe")][JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public RecipeInfo Recipe { get; init; }
+    [JsonPropertyName("errorCode")][JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string ErrorCode { get; init; }
+    [JsonPropertyName("error")][JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string Error { get; init; }
 }
 
 internal sealed class RecipeInfo
@@ -662,7 +665,8 @@ internal sealed class RecipeInfo
     [JsonPropertyName("projects")] public List<string> Projects { get; init; } = new();
     [JsonPropertyName("inputs")] public Dictionary<string, string> Inputs { get; init; } = new(StringComparer.Ordinal);
     [JsonPropertyName("requiresReady")] public bool RequiresReady { get; init; }
-    [JsonPropertyName("allowInGameMutation")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    [JsonPropertyName("allowInGameMutation")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public bool? AllowsInGameMutation { get; init; }
     [JsonPropertyName("timeoutSeconds")] public int TimeoutSeconds { get; init; }
     [JsonPropertyName("success")] public RecipeSuccessInfo Success { get; init; }
@@ -681,7 +685,8 @@ internal sealed class RecipeOperationInfo
 {
     [JsonPropertyName("tool")] public string Tool { get; init; }
     [JsonPropertyName("arguments")] public JsonElement Arguments { get; init; }
-    [JsonPropertyName("expect")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    [JsonPropertyName("expect")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public RecipeOperationExpectationInfo Expectation { get; init; }
 }
 
@@ -694,13 +699,17 @@ internal sealed class RecipeOperationExpectationInfo
 internal sealed class RecipeAssertionInfo
 {
     [JsonPropertyName("pointer")] public string Pointer { get; init; }
-    [JsonPropertyName("exists")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    [JsonPropertyName("exists")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public bool? Exists { get; init; }
-    [JsonPropertyName("equals")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    [JsonPropertyName("equals")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public JsonElement? ExpectedValue { get; init; }
-    [JsonPropertyName("greaterThan")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    [JsonPropertyName("greaterThan")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public double? GreaterThan { get; init; }
-    [JsonPropertyName("lessThan")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    [JsonPropertyName("lessThan")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public double? LessThan { get; init; }
 }
 
@@ -717,9 +726,9 @@ internal sealed class RecipeBudgetInfo
 internal sealed class RecipePlanStep
 {
     [JsonPropertyName("action")] public string Action { get; init; }
-    [JsonPropertyName("reasonCode")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string ReasonCode { get; init; }
-    [JsonPropertyName("condition")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string Condition { get; init; }
-    [JsonPropertyName("recipe")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string Recipe { get; init; }
+    [JsonPropertyName("reasonCode")][JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string ReasonCode { get; init; }
+    [JsonPropertyName("condition")][JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string Condition { get; init; }
+    [JsonPropertyName("recipe")][JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string Recipe { get; init; }
 }
 
 internal sealed class RecipePlanData
@@ -745,8 +754,8 @@ internal sealed class RecipePlanResponse : RecipeResponse
     [JsonPropertyName("steps")] public List<RecipePlanStep> Steps { get; init; } = new();
     [JsonPropertyName("nextAction")] public string NextAction { get; init; }
     [JsonPropertyName("blockedBy")] public List<string> BlockedBy { get; init; } = new();
-    [JsonPropertyName("errorCode")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string ErrorCode { get; init; }
-    [JsonPropertyName("error")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string Error { get; init; }
+    [JsonPropertyName("errorCode")][JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string ErrorCode { get; init; }
+    [JsonPropertyName("error")][JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string Error { get; init; }
 
     internal static RecipePlanResponse From(RecipePlanData plan, int exitCode = 0) => new()
     {
@@ -771,8 +780,8 @@ internal sealed class AgentRecipePlanResponse : AgentResponse
     [JsonPropertyName("steps")] public List<RecipePlanStep> Steps { get; init; } = new();
     [JsonPropertyName("nextAction")] public string NextAction { get; init; }
     [JsonPropertyName("blockedBy")] public List<string> BlockedBy { get; init; } = new();
-    [JsonPropertyName("errorCode")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string ErrorCode { get; init; }
-    [JsonPropertyName("error")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string Error { get; init; }
+    [JsonPropertyName("errorCode")][JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string ErrorCode { get; init; }
+    [JsonPropertyName("error")][JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string Error { get; init; }
 
     internal static AgentRecipePlanResponse From(RecipePlanData plan, int exitCode = 0) => new()
     {
@@ -804,14 +813,28 @@ internal sealed class RecipeBudgetResult
 internal sealed class RecipeOperationResult
 {
     [JsonPropertyName("tool")] public string Tool { get; init; }
+    [JsonPropertyName("operationId")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string OperationId { get; init; }
+    [JsonPropertyName("workflowId")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string WorkflowId { get; init; }
+    [JsonPropertyName("generation")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? Generation { get; init; }
+    [JsonPropertyName("launchId")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string LaunchId { get; init; }
     [JsonPropertyName("success")] public bool Success { get; init; }
-    [JsonPropertyName("expectedSuccess")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    [JsonPropertyName("expectedSuccess")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public bool? ExpectedSuccess { get; init; }
-    [JsonPropertyName("errorCode")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string ErrorCode { get; init; }
-    [JsonPropertyName("error")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string Error { get; init; }
-    [JsonPropertyName("evidence")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string Evidence { get; init; }
-    [JsonPropertyName("result")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public JsonElement? Result { get; init; }
-    [JsonPropertyName("assertions")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    [JsonPropertyName("errorCode")][JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string ErrorCode { get; init; }
+    [JsonPropertyName("error")][JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string Error { get; init; }
+    [JsonPropertyName("evidence")][JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string Evidence { get; init; }
+    [JsonPropertyName("result")][JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public JsonElement? Result { get; init; }
+    [JsonPropertyName("assertions")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public List<RecipeAssertionResult> Assertions { get; init; }
 }
 
@@ -819,7 +842,8 @@ internal sealed class RecipeAssertionResult
 {
     [JsonPropertyName("pointer")] public string Pointer { get; init; }
     [JsonPropertyName("success")] public bool Success { get; init; }
-    [JsonPropertyName("error")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    [JsonPropertyName("error")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string Error { get; init; }
 }
 
@@ -827,18 +851,22 @@ internal sealed class RecipeRunResponse : RecipeResponse
 {
     [JsonPropertyName("schemaVersion")] public string SchemaVersion { get; init; } = DevBridgeSchemaVersions.TestRecipeRun;
     [JsonPropertyName("recipe")] public string Recipe { get; init; }
+    [JsonPropertyName("workflowId")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string WorkflowId { get; init; }
     [JsonPropertyName("success")] public bool Success { get; init; }
     [JsonPropertyName("generation")] public int Generation { get; init; }
     [JsonPropertyName("restartRequired")] public bool RestartRequired { get; init; }
     [JsonPropertyName("launchesConsumed")] public int LaunchesConsumed { get; init; }
-    [JsonPropertyName("leaseId")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string LeaseId { get; init; }
-    [JsonPropertyName("evidence")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string Evidence { get; init; }
-    [JsonPropertyName("failureFingerprint")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string FailureFingerprint { get; init; }
+    [JsonPropertyName("leaseId")][JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string LeaseId { get; init; }
+    [JsonPropertyName("evidence")][JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string Evidence { get; init; }
+    [JsonPropertyName("evidenceId")][JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string EvidenceId { get; init; }
+    [JsonPropertyName("failureFingerprint")][JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string FailureFingerprint { get; init; }
     [JsonPropertyName("finalNextAction")] public string FinalNextAction { get; init; }
     [JsonPropertyName("budget")] public RecipeBudgetResult Budget { get; init; }
-    [JsonPropertyName("operations")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public List<RecipeOperationResult> Operations { get; init; }
-    [JsonPropertyName("errorCode")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string ErrorCode { get; init; }
-    [JsonPropertyName("error")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string Error { get; init; }
+    [JsonPropertyName("operations")][JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public List<RecipeOperationResult> Operations { get; init; }
+    [JsonPropertyName("errorCode")][JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string ErrorCode { get; init; }
+    [JsonPropertyName("error")][JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string Error { get; init; }
 }
 
 internal sealed partial class CoordinatorState
@@ -913,8 +941,12 @@ internal sealed partial class CoordinatorState
         }
         if (!catalog.TryGet(arguments[2].Trim(), out TestRecipeDefinition recipe))
         {
-            request.RecipeResponse = new RecipeShowResponse { ErrorCode = "TEST_RECIPE_NOT_FOUND",
-                Error = "The requested recipe is not present in the repository-owned catalog.", ExitCode = 4 };
+            request.RecipeResponse = new RecipeShowResponse
+            {
+                ErrorCode = "TEST_RECIPE_NOT_FOUND",
+                Error = "The requested recipe is not present in the repository-owned catalog.",
+                ExitCode = 4
+            };
             return 4;
         }
         request.RecipeResponse = new RecipeShowResponse { Recipe = RecipeInfoFor(recipe) };
@@ -1050,15 +1082,17 @@ internal sealed partial class CoordinatorState
                 out string parseCode, out string parseError))
         {
             request.RecipeResponse = RecipeRunFailure(id, parseCode, parseError, null, 0, 0,
-                "inspect-evidence", callerBudget: null);
+                "inspect-evidence", callerBudget: null, workflowId: request.WorkflowId);
             return 2;
         }
+
+        request.WorkflowId = callerBudget.WorkflowId;
 
         RecipePlanData plan = BuildRecipePlan(id, request);
         if (plan.ErrorCode != null)
         {
             request.RecipeResponse = RecipeRunFailure(id, plan.ErrorCode, plan.Error, null, 0, 0,
-                "inspect-evidence", null);
+                "inspect-evidence", null, request.WorkflowId);
             return 4;
         }
         RecipeCatalog.TryLoad(root, out RecipeCatalog catalog, out _, out _);
@@ -1084,7 +1118,11 @@ internal sealed partial class CoordinatorState
             }
             if (repeated != null)
             {
-                request.RecipeResponse = RecipeRepeatedFailure(id, repeated, budgetResult);
+                request.RecipeResponse = RecipeRepeatedFailure(
+                    id,
+                    repeated,
+                    budgetResult,
+                    request.WorkflowId);
                 return 4;
             }
         }
@@ -1282,15 +1320,23 @@ internal sealed partial class CoordinatorState
         string failureFingerprint = success ? null : RecordRecipeFailure(id, failure,
             "The recipe did not produce all expected structured evidence.", generation,
             plan?.ProfileFingerprint, plan?.TestInputs);
+        string evidenceId = null;
+        if (!success)
+        {
+            lock (gate)
+                evidenceId = state.LatestFailureEvidenceId;
+        }
         return new RecipeRunResponse
         {
             Recipe = id,
+            WorkflowId = request.WorkflowId,
             Success = success,
             Generation = generation,
             RestartRequired = restartRequired,
             LaunchesConsumed = launchesConsumed,
             LeaseId = leaseId,
             Evidence = success ? "Runtime/readiness.json" : null,
+            EvidenceId = evidenceId,
             FailureFingerprint = success ? null : failureFingerprint ?? failure,
             FinalNextAction = nextAction,
             Budget = WithConsumed(budget, launchesConsumed, 0),
@@ -1310,15 +1356,23 @@ internal sealed partial class CoordinatorState
                 StringComparison.Ordinal))
             failureFingerprint = RecordRecipeFailure(id, code, error, generation,
                 plan.ProfileFingerprint, plan.TestInputs);
+        string evidenceId = null;
+        if (failureFingerprint != null)
+        {
+            lock (gate)
+                evidenceId = state.LatestFailureEvidenceId;
+        }
         request.RecipeResponse = new RecipeRunResponse
         {
             ExitCode = 4,
             Recipe = id,
+            WorkflowId = request.WorkflowId,
             Success = false,
             Generation = generation,
             RestartRequired = restartRequired,
             LaunchesConsumed = launchesConsumed,
             LeaseId = leaseId,
+            EvidenceId = evidenceId,
             FailureFingerprint = failureFingerprint ?? code,
             FinalNextAction = nextAction,
             Budget = budget,
@@ -1331,12 +1385,13 @@ internal sealed partial class CoordinatorState
 
     private static RecipeRunResponse RecipeRunFailure(string id, string code, string error,
         string leaseId, int generation, int launchesConsumed, string nextAction,
-        RecipeBudgetResult callerBudget)
+        RecipeBudgetResult callerBudget, string workflowId = null)
     {
         return new RecipeRunResponse
         {
             ExitCode = 4,
             Recipe = id,
+            WorkflowId = workflowId,
             Success = false,
             Generation = generation,
             LaunchesConsumed = launchesConsumed,
@@ -1350,16 +1405,19 @@ internal sealed partial class CoordinatorState
     }
 
     private static RecipeRunResponse RecipeRepeatedFailure(string id,
-        FailureOccurrenceSummary occurrence, RecipeBudgetResult budget)
+        FailureOccurrenceSummary occurrence, RecipeBudgetResult budget,
+        string workflowId = null)
     {
         return new RecipeRunResponse
         {
             ExitCode = 4,
             Recipe = id,
+            WorkflowId = workflowId,
             Success = false,
             Generation = occurrence?.LastSeenGeneration ?? 0,
             FailureFingerprint = occurrence?.FailureFingerprint,
             Evidence = occurrence?.EvidenceId,
+            EvidenceId = occurrence?.EvidenceId,
             FinalNextAction = "inspect-evidence",
             Budget = budget,
             ErrorCode = "AUTONOMOUS_REPEATED_FAILURE",
@@ -1438,6 +1496,10 @@ internal sealed partial class CoordinatorState
         return new RecipeOperationResult
         {
             Tool = operation.ToolName,
+            OperationId = route?.OperationId,
+            WorkflowId = route?.WorkflowId,
+            Generation = route?.Generation,
+            LaunchId = route?.LaunchId,
             Success = success,
             ExpectedSuccess = isV2 ? expectation.ExpectedSuccess : null,
             ErrorCode = errorCode,
@@ -1594,6 +1656,7 @@ internal sealed partial class CoordinatorState
         Agent = request.Agent,
         ClientProcessId = request.ClientProcessId,
         Json = request.Json,
+        WorkflowId = request.WorkflowId,
         RuntimeSlotId = request.RuntimeSlotId,
         CoordinatorRoot = request.CoordinatorRoot,
         TicketId = request.TicketId,
@@ -1676,6 +1739,7 @@ internal sealed partial class CoordinatorState
 
     private sealed class RecipeCallerBudget
     {
+        internal string WorkflowId { get; init; }
         internal string SuppliedLeaseId { get; init; }
         internal int? TimeoutSeconds { get; init; }
         internal int? MaxRimWorldLaunches { get; init; }
@@ -1730,6 +1794,7 @@ internal sealed partial class CoordinatorState
             return RecipeParseFailure("TEST_RECIPE_USAGE", "recipe run requires one recipe id.",
                 out errorCode, out error);
         string suppliedLeaseId = null;
+        string workflowId = null;
         int? timeout = null, launches = null, attempts = null, refreshes = null, repeated = null;
         bool? stop = null;
         HashSet<string> seenOptions = new(StringComparer.OrdinalIgnoreCase);
@@ -1738,6 +1803,21 @@ internal sealed partial class CoordinatorState
             string option = arguments[index]?.Trim() ?? string.Empty;
             if (string.Equals(option, "--json", StringComparison.OrdinalIgnoreCase))
                 continue;
+            if (string.Equals(option, "--workflow-id", StringComparison.OrdinalIgnoreCase) ||
+                option.StartsWith("--workflow-id=", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!string.IsNullOrWhiteSpace(workflowId))
+                    return RecipeParseFailure("TEST_RECIPE_WORKFLOW_ID_INVALID",
+                        "a workflow id may be declared only once.", out errorCode, out error);
+                workflowId = option.StartsWith("--workflow-id=", StringComparison.OrdinalIgnoreCase)
+                    ? option.Substring("--workflow-id=".Length).Trim()
+                    : (++index < arguments.Count ? arguments[index]?.Trim() : null);
+                if (!IsWorkflowId(workflowId))
+                    return RecipeParseFailure("TEST_RECIPE_WORKFLOW_ID_INVALID",
+                        "--workflow-id requires a bounded non-empty identifier.",
+                        out errorCode, out error);
+                continue;
+            }
             if (string.Equals(option, "--lease", StringComparison.OrdinalIgnoreCase) ||
                 option.StartsWith("--lease=", StringComparison.OrdinalIgnoreCase))
             {
@@ -1801,6 +1881,7 @@ internal sealed partial class CoordinatorState
                 out errorCode, out error);
         budget = new RecipeCallerBudget
         {
+            WorkflowId = workflowId,
             SuppliedLeaseId = suppliedLeaseId,
             TimeoutSeconds = timeout,
             MaxRimWorldLaunches = launches,
@@ -1823,6 +1904,12 @@ internal sealed partial class CoordinatorState
         return value.Skip(6).All(character =>
             character is >= '0' and <= '9' or >= 'A' and <= 'F' or >= 'a' and <= 'f');
     }
+
+    private static bool IsWorkflowId(string value) =>
+        !string.IsNullOrWhiteSpace(value) &&
+        value.Length <= 128 &&
+        value.All(character => !char.IsWhiteSpace(character) &&
+            !char.IsControl(character));
 
     private static bool RecipeParseFailure(string code, string message, out string errorCode, out string error)
     {

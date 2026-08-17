@@ -94,10 +94,13 @@ internal static class RimBridgeProtocolContract
 
         bool hasResult = root.TryGetProperty("result", out _);
         bool hasErrorProperty = root.TryGetProperty("error", out JsonElement error);
-        if (hasErrorProperty && error.ValueKind != JsonValueKind.Object)
+        // RimBridgeServer 2.1 emits an explicit `error: null` alongside successful
+        // results. Treat that as an absent error while continuing to reject every
+        // other non-object error value.
+        bool hasError = hasErrorProperty && error.ValueKind != JsonValueKind.Null;
+        if (hasError && error.ValueKind != JsonValueKind.Object)
             throw new RimBridgeProtocolException(InvalidResponseCode,
                 "RimBridge returned a non-object error envelope.");
-        bool hasError = hasErrorProperty;
         if (hasResult == hasError)
             throw new RimBridgeProtocolException(InvalidResponseCode,
                 "RimBridge response must contain exactly one result or error.");

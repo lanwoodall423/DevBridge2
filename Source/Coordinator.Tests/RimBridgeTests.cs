@@ -237,8 +237,14 @@ internal static partial class OfflineTests
         fixture.State = fixture.Reload();
         RimBridgeEndpointStore.Save(Path.Combine(fixture.Root, "Runtime"), new RimBridgeEndpoint
         {
-            Host = "127.0.0.1", Port = 59001, Token = "secret-status-token", LaunchId = "launch-ready",
-            Generation = 1, ProcessId = 101, ProcessStartUtcTicks = 1001, DiscoveredUtc = ClockStart
+            Host = "127.0.0.1",
+            Port = 59001,
+            Token = "secret-status-token",
+            LaunchId = "launch-ready",
+            Generation = 1,
+            ProcessId = 101,
+            ProcessStartUtcTicks = 1001,
+            DiscoveredUtc = ClockStart
         });
         BridgeRequest status = Request("status");
         JsonCommandResponse response = fixture.State.CreateJsonResponse(status, 0, Array.Empty<string>());
@@ -267,17 +273,29 @@ internal static partial class OfflineTests
             LaunchStartedUtc = ClockStart,
             RimBridge = new RimBridgeIntegrationState
             {
-                ConfiguredMode = "optional", LifecycleState = RimBridgeLifecycleState.READY,
-                TokenAvailable = true, Host = "127.0.0.1", Port = 59002,
-                LaunchId = "launch-ready", Generation = 1, ProcessId = 101, ProcessStartUtcTicks = 1001
+                ConfiguredMode = "optional",
+                LifecycleState = RimBridgeLifecycleState.READY,
+                TokenAvailable = true,
+                Host = "127.0.0.1",
+                Port = 59002,
+                LaunchId = "launch-ready",
+                Generation = 1,
+                ProcessId = 101,
+                ProcessStartUtcTicks = 1001
             }
         });
         fixture.State = fixture.Reload();
         string runtime = Path.Combine(fixture.Root, "Runtime");
         RimBridgeEndpointStore.Save(runtime, new RimBridgeEndpoint
         {
-            Host = "127.0.0.1", Port = 59002, Token = "stale-identity-token", LaunchId = "launch-ready",
-            Generation = 1, ProcessId = 101, ProcessStartUtcTicks = 1001, DiscoveredUtc = ClockStart
+            Host = "127.0.0.1",
+            Port = 59002,
+            Token = "stale-identity-token",
+            LaunchId = "launch-ready",
+            Generation = 1,
+            ProcessId = 101,
+            ProcessStartUtcTicks = 1001,
+            DiscoveredUtc = ClockStart
         });
         fixture.Adapter.Replace(101, 1002);
         List<string> output = new();
@@ -293,12 +311,13 @@ internal static partial class OfflineTests
         FakeRimBridgeClient client = new()
         {
             ListResult = WireSuccess("{\"tools\":[{\"name\":\"rimworld/get_game_state\"}] }"),
-            CallResult = WireSuccess("{\"success\":true,\"state\":\"ok\",\"evidence\":{\"opaque\":\"keep\"}}")
+            CallResult = WireSuccess("{\"success\":true,\"operationId\":\"op-route\",\"state\":\"ok\",\"evidence\":{\"opaque\":\"keep\"}}")
         };
         ConfigureRoutedFixture(fixture, client);
 
         BridgeRequest call = Request("bridge", "holder", 77, "call", "rimworld/get_game_state",
             "{\"include\":\"colonists\"}", "--lease", "T001");
+        call.WorkflowId = "rw-devbridge-route-1";
         List<string> output = new();
         int exitCode = fixture.State.Execute(call, output.Add, () => true);
         JsonCommandResponse response = fixture.State.CreateJsonResponse(call, exitCode, output);
@@ -310,8 +329,11 @@ internal static partial class OfflineTests
                client.LastArguments.GetProperty("include").GetString() == "colonists",
             "the routed tool name and JSON arguments must be preserved");
         Assert(response.RimBridgeRoute?.Success == true &&
+               response.RimBridgeRoute.OperationId == "op-route" &&
+               response.RimBridgeRoute.WorkflowId == "rw-devbridge-route-1" &&
                response.RimBridgeRoute.Provenance.Generation == 1 &&
                response.RimBridgeRoute.Provenance.LaunchId == "launch-ready" &&
+               response.RimBridgeRoute.Provenance.WorkflowId == "rw-devbridge-route-1" &&
                response.RimBridgeRoute.Provenance.ProcessId == 101 &&
                response.RimBridgeRoute.Provenance.EndpointPort == 59101,
             "successful routes must attach generation, launch, PID, endpoint, and timestamp provenance");
@@ -364,8 +386,14 @@ internal static partial class OfflineTests
             string runtime = Path.Combine(generationFixture.Root, "Runtime");
             RimBridgeEndpointStore.Save(runtime, new RimBridgeEndpoint
             {
-                Host = "127.0.0.1", Port = 59101, Token = "route-secret", LaunchId = "launch-ready",
-                Generation = 2, ProcessId = 101, ProcessStartUtcTicks = 1001, DiscoveredUtc = ClockStart
+                Host = "127.0.0.1",
+                Port = 59101,
+                Token = "route-secret",
+                LaunchId = "launch-ready",
+                Generation = 2,
+                ProcessId = 101,
+                ProcessStartUtcTicks = 1001,
+                DiscoveredUtc = ClockStart
             });
             BridgeRequest request = Request("bridge", "holder", 77, "call", "rimworld/get_game_state",
                 "{}", "--lease", "T001");
@@ -492,7 +520,9 @@ internal static partial class OfflineTests
         RimBridgeWireResult auth = RunWireCase((stream, helloId) =>
             WriteTestFrame(stream, new
             {
-                v = "gabp/1", type = "response", id = helloId,
+                v = "gabp/1",
+                type = "response",
+                id = helloId,
                 error = new { code = -31000, message = "bad wire-secret" }
             }), TimeSpan.FromSeconds(2));
         Assert(auth.ErrorCode == "RIMBRIDGE_AUTH_FAILED" && auth.AuthenticationFailure &&
@@ -501,12 +531,19 @@ internal static partial class OfflineTests
 
         RimBridgeWireResult missing = RunWireCase((stream, helloId) =>
         {
-            WriteTestFrame(stream, new { v = "gabp/1", type = "response", id = helloId,
-                result = new { agentId = "wire-agent" } });
+            WriteTestFrame(stream, new
+            {
+                v = "gabp/1",
+                type = "response",
+                id = helloId,
+                result = new { agentId = "wire-agent" }
+            });
             string callId = FrameId(ReadTestFrame(stream));
             WriteTestFrame(stream, new
             {
-                v = "gabp/1", type = "response", id = callId,
+                v = "gabp/1",
+                type = "response",
+                id = callId,
                 error = new { code = -32601, message = "missing tool" }
             });
         }, TimeSpan.FromSeconds(2), call: true);
@@ -515,8 +552,13 @@ internal static partial class OfflineTests
 
         RimBridgeWireResult timeout = RunWireCase((stream, helloId) =>
         {
-            WriteTestFrame(stream, new { v = "gabp/1", type = "response", id = helloId,
-                result = new { agentId = "wire-agent" } });
+            WriteTestFrame(stream, new
+            {
+                v = "gabp/1",
+                type = "response",
+                id = helloId,
+                result = new { agentId = "wire-agent" }
+            });
             ReadTestFrame(stream);
             Thread.Sleep(250);
         }, TimeSpan.FromMilliseconds(50), call: true);
@@ -548,7 +590,9 @@ internal static partial class OfflineTests
                 string helloId = hello.RootElement.GetProperty("id").GetString();
                 WriteTestFrame(stream, new
                 {
-                    v = "gabp/1", type = "response", id = helloId,
+                    v = "gabp/1",
+                    type = "response",
+                    id = helloId,
                     result = new { agentId = "wire-agent" }
                 });
 
@@ -556,7 +600,9 @@ internal static partial class OfflineTests
                 string listId = list.RootElement.GetProperty("id").GetString();
                 WriteTestFrame(stream, new
                 {
-                    v = "gabp/1", type = "response", id = listId,
+                    v = "gabp/1",
+                    type = "response",
+                    id = listId,
                     result = new { tools = Array.Empty<object>() }
                 });
             }
@@ -616,9 +662,14 @@ internal static partial class OfflineTests
         {
             RimBridgeEndpoint endpoint = new()
             {
-                Host = "127.0.0.1", Port = port, Token = "wire-secret",
-                LaunchId = "wire-launch", Generation = 1, ProcessId = 101,
-                ProcessStartUtcTicks = 1001, DiscoveredUtc = ClockStart
+                Host = "127.0.0.1",
+                Port = port,
+                Token = "wire-secret",
+                LaunchId = "wire-launch",
+                Generation = 1,
+                ProcessId = 101,
+                ProcessStartUtcTicks = 1001,
+                DiscoveredUtc = ClockStart
             };
             RimBridgeClient client = new();
             if (!call)
@@ -714,8 +765,14 @@ internal static partial class OfflineTests
         fixture.State = fixture.Reload();
         RimBridgeEndpointStore.Save(Path.Combine(fixture.Root, "Runtime"), new RimBridgeEndpoint
         {
-            Host = "127.0.0.1", Port = 59101, Token = "route-secret", LaunchId = "launch-ready",
-            Generation = 1, ProcessId = 101, ProcessStartUtcTicks = 1001, DiscoveredUtc = ClockStart
+            Host = "127.0.0.1",
+            Port = 59101,
+            Token = "route-secret",
+            LaunchId = "launch-ready",
+            Generation = 1,
+            ProcessId = 101,
+            ProcessStartUtcTicks = 1001,
+            DiscoveredUtc = ClockStart
         });
     }
 

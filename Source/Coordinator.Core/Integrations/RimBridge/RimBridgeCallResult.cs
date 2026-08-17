@@ -18,6 +18,8 @@ internal sealed class RimBridgeRouteResult
 {
     internal string Operation { get; init; }
     internal string ToolName { get; init; }
+    internal string OperationId { get; init; }
+    internal string WorkflowId { get; init; }
     internal bool Success { get; init; }
     internal string ErrorCode { get; init; }
     internal string Error { get; init; }
@@ -35,6 +37,8 @@ internal sealed class RimBridgeRouteResult
     {
         Operation = Operation,
         ToolName = ToolName,
+        OperationId = OperationId,
+        WorkflowId = WorkflowId,
         Success = Success,
         ErrorCode = ErrorCode,
         Error = Error,
@@ -42,6 +46,7 @@ internal sealed class RimBridgeRouteResult
         OpaqueEvidence = OpaqueEvidence,
         Provenance = new JsonRimBridgeProvenance
         {
+            WorkflowId = WorkflowId,
             Generation = Generation,
             LaunchId = LaunchId,
             ProfileFingerprint = ProfileFingerprint,
@@ -61,6 +66,14 @@ internal sealed class JsonRimBridgeRoute
 
     [JsonPropertyName("toolName")]
     public string ToolName { get; set; }
+
+    [JsonPropertyName("operationId")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string OperationId { get; set; }
+
+    [JsonPropertyName("workflowId")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string WorkflowId { get; set; }
 
     [JsonPropertyName("success")]
     public bool Success { get; set; }
@@ -83,6 +96,10 @@ internal sealed class JsonRimBridgeRoute
 
 internal sealed class JsonRimBridgeProvenance
 {
+    [JsonPropertyName("workflowId")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string WorkflowId { get; set; }
+
     [JsonPropertyName("generation")]
     public int Generation { get; set; }
 
@@ -118,6 +135,8 @@ internal sealed class RimBridgeRouteRequest
 internal sealed class RimBridgeRouteContext
 {
     internal RimBridgeEndpoint Endpoint { get; init; }
+    internal string OperationId { get; init; }
+    internal string WorkflowId { get; init; }
     internal string LaunchId { get; init; }
     internal int Generation { get; init; }
     internal int ProcessId { get; init; }

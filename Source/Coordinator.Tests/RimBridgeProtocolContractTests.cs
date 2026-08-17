@@ -92,6 +92,13 @@ internal static partial class OfflineTests
         Assert(response.Result.HasValue && response.Result.Value.GetProperty("ok").GetBoolean(),
             "typed response envelope must retain a successful result");
 
+        using JsonDocument nullableErrorResponseJson = JsonDocument.Parse(
+            "{\"v\":\"gabp/1\",\"type\":\"response\",\"id\":\"call-fixture\",\"result\":{\"ok\":true},\"error\":null}");
+        GabpResponseEnvelope nullableErrorResponse = RimBridgeProtocolContract.ParseResponse(
+            nullableErrorResponseJson.RootElement, "call-fixture");
+        Assert(nullableErrorResponse.Result.HasValue && nullableErrorResponse.Error == null,
+            "a successful response with a nullable error field must remain valid");
+
         try
         {
             using JsonDocument invalid = JsonDocument.Parse(

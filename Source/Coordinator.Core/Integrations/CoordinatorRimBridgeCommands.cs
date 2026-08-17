@@ -153,6 +153,7 @@ internal sealed partial class CoordinatorState
         RimBridgeRouteContext identity = new()
         {
             Endpoint = endpoint,
+            WorkflowId = request?.WorkflowId,
             LaunchId = state.LaunchId,
             Generation = state.Generation,
             ProcessId = state.ProcessId,
@@ -165,6 +166,7 @@ internal sealed partial class CoordinatorState
         {
             Operation = toolName == "tools/list" ? "tools" : "call",
             ToolName = toolName == "tools/list" ? null : toolName,
+            WorkflowId = request?.WorkflowId,
             Success = false,
             ErrorCode = code,
             Error = error,
@@ -268,6 +270,7 @@ internal sealed partial class CoordinatorState
                 Context = new RimBridgeRouteContext
                 {
                     Endpoint = endpoint,
+                    WorkflowId = request?.WorkflowId,
                     LaunchId = state.LaunchId,
                     Generation = state.Generation,
                     ProcessId = state.ProcessId,
@@ -286,10 +289,11 @@ internal sealed partial class CoordinatorState
             Context = new RimBridgeRouteContext
             {
                 Endpoint = endpoint,
+                WorkflowId = request?.WorkflowId,
                 LaunchId = state.LaunchId,
                 Generation = state.Generation,
                 ProcessId = state.ProcessId,
-                    ProfileFingerprint = state.LaunchProfileFingerprint ?? state.ProfileFingerprint,
+                ProfileFingerprint = state.LaunchProfileFingerprint ?? state.ProfileFingerprint,
                 LeaseId = leaseId,
                 Category = decision.Category
             }
@@ -324,6 +328,7 @@ internal sealed partial class CoordinatorState
                 Context = new RimBridgeRouteContext
                 {
                     Endpoint = endpoint,
+                    WorkflowId = request?.WorkflowId,
                     LaunchId = state.LaunchId,
                     Generation = state.Generation,
                     ProcessId = state.ProcessId,
@@ -332,7 +337,8 @@ internal sealed partial class CoordinatorState
                     Category = RimBridgeOperationPolicy.CategoryFor(toolName)
                 },
                 Failure = CreateRimBridgeRouteFailureLocked(toolName, leaseId,
-                    "RIMBRIDGE_PROCESS_INSPECTION_AMBIGUOUS", exception.Message, endpoint)
+                    "RIMBRIDGE_PROCESS_INSPECTION_AMBIGUOUS", exception.Message, endpoint,
+                    request?.WorkflowId)
             };
             return true;
         }
@@ -349,6 +355,7 @@ internal sealed partial class CoordinatorState
             Context = new RimBridgeRouteContext
             {
                 Endpoint = endpoint,
+                WorkflowId = request?.WorkflowId,
                 LaunchId = state.LaunchId,
                 Generation = state.Generation,
                 ProcessId = state.ProcessId,
@@ -357,18 +364,21 @@ internal sealed partial class CoordinatorState
                 Category = RimBridgeOperationPolicy.CategoryFor(toolName)
             },
             Failure = CreateRimBridgeRouteFailureLocked(toolName, leaseId,
-                "RIMBRIDGE_PROCESS_IDENTITY_MISMATCH", error, endpoint)
+                "RIMBRIDGE_PROCESS_IDENTITY_MISMATCH", error, endpoint,
+                request?.WorkflowId)
         };
         return true;
     }
 
     private RimBridgeRouteResult CreateRimBridgeRouteFailureLocked(string toolName,
-        string leaseId, string code, string error, RimBridgeEndpoint endpoint)
+        string leaseId, string code, string error, RimBridgeEndpoint endpoint,
+        string workflowId)
     {
         return new RimBridgeRouteResult
         {
             Operation = toolName == "tools/list" ? "tools" : "call",
             ToolName = toolName == "tools/list" ? null : toolName,
+            WorkflowId = workflowId,
             Success = false,
             ErrorCode = code,
             Error = error,
@@ -523,6 +533,8 @@ internal sealed partial class CoordinatorState
         {
             Operation = operation,
             ToolName = toolName,
+            OperationId = ExtractOperationId(wire?.RawResponse, wire?.Payload),
+            WorkflowId = context?.WorkflowId,
             Success = success,
             ErrorCode = errorCode,
             Error = error,
@@ -536,6 +548,27 @@ internal sealed partial class CoordinatorState
             Payload = payload,
             OpaqueEvidence = opaqueEvidence
         };
+    }
+
+    private static string ExtractOperationId(JsonElement? rawResponse, JsonElement? payload)
+    {
+        foreach (JsonElement? candidate in new[] { payload, rawResponse })
+        {
+            if (candidate is not { ValueKind: JsonValueKind.Object } value)
+                continue;
+            if (value.TryGetProperty("operationId", out JsonElement operationId) &&
+                operationId.ValueKind == JsonValueKind.String &&
+                !string.IsNullOrWhiteSpace(operationId.GetString()))
+                return operationId.GetString();
+            if (value.TryGetProperty("metadata", out JsonElement metadata) &&
+                metadata.ValueKind == JsonValueKind.Object &&
+                metadata.TryGetProperty("operationId", out operationId) &&
+                operationId.ValueKind == JsonValueKind.String &&
+                !string.IsNullOrWhiteSpace(operationId.GetString()))
+                return operationId.GetString();
+        }
+
+        return null;
     }
 
     private static JsonElement? ExtractOpaqueEvidence(JsonElement? rawResponse,

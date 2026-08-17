@@ -66,9 +66,11 @@ see `MAINTENANCE.md`.
   process if it subsequently reports matching readiness.
 - Use `DevBridge.cmd status` to understand what is happening.
 - Use `DevBridge.cmd wait-ready` after an external command timeout or interruption.
-- If `status` reports `PROCESS_INSPECTION_AMBIGUOUS`, close RimWorld through Steam and run
-  `DevBridge.cmd doctor`. A complete census proving zero matching processes clears the stale quarantine
-  to `STOPPED` without launching anything; then run the separately printed `DevBridge.cmd restart`.
+- If `status` reports `PROCESS_INSPECTION_AMBIGUOUS`, stop issuing lifecycle commands and have the
+  operator resolve the external process state through Steam; agents must not kill or restart RimWorld
+  themselves. After the operator confirms the instance is closed, run `DevBridge.cmd doctor`. A complete
+  census proving zero matching processes clears the stale quarantine to `STOPPED` without launching
+  anything; then run the separately printed `DevBridge.cmd restart` through DevBridge.
 - While crash isolation is active, poll `DevBridge.cmd status` (or `status --json`) only. Do not retry
   restart, edit ModsConfig.xml, or register, renew, or release project intent until isolation is terminal.
 - Diagnostics show the agent/session identity beside leases. Set `DEVBRIDGE_AGENT` to choose an explicit identity; otherwise each CLI session gets a short automatic ID.

@@ -331,22 +331,34 @@ internal static partial class OfflineTests
         using Fixture fixture = Fixture.ReadyWithoutLease();
         fixture.Adapter.ReadyOnLaunch = true;
 
-        BridgeRequest establish = Request("status");
+        BridgeRequest establish = Request("restart");
         int establishExit = fixture.State.Execute(establish, _ => { }, () => true);
-        Assert(establishExit == 0,
-            "the live process ownership proof must be established before the transient module boundary");
+        JsonCommandResponse establishResponse = fixture.State.CreateJsonResponse(
+            establish, establishExit, Array.Empty<string>());
+        Assert(establishExit == 0 && establishResponse.State == "READY" &&
+               establishResponse.Generation == 2 && fixture.Adapter.LaunchCalls == 1,
+            "the setup generation must reach READY through the normal launch path");
 
         FakeProcess owned = fixture.Adapter.Current;
+        PersistedState durable = JsonSerializer.Deserialize<PersistedState>(
+            File.ReadAllText(Path.Combine(fixture.Root, "Runtime", "state.json")), Program.JsonOptions);
+        Assert(durable != null && durable.Phase == BridgePhase.READY && durable.Generation == 2 &&
+               durable.ProcessId == owned.Id && durable.ProcessStartUtcTicks == owned.StartIdentity &&
+               string.Equals(durable.OwnedProcessExecutablePath, fixture.RimWorldPath,
+                   StringComparison.OrdinalIgnoreCase),
+            "READY must durably save the exact process identity and executable proof");
+
+        fixture.State = fixture.Reload();
         owned.ThrowOnExecutablePath = true;
 
         BridgeRequest restart = Request("restart");
         int exitCode = fixture.State.Execute(restart, _ => { }, () => true);
         JsonCommandResponse response = fixture.State.CreateJsonResponse(restart, exitCode, Array.Empty<string>());
 
-        Assert(exitCode == 0 && response.State == "READY" && response.Generation == 2 &&
-               response.ErrorCode == null && fixture.Adapter.LaunchCalls == 1,
-            "a verified live owned process must survive a non-essential MainModule reinspection failure");
-        Assert(fixture.Adapter.TerminationRequests == 1 && owned.HasExited,
+        Assert(exitCode == 0 && response.State == "READY" && response.Generation == 3 &&
+               response.ErrorCode == null && fixture.Adapter.LaunchCalls == 2,
+            "a rehydrated verified live owned process must survive a non-essential MainModule reinspection failure");
+        Assert(fixture.Adapter.TerminationRequests == 2 && owned.HasExited,
             "restart must request termination of the exact previously verified process");
         Assert(fixture.Adapter.EnumerationCalls > 0,
             "replacement launch must follow an authoritative absence census");

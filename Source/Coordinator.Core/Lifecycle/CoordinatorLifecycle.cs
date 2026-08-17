@@ -148,53 +148,72 @@ internal sealed partial class CoordinatorState
             return (true, null, null);
 
         IManagedProcess process = null;
+        bool terminationRequested = false;
         try
         {
-            process = processAdapter.Open(processId);
-            if (process == null)
-                return (true, null, null);
-            bool alreadyExited = process.HasExited;
-            // An exact, already-exited instance is safely drained. This is
-            // important after PROCESS_EXITED: requiring a running process here
-            // would turn an observed crash into an identity ambiguity.
-            if (!IsExactProcessIdentity(process, startTicks))
-                return (false, "PROCESS_IDENTITY_CHANGED", "the persisted RimWorld process identity no longer matches");
-
-            if (alreadyExited)
-            {
-                TraceEvent("process.termination.confirmed", detail: "already-exited", success: true);
-                return (true, null, null);
-            }
-
-            if (!process.HasExited)
+            DateTime inspectionDeadline = clock.UtcNow.Add(options.ProcessInspectionRetryTimeout);
+            while (true)
             {
                 try
                 {
+                    process = processAdapter.Open(processId);
+                    if (process == null)
+                        return (true, null, null);
+
+                    bool alreadyExited = process.HasExited;
+                    // An exited process can no longer expose MainModule.FileName
+                    // even though its start identity remains queryable. The
+                    // persisted PID/start pair is the exact owner proof for
+                    // this already-exited coordinator launch; the next launch
+                    // still performs a complete zero-process census.
+                    if (alreadyExited)
+                    {
+                        if (!IsExactExitedProcessIdentity(process, startTicks))
+                            return (false, "PROCESS_IDENTITY_CHANGED",
+                                "the persisted RimWorld process identity no longer matches");
+
+                        TraceEvent("process.termination.confirmed", detail: "already-exited", success: true);
+                        return (true, null, null);
+                    }
+
+                    // Prove the live process identity before requesting
+                    // termination. If it crosses into exit while this proof is
+                    // being read, the bounded observation below can re-open it
+                    // and validate the exited start identity safely.
+                    if (!IsExactProcessIdentity(process, startTicks))
+                        return (false, "PROCESS_IDENTITY_CHANGED",
+                            "the persisted RimWorld process identity no longer matches");
+
                     bool requested = process.RequestTermination();
+                    terminationRequested = true;
                     TraceEvent("process.termination.requested", success: requested,
                         errorCode: requested ? null : "TERMINATION_REQUEST_REJECTED");
-                    process.WaitForExit(options.ProcessExitTimeout);
+                    bool exited = process.WaitForExit(options.ProcessExitTimeout);
+                    if (!exited)
+                    {
+                        TraceEvent("process.termination.force_requested");
+                        if (!process.ForceTerminate())
+                            return (false, "STOP_FAILED", "process exit was not confirmed");
+                    }
+
+                    InjectFaultForTesting(CoordinatorFaultPoint.AfterProcessActionBeforeResultingStatePersistence);
+                    TraceEvent("process.termination.confirmed", success: true);
+                    return (true, null, null);
                 }
                 catch (ProcessInspectionException)
                 {
-                    return (false, ProcessInspection.ErrorCode, ProcessInspection.Message);
-                }
-                catch
-                {
-                    // Fall through to the bounded kill below.
-                }
+                    // Only the pre-termination identity observation may be
+                    // retried. Once termination was requested, uncertainty is
+                    // terminal and remains fail-closed.
+                    if (terminationRequested || clock.UtcNow >= inspectionDeadline)
+                        return (false, ProcessInspection.ErrorCode, ProcessInspection.Message);
 
-                if (!process.HasExited)
-                {
-                    TraceEvent("process.termination.force_requested");
-                    if (!process.ForceTerminate() || !process.HasExited)
-                        return (false, "STOP_FAILED", "process exit was not confirmed");
+                    process?.Dispose();
+                    process = null;
+                    TimeSpan remaining = inspectionDeadline - clock.UtcNow;
+                    clock.Sleep(remaining < TimeSpan.FromSeconds(1) ? remaining : TimeSpan.FromSeconds(1));
                 }
             }
-
-            InjectFaultForTesting(CoordinatorFaultPoint.AfterProcessActionBeforeResultingStatePersistence);
-            TraceEvent("process.termination.confirmed", success: true);
-            return (true, null, null);
         }
         catch (ProcessInspectionException)
         {

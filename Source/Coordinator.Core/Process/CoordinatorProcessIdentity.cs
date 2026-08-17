@@ -74,10 +74,29 @@ internal sealed partial class CoordinatorState
         if (processId <= 0)
             return false;
 
+        DateTime inspectionDeadline = clock.UtcNow.Add(options.ProcessInspectionRetryTimeout);
         try
         {
-            using IManagedProcess process = processAdapter.Open(processId);
-            return IsOwnedProcess(process, startTicks);
+            while (true)
+            {
+                try
+                {
+                    using IManagedProcess process = processAdapter.Open(processId);
+                    return IsOwnedProcess(process, startTicks);
+                }
+                catch (ProcessInspectionException)
+                {
+                    // Restart preflight and readiness probes can cross the same
+                    // Windows exit/module boundary as StopOwnedProcess. Re-open
+                    // the persisted PID and retry only within a bounded window;
+                    // persistent uncertainty remains fail-closed.
+                    if (clock.UtcNow >= inspectionDeadline)
+                        throw;
+
+                    TimeSpan remaining = inspectionDeadline - clock.UtcNow;
+                    clock.Sleep(remaining < TimeSpan.FromSeconds(1) ? remaining : TimeSpan.FromSeconds(1));
+                }
+            }
         }
         catch (ProcessInspectionException)
         {
@@ -122,6 +141,47 @@ internal sealed partial class CoordinatorState
             if (actualStartTicks <= 0)
                 throw ProcessInspection.Failure();
             return actualStartTicks == startTicks;
+        }
+        catch (ProcessInspectionException)
+        {
+            throw;
+        }
+        catch
+        {
+            throw ProcessInspection.Failure();
+        }
+    }
+
+    private bool IsExactExitedProcessIdentity(IManagedProcess process, long startTicks)
+    {
+        try
+        {
+            if (process == null || startTicks <= 0)
+                return false;
+
+            long actualStartTicks = process.StartIdentity;
+            if (actualStartTicks <= 0)
+                throw ProcessInspection.Failure();
+            if (actualStartTicks != startTicks)
+                return false;
+
+            // Preserve the executable-path check whenever Windows still
+            // exposes it. After exit, MainModule may be unavailable; the
+            // exact start identity remains the ownership proof for the
+            // coordinator-launched process in that expected boundary.
+            try
+            {
+                string executablePath = process.ExecutablePath;
+                if (!string.IsNullOrWhiteSpace(executablePath))
+                    return string.Equals(Path.GetFullPath(executablePath), rimWorldExe,
+                        StringComparison.OrdinalIgnoreCase);
+            }
+            catch (ProcessInspectionException)
+            {
+                // Expected for an exited process whose module handle is gone.
+            }
+
+            return true;
         }
         catch (ProcessInspectionException)
         {

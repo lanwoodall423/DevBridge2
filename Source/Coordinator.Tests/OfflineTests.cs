@@ -30,6 +30,8 @@ internal static partial class OfflineTests
         Run("stop serializes ensure-ready and restart", TestStopSerialization);
         Run("ensure-ready launches exactly once after maintenance", TestEnsureReadyLaunch);
         Run("restart retains immediate launch behavior", TestImmediateRestart);
+        Run("restart accepts an exact owned process at the exit-inspection boundary", TestRestartOwnedExitInspectionBoundary);
+        Run("restart retries transient pre-termination process inspection", TestRestartRetriesTransientPreterminationInspection);
         Run("launch monitoring retries transient process inspection failures", TestLaunchMonitoringRetriesTransientInspection);
         Run("matching late readiness repairs process inspection quarantine", TestInspectionQuarantineAcceptsMatchingReadiness);
         Run("duplicate stop is idempotent", TestDuplicateStop);
@@ -727,6 +729,8 @@ internal static partial class OfflineTests
         internal bool ThrowOnStartIdentity { get; set; }
         internal bool ThrowOnExecutablePath { get; set; }
         internal bool ThrowOnHasExited { get; set; }
+        internal bool ReportExitedOnFirstHasExited { get; set; }
+        internal bool InvalidateInspectionAfterExitObservation { get; set; }
         internal int ExecutablePathFailuresRemaining { get; set; }
         public long StartIdentity => ThrowOnStartIdentity ? throw new InvalidOperationException("start identity unavailable") : startIdentity;
         public string ExecutablePath
@@ -743,7 +747,22 @@ internal static partial class OfflineTests
                 return executablePath;
             }
         }
-        public bool HasExited => ThrowOnHasExited ? throw new InvalidOperationException("exit state unavailable") : exited;
+        public bool HasExited
+        {
+            get
+            {
+                if (ThrowOnHasExited)
+                    throw new InvalidOperationException("exit state unavailable");
+                if (ReportExitedOnFirstHasExited && !exited)
+                {
+                    exited = true;
+                    ReportExitedOnFirstHasExited = false;
+                    if (InvalidateInspectionAfterExitObservation)
+                        ThrowOnExecutablePath = true;
+                }
+                return exited;
+            }
+        }
 
         private readonly long startIdentity;
         private readonly string executablePath;

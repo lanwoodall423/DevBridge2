@@ -264,6 +264,68 @@ internal static partial class OfflineTests
         Assert(response.State == "READY" && response.Generation == 2, "restart must produce the next ready generation");
     }
 
+    private static void TestRestartOwnedExitInspectionBoundary()
+    {
+        using Fixture fixture = Fixture.ReadyWithoutLease();
+        fixture.Adapter.ReadyOnLaunch = true;
+        fixture.Adapter.Current.ReportExitedOnFirstHasExited = true;
+        fixture.Adapter.Current.InvalidateInspectionAfterExitObservation = true;
+
+        BridgeRequest restart = Request("restart");
+        int exitCode = fixture.State.Execute(restart, _ => { }, () => true);
+        JsonCommandResponse response = fixture.State.CreateJsonResponse(restart, exitCode, Array.Empty<string>());
+
+        Assert(exitCode == 0 && response.State == "READY" && response.Generation == 2 &&
+               response.ErrorCode == null && fixture.Adapter.LaunchCalls == 1,
+            "an exact owned process that exits before MainModule inspection must not quarantine a restart");
+        Assert(fixture.Adapter.TerminationRequests == 0,
+            "an already-exited owned process must not receive a second termination request");
+
+        using Fixture ambiguous = Fixture.ReadyWithoutLease();
+        ambiguous.Adapter.ReadyOnLaunch = true;
+        ambiguous.Adapter.Current.ReportExitedOnFirstHasExited = true;
+        ambiguous.Adapter.Current.InvalidateInspectionAfterExitObservation = true;
+        ambiguous.Adapter.ExtraMatchingProcess = true;
+
+        BridgeRequest ambiguousRestart = Request("restart");
+        int ambiguousExit = ambiguous.State.Execute(ambiguousRestart, _ => { }, () => true);
+        JsonCommandResponse ambiguousResponse = ambiguous.State.CreateJsonResponse(
+            ambiguousRestart, ambiguousExit, Array.Empty<string>());
+
+        Assert(ambiguousExit != 0 && ambiguous.Adapter.LaunchCalls == 0 &&
+               (ambiguousResponse.ErrorCode == "LAUNCH_FAILED" ||
+                ambiguousResponse.ErrorCode == ProcessInspection.ErrorCode),
+            "a separate matching process must still block the replacement launch fail-closed");
+    }
+
+    private static void TestRestartRetriesTransientPreterminationInspection()
+    {
+        using Fixture transient = Fixture.ReadyWithoutLease();
+        transient.Adapter.ReadyOnLaunch = true;
+        transient.Adapter.Current.ExecutablePathFailuresRemaining = 1;
+
+        BridgeRequest restart = Request("restart");
+        int exitCode = transient.State.Execute(restart, _ => { }, () => true);
+        JsonCommandResponse response = transient.State.CreateJsonResponse(restart, exitCode, Array.Empty<string>());
+
+        Assert(exitCode == 0 && response.State == "READY" && response.Generation == 2 &&
+               response.ErrorCode == null && transient.Adapter.LaunchCalls == 1,
+            "a transient pre-termination process inspection failure must be retried");
+
+        using Fixture ambiguous = Fixture.ReadyWithoutLease();
+        ambiguous.Adapter.ReadyOnLaunch = true;
+        ambiguous.Adapter.Current.ThrowOnExecutablePath = true;
+
+        BridgeRequest ambiguousRestart = Request("restart");
+        int ambiguousExit = ambiguous.State.Execute(ambiguousRestart, _ => { }, () => true);
+        JsonCommandResponse ambiguousResponse = ambiguous.State.CreateJsonResponse(
+            ambiguousRestart, ambiguousExit, Array.Empty<string>());
+
+        Assert(ambiguousExit != 0 && ambiguous.Adapter.LaunchCalls == 0 &&
+               ambiguousResponse.ErrorCode == ProcessInspection.ErrorCode,
+            "persistent pre-termination process inspection uncertainty must fail closed");
+    }
+
     private static void TestLaunchMonitoringRetriesTransientInspection()
     {
         using Fixture fixture = Fixture.ReadyWithoutLease();

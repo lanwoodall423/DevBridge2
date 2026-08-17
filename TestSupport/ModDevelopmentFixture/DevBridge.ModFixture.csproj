@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>DevBridge.ModFixture</AssemblyName>
+    <RootNamespace>DevBridge.ModFixture</RootNamespace>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Deterministic>true</Deterministic>
+    <!-- The transaction deploys only the assembly. Excluding portable debug metadata
+         keeps the hashed fixture independent of its per-run staging path. -->
+    <DebugType>None</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- The transaction redirects intermediate output outside the source tree. -->
+    <Compile Remove="obj\**\*.cs" />
+  </ItemGroup>
+</Project>

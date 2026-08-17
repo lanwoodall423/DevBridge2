@@ -1,6 +1,8 @@
 using System.Diagnostics;
+using System.ComponentModel;
 using System.Globalization;
 using System.IO.Pipes;
+using System.Runtime.InteropServices;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
@@ -403,6 +405,8 @@ internal static class CoordinatorClient
         }
         if (ProcessStarterForTests != null)
             ProcessStarterForTests(start);
+        else if (OperatingSystem.IsWindows())
+            DetachedCoordinatorProcess.Start(start);
         else
         {
             Process server = Process.Start(start);
@@ -415,6 +419,112 @@ internal static class CoordinatorClient
             }
         }
     }
+}
+
+internal static class DetachedCoordinatorProcess
+{
+    private const uint CreateNoWindow = 0x08000000;
+    private const int StartfUseShowWindow = 0x00000001;
+    private const short SwHide = 0;
+
+    internal static void Start(ProcessStartInfo start)
+    {
+        string commandLine = QuoteWindowsArgument(start.FileName) +
+            string.Concat(start.ArgumentList.Select(argument => " " + QuoteWindowsArgument(argument)));
+        StartupInfo startup = new()
+        {
+            cb = Marshal.SizeOf<StartupInfo>(),
+            dwFlags = StartfUseShowWindow,
+            wShowWindow = SwHide
+        };
+        if (!CreateProcess(start.FileName, new StringBuilder(commandLine), IntPtr.Zero, IntPtr.Zero,
+                bInheritHandles: false, creationFlags: CreateNoWindow, IntPtr.Zero,
+                string.IsNullOrWhiteSpace(start.WorkingDirectory) ? null : start.WorkingDirectory,
+                ref startup, out ProcessInformation process))
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error(),
+                "the detached coordinator server could not be started");
+        }
+
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+    }
+
+    private static string QuoteWindowsArgument(string value)
+    {
+        value ??= string.Empty;
+        if (value.Length > 0 && !value.Any(character => char.IsWhiteSpace(character) || character == '"'))
+            return value;
+
+        StringBuilder quoted = new("\"");
+        int backslashes = 0;
+        foreach (char character in value)
+        {
+            if (character == '\\')
+            {
+                backslashes++;
+                continue;
+            }
+
+            if (character == '"')
+                quoted.Append('\\', backslashes * 2 + 1);
+            else
+                quoted.Append('\\', backslashes);
+            quoted.Append(character);
+            backslashes = 0;
+        }
+        quoted.Append('\\', backslashes * 2);
+        quoted.Append('"');
+        return quoted.ToString();
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct StartupInfo
+    {
+        internal int cb;
+        internal string lpReserved;
+        internal string lpDesktop;
+        internal string lpTitle;
+        internal int dwX;
+        internal int dwY;
+        internal int dwXSize;
+        internal int dwYSize;
+        internal int dwXCountChars;
+        internal int dwYCountChars;
+        internal int dwFillAttribute;
+        internal int dwFlags;
+        internal short wShowWindow;
+        internal short cbReserved2;
+        internal IntPtr lpReserved2;
+        internal IntPtr hStdInput;
+        internal IntPtr hStdOutput;
+        internal IntPtr hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ProcessInformation
+    {
+        internal IntPtr hProcess;
+        internal IntPtr hThread;
+        internal int processId;
+        internal int threadId;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool CreateProcess(
+        string applicationName,
+        StringBuilder commandLine,
+        IntPtr processAttributes,
+        IntPtr threadAttributes,
+        bool bInheritHandles,
+        uint creationFlags,
+        IntPtr environment,
+        string currentDirectory,
+        ref StartupInfo startupInfo,
+        out ProcessInformation processInformation);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr handle);
 }
 
 internal static class CoordinatorServer
@@ -748,12 +858,18 @@ internal static class CoordinatorServer
                                 ? state.CreateRecipeJsonResponse(request, exitCode)
                                 : state.IsForensicCommand(request)
                                     ? state.CreateForensicJsonResponse(request, exitCode)
+                                : request.HistoryDiffResult != null
+                                    ? request.HistoryDiffResult
+                                : request.HistoryDiagnosisResult != null
+                                    ? request.HistoryDiagnosisResult
                                 : state.CreateJsonResponse(request, exitCode, buffered);
                         exitCode = response switch
                         {
                             AgentResponse agentResponse => agentResponse.ExitCode,
                             RecipeResponse recipeResponse => recipeResponse.ExitCode,
                             ForensicResponse forensicResponse => forensicResponse.ExitCode,
+                            HistoryDiffResponse historyDiffResponse => historyDiffResponse.ExitCode,
+                            HistoryDiagnosisResponse historyDiagnosisResponse => historyDiagnosisResponse.ExitCode,
                             JsonCommandResponse legacyResponse => legacyResponse.ExitCode,
                             _ => exitCode
                         };

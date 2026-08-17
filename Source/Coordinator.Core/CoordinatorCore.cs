@@ -171,6 +171,10 @@ internal sealed class BridgeRequest
     // Server-side only. History commands cache their deterministic view here
     // so response construction does not reread or mutate the history files.
     internal GenerationHistoryView HistoryResult { get; set; }
+    // Server-side only. Pure history analysis caches its bounded response so
+    // JSON construction cannot reread artifacts or cross a mutation boundary.
+    internal HistoryDiffResponse HistoryDiffResult { get; set; }
+    internal HistoryDiagnosisResponse HistoryDiagnosisResult { get; set; }
     // Server-side only. `project resolve` caches its pure planning result so
     // JSON response construction cannot rerun resolution or cross a mutation boundary.
     internal ProjectResolutionResult ProjectResolutionResult { get; set; }

@@ -4,8 +4,35 @@ param()
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $publisher = Join-Path $PSScriptRoot 'dev-publish.ps1'
-$managed = Join-Path $repoRoot '..\..\RimWorldWin64_Data\Managed'
+$managedFixtureRoot = Join-Path $repoRoot 'TestSupport\RimWorldManagedFixtures'
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('DevBridge2-dev-publish-tests-' + $PID)
+
+function Invoke-Required {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+    $output = & $FilePath @Arguments 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Description failed (exit $LASTEXITCODE):`n$($output.Trim())"
+    }
+}
+
+function Build-ManagedFixture {
+    param([Parameter(Mandatory = $true)][string]$OutputPath)
+    New-Item -ItemType Directory -Force -Path $OutputPath | Out-Null
+    foreach ($project in @('Assembly-CSharp.csproj', 'UnityEngine.CoreModule.csproj')) {
+        $projectName = [IO.Path]::GetFileNameWithoutExtension($project)
+        $intermediate = Join-Path $testRoot "fixture-obj\$projectName"
+        Invoke-Required 'dotnet' @(
+            'build', (Join-Path $managedFixtureRoot $project),
+            '--configuration', 'Release', '--output', $OutputPath, '--nologo',
+            "-p:BaseIntermediateOutputPath=$intermediate\",
+            "-p:MSBuildProjectExtensionsPath=$intermediate\"
+        ) "managed assembly fixture $project build"
+    }
+}
 
 function Invoke-Publish {
     param(
@@ -58,6 +85,8 @@ try {
     Write-Host 'PASS changed coordinator artifact uses graceful shutdown'
 
     $modRoot = Join-Path $testRoot 'mod'
+    $managed = Join-Path $testRoot 'RimWorldWin64_Data\Managed'
+    Build-ManagedFixture $managed
     $modReport = Invoke-Publish $modRoot 'Source/Mod/DevBridge2Mod.cs' $managed
     Assert-True ($modReport.plan.build -contains 'rimworld-mod') 'mod plan must build the mod assembly'
     Assert-True ($modReport.deployed -contains 'rimworld-mod') 'changed mod artifact must deploy'

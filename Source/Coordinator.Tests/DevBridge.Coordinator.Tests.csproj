@@ -35,6 +35,7 @@
     <Compile Include="VersionAndSchemaTests.cs" />
     <Compile Include="DoctorTests.cs" />
     <Compile Include="GenerationHistoryTests.cs" />
+    <Compile Include="HistoryAnalysisTests.cs" />
     <Compile Include="ProjectResolutionTests.cs" />
     <Compile Include="TestGenerationInputTests.cs" />
     <Compile Include="DevBridgeWrapperTests.cs" />

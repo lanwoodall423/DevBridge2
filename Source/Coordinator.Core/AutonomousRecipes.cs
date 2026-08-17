@@ -18,6 +18,7 @@ internal sealed class TestRecipeDefinition
     internal List<string> Projects { get; init; } = new();
     internal List<TestInputAssignment> Inputs { get; init; } = new();
     internal bool RequiresReady { get; init; } = true;
+    internal bool AllowsInGameMutation { get; init; }
     internal RecipeExpectation Success { get; init; } = new();
     internal List<RecipeOperationDefinition> Operations { get; init; } = new();
     internal RecipeBudgetDefinition Budget { get; init; } = new();
@@ -34,6 +35,22 @@ internal sealed class RecipeOperationDefinition
 {
     internal string ToolName { get; init; }
     internal JsonElement Arguments { get; init; }
+    internal RecipeOperationExpectation Expectation { get; init; }
+}
+
+internal sealed class RecipeOperationExpectation
+{
+    internal bool ExpectedSuccess { get; init; } = true;
+    internal List<RecipeAssertionDefinition> Assertions { get; init; } = new();
+}
+
+internal sealed class RecipeAssertionDefinition
+{
+    internal string Pointer { get; init; }
+    internal bool? Exists { get; init; }
+    internal JsonElement? ExpectedValue { get; init; }
+    internal double? GreaterThan { get; init; }
+    internal double? LessThan { get; init; }
 }
 
 internal sealed class RecipeBudgetDefinition
@@ -167,8 +184,22 @@ internal sealed class RecipeCatalog
             return Failure("TEST_RECIPE_ROOT_INVALID", "A recipe must be a JSON object.",
                 out errorCode, out error);
 
-        string[] allowed = { "schemaVersion", "id", "description", "projects", "inputs",
-            "requiresReady", "success", "operations", "timeoutSeconds", "budget" };
+        if (!TryString(root, "schemaVersion", required: true, out string schema,
+                out errorCode, out error))
+            return false;
+        bool isV1 = string.Equals(schema, DevBridgeSchemaVersions.TestRecipe, StringComparison.Ordinal);
+        bool isV2 = string.Equals(schema, DevBridgeSchemaVersions.TestRecipeV2Contract, StringComparison.Ordinal);
+        if (!isV1 && !isV2)
+            return Failure("TEST_RECIPE_SCHEMA_UNSUPPORTED",
+                "Only devbridge-test-recipe/v1 and /v2 recipes are supported.",
+                out errorCode, out error);
+
+        string[] allowed = isV2
+            ? new[] { "schemaVersion", "id", "description", "projects", "inputs",
+                "requiresReady", "success", "operations", "timeoutSeconds", "budget",
+                "allowInGameMutation" }
+            : new[] { "schemaVersion", "id", "description", "projects", "inputs",
+                "requiresReady", "success", "operations", "timeoutSeconds", "budget" };
         foreach (JsonProperty property in root.EnumerateObject())
         {
             if (!allowed.Contains(property.Name, StringComparer.Ordinal))
@@ -177,14 +208,6 @@ internal sealed class RecipeCatalog
                     out errorCode, out error);
         }
 
-        if (!TryString(root, "schemaVersion", required: true, out string schema,
-                out errorCode, out error) ||
-            !string.Equals(schema, DevBridgeSchemaVersions.TestRecipe, StringComparison.Ordinal))
-        {
-            errorCode ??= "TEST_RECIPE_SCHEMA_UNSUPPORTED";
-            error ??= "Only devbridge-test-recipe/v1 recipes are supported.";
-            return false;
-        }
         if (!TryString(root, "id", required: true, out string id, out errorCode, out error))
             return false;
         if (id.Length > 64 || id.Length == 0 ||
@@ -247,6 +270,17 @@ internal sealed class RecipeCatalog
             requiresReady = readyElement.GetBoolean();
         }
 
+        bool allowsInGameMutation = false;
+        if (root.TryGetProperty("allowInGameMutation", out JsonElement mutationElement))
+        {
+            if (!isV2 || (mutationElement.ValueKind != JsonValueKind.True &&
+                    mutationElement.ValueKind != JsonValueKind.False))
+                return Failure("TEST_RECIPE_MUTATION_OPT_IN_INVALID",
+                    "allowInGameMutation must be a boolean and is available only in v2 recipes.",
+                    out errorCode, out error);
+            allowsInGameMutation = mutationElement.GetBoolean();
+        }
+
         RecipeExpectation success = new() { QuicktestReady = requiresReady };
         if (root.TryGetProperty("success", out JsonElement successElement))
         {
@@ -283,7 +317,8 @@ internal sealed class RecipeCatalog
                     return Failure("TEST_RECIPE_OPERATIONS_INVALID", "each operation must be an object.",
                         out errorCode, out error);
                 foreach (JsonProperty property in operation.EnumerateObject())
-                    if (property.Name != "tool" && property.Name != "arguments")
+                    if (property.Name != "tool" && property.Name != "arguments" &&
+                        (!isV2 || property.Name != "expect"))
                         return Failure("TEST_RECIPE_UNSUPPORTED_FIELD", "operations contain an unsupported field.",
                             out errorCode, out error);
                 if (!TryString(operation, "tool", true, out string tool, out errorCode, out error))
@@ -295,12 +330,31 @@ internal sealed class RecipeCatalog
                 if (JsonSerializer.Serialize(arguments, CoordinatorSerialization.JsonOptions).Length > 4096)
                     return Failure("TEST_RECIPE_OPERATIONS_INVALID", "operation arguments are bounded.",
                         out errorCode, out error);
-                if (!string.Equals(RimBridgeOperationPolicy.CategoryFor(tool),
-                        RimBridgeOperationCategories.ReadOnly, StringComparison.Ordinal))
+                string category = RimBridgeOperationPolicy.CategoryFor(tool);
+                if (category == RimBridgeOperationCategories.ProfileMutation ||
+                    category == RimBridgeOperationCategories.LifecycleMutation)
+                    return Failure(isV2 ? "TEST_RECIPE_RIMBRIDGE_FORBIDDEN" : "TEST_RECIPE_RIMBRIDGE_MUTATION",
+                        isV2 ? "profile and lifecycle RimBridge operations are never allowed in recipes." :
+                            "recipes may call only policy-approved read-only/debug RimBridge tools.",
+                        out errorCode, out error);
+                if (category == RimBridgeOperationCategories.InGameMutation && !isV2)
                     return Failure("TEST_RECIPE_RIMBRIDGE_MUTATION",
                         "recipes may call only policy-approved read-only/debug RimBridge tools.",
                         out errorCode, out error);
-                operations.Add(new RecipeOperationDefinition { ToolName = tool, Arguments = arguments.Clone() });
+                if (category == RimBridgeOperationCategories.InGameMutation && !allowsInGameMutation)
+                    return Failure("TEST_RECIPE_IN_GAME_MUTATION_OPT_IN_REQUIRED",
+                        "v2 recipes must explicitly allow in-game mutation operations.",
+                        out errorCode, out error);
+                RecipeOperationExpectation expectation = new();
+                if (isV2 && operation.TryGetProperty("expect", out JsonElement expectElement) &&
+                    !TryParseOperationExpectation(expectElement, out expectation, out errorCode, out error))
+                    return false;
+                operations.Add(new RecipeOperationDefinition
+                {
+                    ToolName = tool,
+                    Arguments = arguments.Clone(),
+                    Expectation = isV2 ? expectation : null
+                });
             }
         }
 
@@ -374,11 +428,126 @@ internal sealed class RecipeCatalog
             Projects = ModProfileResolver.CanonicalAliases(projects).ToList(),
             Inputs = inputs,
             RequiresReady = requiresReady,
+            AllowsInGameMutation = allowsInGameMutation,
             Success = success,
             Operations = operations,
             Budget = budget
         };
         return true;
+    }
+
+    private static bool TryParseOperationExpectation(JsonElement element,
+        out RecipeOperationExpectation expectation, out string errorCode, out string error)
+    {
+        expectation = null;
+        errorCode = null;
+        error = null;
+        if (element.ValueKind != JsonValueKind.Object)
+            return Failure("TEST_RECIPE_EXPECTATION_INVALID", "operation expect must be an object.",
+                out errorCode, out error);
+
+        foreach (JsonProperty property in element.EnumerateObject())
+            if (property.Name != "success" && property.Name != "assertions")
+                return Failure("TEST_RECIPE_UNSUPPORTED_FIELD",
+                    "operation expectations contain an unsupported field.", out errorCode, out error);
+
+        bool expectedSuccess = true;
+        if (element.TryGetProperty("success", out JsonElement success))
+        {
+            if (success.ValueKind != JsonValueKind.True && success.ValueKind != JsonValueKind.False)
+                return Failure("TEST_RECIPE_EXPECTATION_INVALID", "expect.success must be boolean.",
+                    out errorCode, out error);
+            expectedSuccess = success.GetBoolean();
+        }
+
+        List<RecipeAssertionDefinition> assertions = new();
+        if (element.TryGetProperty("assertions", out JsonElement assertionsElement))
+        {
+            if (assertionsElement.ValueKind != JsonValueKind.Array ||
+                assertionsElement.GetArrayLength() > 4)
+                return Failure("TEST_RECIPE_ASSERTIONS_INVALID",
+                    "operation assertions must be a bounded array of at most four items.",
+                    out errorCode, out error);
+            foreach (JsonElement assertion in assertionsElement.EnumerateArray())
+            {
+                if (!TryParseAssertion(assertion, out RecipeAssertionDefinition parsed,
+                        out errorCode, out error))
+                    return false;
+                assertions.Add(parsed);
+            }
+        }
+        expectation = new RecipeOperationExpectation
+        {
+            ExpectedSuccess = expectedSuccess,
+            Assertions = assertions
+        };
+        return true;
+    }
+
+    private static bool TryParseAssertion(JsonElement element, out RecipeAssertionDefinition assertion,
+        out string errorCode, out string error)
+    {
+        assertion = null;
+        errorCode = null;
+        error = null;
+        if (element.ValueKind != JsonValueKind.Object)
+            return Failure("TEST_RECIPE_ASSERTION_INVALID", "an assertion must be an object.",
+                out errorCode, out error);
+        foreach (JsonProperty property in element.EnumerateObject())
+            if (property.Name != "pointer" && property.Name != "exists" && property.Name != "equals" &&
+                property.Name != "greaterThan" && property.Name != "lessThan")
+                return Failure("TEST_RECIPE_UNSUPPORTED_FIELD", "assertions contain an unsupported field.",
+                    out errorCode, out error);
+
+        if (!TryString(element, "pointer", required: true, out string pointer,
+                out errorCode, out error))
+            return false;
+        if (pointer.Length > 256 || (pointer.Length > 0 && pointer[0] != '/'))
+            return Failure("TEST_RECIPE_ASSERTION_INVALID",
+                "assertion pointers must be bounded JSON Pointers.", out errorCode, out error);
+
+        bool hasExists = element.TryGetProperty("exists", out JsonElement exists);
+        if (hasExists && exists.ValueKind != JsonValueKind.True && exists.ValueKind != JsonValueKind.False)
+            return Failure("TEST_RECIPE_ASSERTION_INVALID", "assertion exists must be boolean.",
+                out errorCode, out error);
+        bool hasEquals = element.TryGetProperty("equals", out JsonElement equals);
+        if (hasEquals && !IsScalar(equals))
+            return Failure("TEST_RECIPE_ASSERTION_INVALID", "assertion equals must be scalar.",
+                out errorCode, out error);
+        bool hasGreaterThan = element.TryGetProperty("greaterThan", out JsonElement greaterThan);
+        if (hasGreaterThan && !TryFiniteDouble(greaterThan, out _))
+            return Failure("TEST_RECIPE_ASSERTION_INVALID", "assertion greaterThan must be finite numeric.",
+                out errorCode, out error);
+        bool hasLessThan = element.TryGetProperty("lessThan", out JsonElement lessThan);
+        if (hasLessThan && !TryFiniteDouble(lessThan, out _))
+            return Failure("TEST_RECIPE_ASSERTION_INVALID", "assertion lessThan must be finite numeric.",
+                out errorCode, out error);
+        int checks = (hasExists ? 1 : 0) + (hasEquals ? 1 : 0) +
+            (hasGreaterThan ? 1 : 0) + (hasLessThan ? 1 : 0);
+        if (checks != 1)
+            return Failure("TEST_RECIPE_ASSERTION_INVALID",
+                "each assertion must select exactly one bounded comparison.", out errorCode, out error);
+
+        assertion = new RecipeAssertionDefinition
+        {
+            Pointer = pointer,
+            Exists = hasExists ? exists.GetBoolean() : null,
+            ExpectedValue = hasEquals ? equals.Clone() : null,
+            GreaterThan = hasGreaterThan ? greaterThan.GetDouble() : null,
+            LessThan = hasLessThan ? lessThan.GetDouble() : null
+        };
+        return true;
+    }
+
+    private static bool IsScalar(JsonElement element) => element.ValueKind == JsonValueKind.Null ||
+        element.ValueKind == JsonValueKind.String || element.ValueKind == JsonValueKind.True ||
+        element.ValueKind == JsonValueKind.False || element.ValueKind == JsonValueKind.Number;
+
+    private static bool TryFiniteDouble(JsonElement element, out double value)
+    {
+        value = 0;
+        return element.ValueKind == JsonValueKind.Number && element.TryGetDouble(out value) &&
+            !double.IsNaN(value) && !double.IsInfinity(value);
     }
 
     private static bool ReadBudgetInt(JsonElement parent, string name, int min, int max,
@@ -493,6 +662,8 @@ internal sealed class RecipeInfo
     [JsonPropertyName("projects")] public List<string> Projects { get; init; } = new();
     [JsonPropertyName("inputs")] public Dictionary<string, string> Inputs { get; init; } = new(StringComparer.Ordinal);
     [JsonPropertyName("requiresReady")] public bool RequiresReady { get; init; }
+    [JsonPropertyName("allowInGameMutation")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? AllowsInGameMutation { get; init; }
     [JsonPropertyName("timeoutSeconds")] public int TimeoutSeconds { get; init; }
     [JsonPropertyName("success")] public RecipeSuccessInfo Success { get; init; }
     [JsonPropertyName("operations")] public List<RecipeOperationInfo> Operations { get; init; } = new();
@@ -510,6 +681,27 @@ internal sealed class RecipeOperationInfo
 {
     [JsonPropertyName("tool")] public string Tool { get; init; }
     [JsonPropertyName("arguments")] public JsonElement Arguments { get; init; }
+    [JsonPropertyName("expect")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public RecipeOperationExpectationInfo Expectation { get; init; }
+}
+
+internal sealed class RecipeOperationExpectationInfo
+{
+    [JsonPropertyName("success")] public bool Success { get; init; }
+    [JsonPropertyName("assertions")] public List<RecipeAssertionInfo> Assertions { get; init; } = new();
+}
+
+internal sealed class RecipeAssertionInfo
+{
+    [JsonPropertyName("pointer")] public string Pointer { get; init; }
+    [JsonPropertyName("exists")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? Exists { get; init; }
+    [JsonPropertyName("equals")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public JsonElement? ExpectedValue { get; init; }
+    [JsonPropertyName("greaterThan")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public double? GreaterThan { get; init; }
+    [JsonPropertyName("lessThan")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public double? LessThan { get; init; }
 }
 
 internal sealed class RecipeBudgetInfo
@@ -613,9 +805,22 @@ internal sealed class RecipeOperationResult
 {
     [JsonPropertyName("tool")] public string Tool { get; init; }
     [JsonPropertyName("success")] public bool Success { get; init; }
+    [JsonPropertyName("expectedSuccess")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? ExpectedSuccess { get; init; }
     [JsonPropertyName("errorCode")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string ErrorCode { get; init; }
+    [JsonPropertyName("error")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string Error { get; init; }
     [JsonPropertyName("evidence")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string Evidence { get; init; }
     [JsonPropertyName("result")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public JsonElement? Result { get; init; }
+    [JsonPropertyName("assertions")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<RecipeAssertionResult> Assertions { get; init; }
+}
+
+internal sealed class RecipeAssertionResult
+{
+    [JsonPropertyName("pointer")] public string Pointer { get; init; }
+    [JsonPropertyName("success")] public bool Success { get; init; }
+    [JsonPropertyName("error")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string Error { get; init; }
 }
 
 internal sealed class RecipeRunResponse : RecipeResponse
@@ -909,9 +1114,48 @@ internal sealed partial class CoordinatorState
         int launchesConsumed = 0;
         bool leavePendingForRecovery = false;
         string leaseId = null;
+        bool ownsLease = false;
         List<RecipeOperationResult> operationResults = new();
         try
         {
+            if (!string.IsNullOrWhiteSpace(callerBudget.SuppliedLeaseId))
+            {
+                TestLease suppliedLease;
+                lock (gate)
+                {
+                    SynchronizeLocked();
+                    if (!TryGetLeaseHolderLocked(callerBudget.SuppliedLeaseId, request,
+                            out suppliedLease))
+                    {
+                        return SetRecipeFailure(request, id, "RECIPE_SUPPLIED_LEASE_NOT_HELD",
+                            "The supplied lease is not held by this stable agent identity.",
+                            state.Generation, restartRequired, launchesConsumed,
+                            callerBudget.SuppliedLeaseId, budgetResult, "acquire-lease", null, plan);
+                    }
+
+                    if (state.Phase != BridgePhase.READY || state.RestartPending ||
+                        state.Generation <= 0 || suppliedLease.Generation != state.Generation)
+                    {
+                        return SetRecipeFailure(request, id,
+                            "RECIPE_SUPPLIED_LEASE_GENERATION_MISMATCH",
+                            "The supplied lease is not valid for the current READY generation; " +
+                            "no lifecycle operation was attempted.", state.Generation,
+                            restartRequired, launchesConsumed, suppliedLease.Id, budgetResult,
+                            "inspect-evidence", null, plan);
+                    }
+                }
+
+                leaseId = callerBudget.SuppliedLeaseId;
+                if (restartRequired)
+                {
+                    return SetRecipeFailure(request, id, "RECIPE_SUPPLIED_LEASE_REQUIRES_READY",
+                        "A supplied lease cannot authorize an autonomous restart; plan and accept " +
+                        "the intended generation before running the recipe.", initialGeneration,
+                        restartRequired, launchesConsumed, leaseId, budgetResult,
+                        "ensure-ready", null, plan);
+                }
+            }
+
             if (restartRequired)
             {
                 bool matchingPending = pendingBefore && plan.EstimatedRimWorldLaunches == 0;
@@ -946,7 +1190,8 @@ internal sealed partial class CoordinatorState
                     CurrentGenerationForRecipe(), restartRequired, launchesConsumed, null,
                     WithConsumed(budgetResult, launchesConsumed, 0), "wait-event", null, plan);
 
-            if (recipe.RequiresReady || recipe.Operations.Count > 0)
+            if (string.IsNullOrWhiteSpace(leaseId) &&
+                (recipe.RequiresReady || recipe.Operations.Count > 0))
             {
                 TestLease lease = null;
                 int beginResult = BeginLease(request, SilentRecipeEmit, connected,
@@ -964,13 +1209,16 @@ internal sealed partial class CoordinatorState
                         leavePendingForRecovery ? "wait-event" : "acquire-lease", null, plan);
                 }
                 leaseId = lease.Id;
+                ownsLease = true;
             }
 
             foreach (RecipeOperationDefinition operation in recipe.Operations)
             {
                 if (!BudgetAvailable())
                     return SetRecipeFailure(request, id, "AUTONOMOUS_BUDGET_EXHAUSTED",
-                        "The recipe budget expired before the next read-only operation.",
+                        operation.Expectation == null
+                            ? "The recipe budget expired before the next read-only operation."
+                            : "The recipe budget expired before the next RimBridge operation.",
                         CurrentGenerationForRecipe(), restartRequired, launchesConsumed, leaseId,
                         WithConsumed(budgetResult, launchesConsumed, 0),
                         "wait-event", operationResults, plan);
@@ -983,17 +1231,11 @@ internal sealed partial class CoordinatorState
                 }
                 int operationExit = BridgeCallCommand(callArguments, request, SilentRecipeEmit);
                 RimBridgeRouteResult route = request.RimBridgeRouteResult;
-                operationResults.Add(new RecipeOperationResult
-                {
-                    Tool = operation.ToolName,
-                    Success = operationExit == 0 && route?.Success == true,
-                    ErrorCode = route?.ErrorCode,
-                    Evidence = route == null ? null : "generation/" + route.Generation + "/rimbridge",
-                    Result = BoundRecipePayload(route?.Payload)
-                });
-                if (operationExit != 0 || route?.Success != true)
-                    return SetRecipeFailure(request, id, route?.ErrorCode ?? "RECIPE_OPERATION_FAILED",
-                        "A policy-approved read-only recipe operation failed.",
+                RecipeOperationResult operationResult = EvaluateRecipeOperation(operation, operationExit, route);
+                operationResults.Add(operationResult);
+                if (!operationResult.Success)
+                    return SetRecipeFailure(request, id, operationResult.ErrorCode ?? "RECIPE_OPERATION_FAILED",
+                        operationResult.Error ?? "The recipe operation did not satisfy its bounded expectation.",
                         CurrentGenerationForRecipe(), restartRequired, launchesConsumed, leaseId,
                         WithConsumed(budgetResult, launchesConsumed, 0),
                         "inspect-evidence", operationResults, plan);
@@ -1006,7 +1248,7 @@ internal sealed partial class CoordinatorState
         }
         finally
         {
-            if (!string.IsNullOrWhiteSpace(leaseId))
+            if (ownsLease && !string.IsNullOrWhiteSpace(leaseId))
                 EndLease(request, new[] { "end", leaseId }, SilentRecipeEmit);
             lock (gate)
                 leavePendingForRecovery |= state.RestartPending;
@@ -1157,6 +1399,153 @@ internal sealed partial class CoordinatorState
             return state.Generation;
     }
 
+    private static RecipeOperationResult EvaluateRecipeOperation(RecipeOperationDefinition operation,
+        int operationExit, RimBridgeRouteResult route)
+    {
+        bool isV2 = operation.Expectation != null;
+        RecipeOperationExpectation expectation = operation.Expectation ?? new RecipeOperationExpectation();
+        bool actualSuccess = operationExit == 0 && route?.Success == true;
+        bool success = actualSuccess == expectation.ExpectedSuccess;
+        List<RecipeAssertionResult> assertions = null;
+        if (success && expectation.Assertions.Count > 0)
+        {
+            assertions = new List<RecipeAssertionResult>();
+            foreach (RecipeAssertionDefinition assertion in expectation.Assertions)
+                assertions.Add(EvaluateRecipeAssertion(assertion, route?.Payload));
+            success = assertions.All(value => value.Success);
+        }
+
+        string errorCode = null;
+        string error = null;
+        if (!success)
+        {
+            if (actualSuccess != expectation.ExpectedSuccess)
+            {
+                errorCode = expectation.ExpectedSuccess
+                    ? route?.ErrorCode ?? "RECIPE_OPERATION_FAILED"
+                    : "RECIPE_EXPECTED_FAILURE_NOT_RETURNED";
+                error = expectation.ExpectedSuccess
+                    ? isV2 ? "The RimBridge operation did not succeed as expected."
+                        : "A policy-approved read-only recipe operation failed."
+                    : "The RimBridge operation succeeded when failure was expected.";
+            }
+            else
+            {
+                errorCode = "RECIPE_ASSERTION_FAILED";
+                error = "A bounded RimBridge result assertion failed.";
+            }
+        }
+        return new RecipeOperationResult
+        {
+            Tool = operation.ToolName,
+            Success = success,
+            ExpectedSuccess = isV2 ? expectation.ExpectedSuccess : null,
+            ErrorCode = errorCode,
+            Error = error,
+            Evidence = route == null ? null : "generation/" + route.Generation + "/rimbridge",
+            Result = BoundRecipePayload(route?.Payload),
+            Assertions = assertions
+        };
+    }
+
+    private static RecipeAssertionResult EvaluateRecipeAssertion(RecipeAssertionDefinition assertion,
+        JsonElement? payload)
+    {
+        JsonElement selected = default;
+        bool found = payload.HasValue && TrySelectJsonPointer(payload.Value, assertion.Pointer,
+            out selected);
+        bool success;
+        string error = null;
+        if (assertion.Exists.HasValue)
+            success = found == assertion.Exists.Value;
+        else if (!found)
+        {
+            success = false;
+            error = "The selected result field was not present.";
+        }
+        else if (assertion.ExpectedValue.HasValue)
+        {
+            success = ScalarEquals(selected, assertion.ExpectedValue.Value);
+            if (!success)
+                error = "The selected scalar did not match the expected value.";
+        }
+        else if (assertion.GreaterThan.HasValue)
+        {
+            success = TryFiniteDouble(selected, out double value) && value > assertion.GreaterThan.Value;
+            if (!success)
+                error = "The selected numeric value was not greater than expected.";
+        }
+        else
+        {
+            success = TryFiniteDouble(selected, out double value) && value < assertion.LessThan.Value;
+            if (!success)
+                error = "The selected numeric value was not less than expected.";
+        }
+        if (!success && error == null)
+            error = "The selected field existence did not match the expectation.";
+        return new RecipeAssertionResult { Pointer = assertion.Pointer, Success = success, Error = error };
+    }
+
+    private static bool TrySelectJsonPointer(JsonElement root, string pointer, out JsonElement value)
+    {
+        value = default;
+        if (pointer.Length == 0)
+        {
+            value = root;
+            return true;
+        }
+        if (pointer[0] != '/')
+            return false;
+        JsonElement current = root;
+        string[] segments = pointer.Split('/');
+        if (segments.Length > 17)
+            return false;
+        for (int index = 1; index < segments.Length; index++)
+        {
+            string segment = segments[index].Replace("~1", "/", StringComparison.Ordinal)
+                .Replace("~0", "~", StringComparison.Ordinal);
+            if (current.ValueKind == JsonValueKind.Object)
+            {
+                if (!current.TryGetProperty(segment, out current))
+                    return false;
+            }
+            else if (current.ValueKind == JsonValueKind.Array &&
+                int.TryParse(segment, NumberStyles.None, CultureInfo.InvariantCulture, out int item) &&
+                item >= 0 && item < current.GetArrayLength())
+            {
+                current = current[item];
+            }
+            else
+                return false;
+        }
+        value = current;
+        return true;
+    }
+
+    private static bool ScalarEquals(JsonElement actual, JsonElement expected)
+    {
+        if (actual.ValueKind != expected.ValueKind)
+            return actual.ValueKind == JsonValueKind.Number && expected.ValueKind == JsonValueKind.Number &&
+                TryFiniteDouble(actual, out _) && TryFiniteDouble(expected, out _) &&
+                actual.GetDouble() == expected.GetDouble();
+        return actual.ValueKind switch
+        {
+            JsonValueKind.Null => true,
+            JsonValueKind.String => string.Equals(actual.GetString(), expected.GetString(), StringComparison.Ordinal),
+            JsonValueKind.True or JsonValueKind.False => actual.GetBoolean() == expected.GetBoolean(),
+            JsonValueKind.Number => TryFiniteDouble(actual, out double actualNumber) &&
+                TryFiniteDouble(expected, out double expectedNumber) && actualNumber == expectedNumber,
+            _ => false
+        };
+    }
+
+    private static bool TryFiniteDouble(JsonElement element, out double value)
+    {
+        value = 0;
+        return element.ValueKind == JsonValueKind.Number && element.TryGetDouble(out value) &&
+            !double.IsNaN(value) && !double.IsInfinity(value);
+    }
+
     private static JsonElement? BoundRecipePayload(JsonElement? payload)
     {
         if (!payload.HasValue)
@@ -1247,6 +1636,8 @@ internal sealed partial class CoordinatorState
         Inputs = recipe.Inputs.OrderBy(value => value.Name, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(value => value.Name, value => value.Value, StringComparer.Ordinal),
         RequiresReady = recipe.RequiresReady,
+        AllowsInGameMutation = recipe.SchemaVersion == DevBridgeSchemaVersions.TestRecipeV2Contract
+            ? recipe.AllowsInGameMutation : null,
         TimeoutSeconds = recipe.Budget.TimeoutSeconds,
         Success = new RecipeSuccessInfo
         {
@@ -1257,7 +1648,20 @@ internal sealed partial class CoordinatorState
         Operations = recipe.Operations.Select(value => new RecipeOperationInfo
         {
             Tool = value.ToolName,
-            Arguments = value.Arguments
+            Arguments = value.Arguments,
+            Expectation = recipe.SchemaVersion == DevBridgeSchemaVersions.TestRecipeV2Contract
+                ? new RecipeOperationExpectationInfo
+                {
+                    Success = value.Expectation.ExpectedSuccess,
+                    Assertions = value.Expectation.Assertions.Select(assertion => new RecipeAssertionInfo
+                    {
+                        Pointer = assertion.Pointer,
+                        Exists = assertion.Exists,
+                        ExpectedValue = assertion.ExpectedValue,
+                        GreaterThan = assertion.GreaterThan,
+                        LessThan = assertion.LessThan
+                    }).ToList()
+                } : null
         }).ToList(),
         Budget = new RecipeBudgetInfo
         {
@@ -1272,6 +1676,7 @@ internal sealed partial class CoordinatorState
 
     private sealed class RecipeCallerBudget
     {
+        internal string SuppliedLeaseId { get; init; }
         internal int? TimeoutSeconds { get; init; }
         internal int? MaxRimWorldLaunches { get; init; }
         internal int? MaxRecipeAttempts { get; init; }
@@ -1324,6 +1729,7 @@ internal sealed partial class CoordinatorState
         if (string.IsNullOrWhiteSpace(id))
             return RecipeParseFailure("TEST_RECIPE_USAGE", "recipe run requires one recipe id.",
                 out errorCode, out error);
+        string suppliedLeaseId = null;
         int? timeout = null, launches = null, attempts = null, refreshes = null, repeated = null;
         bool? stop = null;
         HashSet<string> seenOptions = new(StringComparer.OrdinalIgnoreCase);
@@ -1332,6 +1738,21 @@ internal sealed partial class CoordinatorState
             string option = arguments[index]?.Trim() ?? string.Empty;
             if (string.Equals(option, "--json", StringComparison.OrdinalIgnoreCase))
                 continue;
+            if (string.Equals(option, "--lease", StringComparison.OrdinalIgnoreCase) ||
+                option.StartsWith("--lease=", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!string.IsNullOrWhiteSpace(suppliedLeaseId))
+                    return RecipeParseFailure("TEST_RECIPE_LEASE_INVALID",
+                        "a supplied lease may be declared only once.", out errorCode, out error);
+                string candidate = option.StartsWith("--lease=", StringComparison.OrdinalIgnoreCase)
+                    ? option.Substring("--lease=".Length).Trim()
+                    : (++index < arguments.Count ? arguments[index]?.Trim() : null);
+                if (!IsFullLeaseId(candidate))
+                    return RecipeParseFailure("TEST_RECIPE_LEASE_INVALID",
+                        "--lease requires the complete lease capability ID.", out errorCode, out error);
+                suppliedLeaseId = candidate;
+                continue;
+            }
             if (option is "--timeout-seconds" or "--budget-seconds" or "--max-rimworld-launches" or
                 "--max-recipe-attempts" or "--max-coordinator-refreshes" or "--max-repeated-failure-count")
             {
@@ -1380,6 +1801,7 @@ internal sealed partial class CoordinatorState
                 out errorCode, out error);
         budget = new RecipeCallerBudget
         {
+            SuppliedLeaseId = suppliedLeaseId,
             TimeoutSeconds = timeout,
             MaxRimWorldLaunches = launches,
             MaxRecipeAttempts = attempts,
@@ -1392,6 +1814,15 @@ internal sealed partial class CoordinatorState
 
     private static bool BoundedCaller(int? value, int min, int max) =>
         !value.HasValue || value.Value >= min && value.Value <= max;
+
+    private static bool IsFullLeaseId(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value) || value.Length != 38 ||
+            !value.StartsWith("lease-", StringComparison.OrdinalIgnoreCase))
+            return false;
+        return value.Skip(6).All(character =>
+            character is >= '0' and <= '9' or >= 'A' and <= 'F' or >= 'a' and <= 'f');
+    }
 
     private static bool RecipeParseFailure(string code, string message, out string errorCode, out string error)
     {

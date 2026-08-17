@@ -29,6 +29,9 @@ $alwaysOnPackages = @(
     'astryl.moderndevtools',
     'brrainz.rimbridgeserver'
 )
+$diagnosticTextLimit = 4000
+$script:CurrentFixture = $null
+$script:LastBridgeResponse = $null
 
 if (-not (Test-Path -LiteralPath $coordinatorExe -PathType Leaf) -or
     -not (Test-Path -LiteralPath $fakeExe -PathType Leaf)) {
@@ -58,6 +61,90 @@ function Write-InstalledMetadata {
     Write-Utf8File (Join-Path $about 'About.xml') $xml
 }
 
+function Write-TestRecipe {
+    param([Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$Id,
+        [Parameter(Mandatory = $true)]$Definition)
+    Write-Utf8File (Join-Path $Root 'TestRecipes' ($Id + '.json')) `
+        ($Definition | ConvertTo-Json -Depth 12)
+}
+
+function Add-BehavioralRecipes {
+    param([Parameter(Mandatory = $true)]$Fixture)
+    $successOperations = @(
+        [ordered]@{
+            tool = 'rimworld/fixture_mutate'
+            arguments = [ordered]@{ value = 'behavioral-ready' }
+            expect = [ordered]@{
+                success = $true
+                assertions = @(
+                    [ordered]@{ pointer = '/value'; equals = 'behavioral-ready' }
+                    [ordered]@{ pointer = '/mutationCount'; greaterThan = 0 }
+                )
+            }
+        }
+        [ordered]@{
+            tool = 'rimworld/inspect_fixture'
+            arguments = [ordered]@{}
+            expect = [ordered]@{
+                success = $true
+                assertions = @(
+                    [ordered]@{ pointer = '/value'; equals = 'behavioral-ready' }
+                    [ordered]@{ pointer = '/mutationCount'; greaterThan = 0 }
+                )
+            }
+        }
+    )
+    $base = [ordered]@{
+        description = 'Temporary behavioral fixture mutation and observation.'
+        projects = @()
+        inputs = [ordered]@{}
+        requiresReady = $true
+        allowInGameMutation = $true
+        success = [ordered]@{ quicktestReady = $true }
+        budget = [ordered]@{
+            timeoutSeconds = 30
+            maxRimWorldLaunches = 1
+            maxRecipeAttempts = 1
+            maxCoordinatorRefreshes = 4
+            stopOnRepeatedFailureFingerprint = $true
+            maxRepeatedFailureCount = 1
+        }
+    }
+
+    $behavioral = [ordered]@{} + $base
+    $behavioral.schemaVersion = 'devbridge-test-recipe/v2'
+    $behavioral.id = 'behavioral-fixture'
+    $behavioral.operations = $successOperations
+    Write-TestRecipe $Fixture.Root $behavioral.id $behavioral
+
+    $v1 = [ordered]@{} + $base
+    $v1.schemaVersion = 'devbridge-test-recipe/v1'
+    $v1.id = 'v1-readonly-fixture'
+    $v1.Remove('allowInGameMutation')
+    $v1.operations = @([ordered]@{
+        tool = 'rimworld/inspect_fixture'
+        arguments = [ordered]@{}
+    })
+    Write-TestRecipe $Fixture.Root $v1.id $v1
+
+    $failure = [ordered]@{} + $base
+    $failure.schemaVersion = 'devbridge-test-recipe/v2'
+    $failure.id = 'behavioral-assertion-failure'
+    $failure.operations = @(
+        $successOperations[0]
+        [ordered]@{
+            tool = 'rimworld/inspect_fixture'
+            arguments = [ordered]@{}
+            expect = [ordered]@{
+                success = $true
+                assertions = @([ordered]@{ pointer = '/value'; equals = 'not-the-value' })
+            }
+        }
+    )
+    Write-TestRecipe $Fixture.Root $failure.id $failure
+}
+
 function New-Fixture {
     param([Parameter(Mandatory = $true)][string]$Name,
         [string]$ScenarioName = 'ready-immediately',
@@ -71,6 +158,8 @@ function New-Fixture {
     $runtime = Join-Path $root 'Runtime'
     $modsRoot = Join-Path $root 'InstalledMods'
     $logPath = Join-Path $root 'Player.log'
+    $readyGatePath = Join-Path $runtime 'ready.gate'
+    $readyWaitingPath = $readyGatePath + '.waiting'
     New-Item -ItemType Directory -Force -Path $runtime, $modsRoot | Out-Null
 
     foreach ($packageId in $alwaysOnPackages) {
@@ -94,6 +183,10 @@ $activeMods
     foreach ($key in $ScenarioOverrides.Keys) {
         $scenario[$key] = $ScenarioOverrides[$key]
     }
+    if ($ScenarioName -eq 'ready-delayed' -and -not $scenario.Contains('readyGatePath')) {
+        $scenario['readyGatePath'] = $readyGatePath
+        $scenario['readyWaitingPath'] = $readyWaitingPath
+    }
     Write-Utf8File (Join-Path $runtime 'fake-rimworld-scenario.json') (($scenario | ConvertTo-Json -Depth 8))
 
     $recipesSource = Join-Path $repoRoot 'TestRecipes'
@@ -109,14 +202,119 @@ $activeMods
     $env:DEVBRIDGE_RIMBRIDGE_MODE = $RimBridgeMode
     $env:DEVBRIDGE_AGENT = 'process-e2e'
 
-    return [pscustomobject]@{
+    $fixture = [pscustomobject]@{
         Name = $Name
+        ScenarioName = $ScenarioName
         Root = $root
         Runtime = $runtime
         Slot = $slot
         LogPath = $logPath
         ScenarioPath = Join-Path $runtime 'fake-rimworld-scenario.json'
+        ReadyGatePath = $readyGatePath
+        ReadyWaitingPath = $readyWaitingPath
         FakeExecutable = $fakeExe
+        LastResponseBeforeCleanup = $null
+    }
+    $script:CurrentFixture = $fixture
+    return $fixture
+}
+
+function Limit-DiagnosticText {
+    param([AllowEmptyString()][string]$Text,
+        [int]$Limit = $diagnosticTextLimit)
+    if ([string]::IsNullOrEmpty($Text)) { return '<empty>' }
+    $normalized = $Text.Trim()
+    if ($normalized.Length -le $Limit) { return $normalized }
+    return $normalized.Substring(0, $Limit) + "`n...[truncated to $Limit characters]"
+}
+
+function Format-Command {
+    param([Parameter(Mandatory = $true)][string[]]$Arguments)
+    return (($Arguments | ForEach-Object {
+        $value = [string]$_
+        if ($value -match '[\s"]') { '"' + $value.Replace('"', '\"') + '"' } else { $value }
+    }) -join ' ')
+}
+
+function Get-DiagnosticArtifactPaths {
+    param([Parameter(Mandatory = $true)][string]$Root)
+    $runtime = Join-Path $Root 'Runtime'
+    $paths = [System.Collections.Generic.List[string]]::new()
+    foreach ($path in @(
+        $Root,
+        $runtime,
+        (Join-Path $runtime 'coordinator-events.jsonl'),
+        (Join-Path $runtime 'state.json'),
+        (Join-Path $runtime 'readiness.json'),
+        (Join-Path $runtime 'quicktest-failure.json'),
+        (Join-Path $Root 'Player.log'),
+        (Join-Path $Root 'ModsConfig.xml')
+    )) {
+        $paths.Add([IO.Path]::GetFullPath($path))
+    }
+    if (Test-Path -LiteralPath $runtime -PathType Container) {
+        Get-ChildItem -LiteralPath $runtime -Filter 'e2e-result-*.json' -File -ErrorAction SilentlyContinue |
+            ForEach-Object { $paths.Add($_.FullName) }
+    }
+    return @($paths | Select-Object -Unique)
+}
+
+function Get-DiagnosticArtifactText {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    try {
+        return Limit-DiagnosticText ([IO.File]::ReadAllText($Path))
+    } catch {
+        return "<could not read: $($_.Exception.Message)>"
+    }
+}
+
+function Format-BridgeFailure {
+    param([Parameter(Mandatory = $true)][string]$Scenario,
+        [string]$HostScenario,
+        [Parameter(Mandatory = $true)][string]$Stage,
+        [Parameter(Mandatory = $true)][string]$ExceptionMessage,
+        $Response,
+        [Parameter(Mandatory = $true)][string]$Root)
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add("scenario: $Scenario")
+    if (-not [string]::IsNullOrWhiteSpace($HostScenario)) {
+        $lines.Add("fake host scenario: $HostScenario")
+    }
+    $lines.Add("stage: $Stage")
+    $lines.Add("exception: $(Limit-DiagnosticText $ExceptionMessage)")
+    if ($null -ne $Response) {
+        $lines.Add("command: $($Response.Command)")
+        $lines.Add("exit code: $($Response.ExitCode)")
+        $lines.Add("result path: $($Response.ResultPath)")
+        $lines.Add("result: $(Limit-DiagnosticText ([string]$Response.Output))")
+        $lines.Add("child stdout: $(Limit-DiagnosticText ([string]$Response.Stdout))")
+        $lines.Add("child stderr: $(Limit-DiagnosticText ([string]$Response.Stderr))")
+    }
+    $lines.Add('runtime artifacts:')
+    foreach ($path in @(Get-DiagnosticArtifactPaths $Root)) {
+        $lines.Add("- $path")
+        $artifactText = Get-DiagnosticArtifactText $path
+        if ($null -ne $artifactText) {
+            $lines.Add("  bounded contents: $artifactText")
+        }
+        elseif (-not (Test-Path -LiteralPath $path)) {
+            $lines.Add('  status: missing')
+        }
+    }
+    return ($lines -join "`n")
+}
+
+function Read-BoundedProcessStream {
+    param([Parameter(Mandatory = $true)]$Task,
+        [Parameter(Mandatory = $true)][string]$Name)
+    try {
+        if (-not $Task.Wait(2000)) {
+            return "<$Name stream did not close within 2000 ms>"
+        }
+        return [string]$Task.GetAwaiter().GetResult()
+    } catch {
+        return "<$Name read failed: $($_.Exception.Message)>"
     }
 }
 
@@ -148,22 +346,46 @@ function Invoke-Bridge {
     $start.RedirectStandardError = $true
     $start.Environment['DEVBRIDGE_TEST_RESULT_FILE'] = $resultPath
     foreach ($argument in $cliArguments) { [void]$start.ArgumentList.Add([string]$argument) }
+    $command = Format-Command (@($start.FileName) + $cliArguments)
     $process = [System.Diagnostics.Process]::Start($start)
     $stdoutDrain = $process.StandardOutput.ReadToEndAsync()
     $stderrDrain = $process.StandardError.ReadToEndAsync()
-    if (-not $process.WaitForExit(65000)) {
-        try { $process.Kill() } catch { }
-        throw "CLI command timed out: $($Arguments -join ' ')"
+    $timedOut = -not $process.WaitForExit(65000)
+    if ($timedOut) {
+        try { $process.Kill($true) } catch { try { $process.Kill() } catch { } }
+        try { $process.WaitForExit(5000) } catch { }
     }
-    $exitCode = $process.ExitCode
+    $exitCode = if ($timedOut) { 'TIMEOUT' } else { $process.ExitCode }
+    $stdout = Read-BoundedProcessStream $stdoutDrain 'stdout'
+    $stderr = Read-BoundedProcessStream $stderrDrain 'stderr'
     $process.Dispose()
     $output = if (Test-Path -LiteralPath $resultPath) {
         [System.IO.File]::ReadAllText($resultPath).Trim()
     } else { '' }
-    Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue
     $json = $null
     try { $json = Get-JsonResponse -Text $output } catch { }
-    return [pscustomobject]@{ Output = $output; ExitCode = $exitCode; Json = $json }
+    $response = [pscustomobject]@{
+        Command = $command
+        Output = $output
+        Stdout = $stdout
+        Stderr = $stderr
+        ExitCode = $exitCode
+        Json = $json
+        ResultPath = $resultPath
+        Stage = $null
+    }
+    $failed = $timedOut -or $exitCode -ne 0 -or $null -eq $json -or
+        (($json.PSObject.Properties.Name -contains 'success') -and -not [bool]$json.success)
+    if (-not $failed) {
+        Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue
+    }
+    $script:LastBridgeResponse = $response
+    if ($timedOut) {
+        throw (Format-BridgeFailure -Scenario $script:CurrentFixture.Name `
+            -HostScenario $script:CurrentFixture.ScenarioName -Stage 'CLI timeout' `
+            -ExceptionMessage 'CLI command timed out after 65000 ms.' -Response $response -Root $Root)
+    }
+    return $response
 }
 
 function Assert-Success {
@@ -172,6 +394,7 @@ function Assert-Success {
     if ($Response.ExitCode -ne 0 -or $null -eq $Response.Json -or
         ($Response.Json.PSObject.Properties.Name -contains 'success' -and
             -not [bool]$Response.Json.success)) {
+        $Response.Stage = $Context
         throw "$Context failed (exit $($Response.ExitCode)): $($Response.Output)"
     }
 }
@@ -198,6 +421,16 @@ function Wait-GameState {
     throw "Timed out waiting for gameState=$Expected."
 }
 
+function Wait-File {
+    param([Parameter(Mandatory = $true)][string]$Path, [int]$TimeoutMs = 5000)
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    do {
+        if (Test-Path -LiteralPath $Path -PathType Leaf) { return }
+        Start-Sleep -Milliseconds 25
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Timed out waiting for synchronization file: $Path"
+}
+
 function Get-FakePid {
     param([Parameter(Mandatory = $true)]$Status)
     $processId = [int]$Status.rimworldPid
@@ -211,6 +444,22 @@ function Start-Ready {
     Assert-Success $response 'restart'
     $ready = Wait-GameState $Fixture 'READY'
     return $ready
+}
+
+function Begin-TestLease {
+    param([Parameter(Mandatory = $true)]$Fixture)
+    $response = Invoke-Bridge -Root $Fixture.Root -Slot $Fixture.Slot -Arguments @('test', 'begin')
+    Assert-Success $response 'test begin'
+    $leaseId = [string]$response.Json.leaseId
+    if ([string]::IsNullOrWhiteSpace($leaseId)) { throw 'test begin returned no leaseId.' }
+    return $leaseId
+}
+
+function End-TestLease {
+    param([Parameter(Mandatory = $true)]$Fixture,
+        [Parameter(Mandatory = $true)][string]$LeaseId)
+    $response = Invoke-Bridge -Root $Fixture.Root -Slot $Fixture.Slot -Arguments @('test', 'end', $LeaseId)
+    Assert-Success $response 'test end'
 }
 
 function Stop-Ready {
@@ -232,6 +481,7 @@ function Shutdown-Coordinator {
 
 function Remove-Fixture {
     param([Parameter(Mandatory = $true)]$Fixture)
+    $Fixture.LastResponseBeforeCleanup = $script:LastBridgeResponse
     $processId = 0
     try {
         $status = Get-Status $Fixture
@@ -243,22 +493,54 @@ function Remove-Fixture {
     if ($processId -gt 0) {
         Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
     }
-    Remove-Item -LiteralPath $Fixture.Root -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+function Complete-Fixture {
+    param([Parameter(Mandatory = $true)]$Fixture,
+        [Parameter(Mandatory = $true)][bool]$Preserve)
+    if (-not $Preserve -and -not $KeepRoots) {
+        Remove-Item -LiteralPath $Fixture.Root -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Invoke-Case {
     param([Parameter(Mandatory = $true)][string]$Name,
         [Parameter(Mandatory = $true)][scriptblock]$Body)
     $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $script:CurrentFixture = $null
+    $script:LastBridgeResponse = $null
     try {
         & $Body
         $timer.Stop()
+        if ($null -ne $script:CurrentFixture) {
+            Complete-Fixture $script:CurrentFixture $false
+        }
         Write-Host ("PASS {0} ({1} ms)" -f $Name, $timer.ElapsedMilliseconds)
         return [pscustomobject]@{ Name = $Name; Passed = $true; DurationMs = $timer.ElapsedMilliseconds; Error = $null }
     } catch {
         $timer.Stop()
-        Write-Host ("FAIL {0} ({1} ms): {2}" -f $Name, $timer.ElapsedMilliseconds, $_.Exception.Message)
-        return [pscustomobject]@{ Name = $Name; Passed = $false; DurationMs = $timer.ElapsedMilliseconds; Error = $_.Exception.Message }
+        $fixture = $script:CurrentFixture
+        $response = if ($null -ne $fixture -and $null -ne $fixture.LastResponseBeforeCleanup) {
+            $fixture.LastResponseBeforeCleanup
+        } else { $script:LastBridgeResponse }
+        $stage = if ($null -ne $response -and -not [string]::IsNullOrWhiteSpace([string]$response.Stage)) {
+            [string]$response.Stage
+        } else { 'scenario assertion' }
+        $root = if ($null -ne $fixture) { $fixture.Root } else { $repoRoot }
+        $hostScenario = if ($null -ne $fixture) { $fixture.ScenarioName } else { $null }
+        $report = Format-BridgeFailure -Scenario $Name -HostScenario $hostScenario -Stage $stage `
+            -ExceptionMessage $_.Exception.Message -Response $response -Root $root
+        if ($null -ne $fixture) {
+            Complete-Fixture $fixture $true
+        }
+        Write-Host ("FAIL {0} ({1} ms):`n{2}" -f $Name, $timer.ElapsedMilliseconds, $report)
+        return [pscustomobject]@{
+            Name = $Name
+            Passed = $false
+            DurationMs = $timer.ElapsedMilliseconds
+            Error = $report
+            ArtifactPaths = @(Get-DiagnosticArtifactPaths $root)
+        }
     }
 }
 
@@ -337,13 +619,20 @@ $results.Add((Invoke-Case 'delayed readiness is observable through agent wait-ev
         $restart = Start-Process -FilePath $coordinatorExe -ArgumentList @('--root', $fixture.Root,
             '--runtime-slot', $fixture.Slot, 'restart', '--projects', 'none', '--json') -PassThru -WindowStyle Hidden
         try {
-            Start-Sleep -Milliseconds 100
+            Wait-File $fixture.ReadyWaitingPath
             $cursor = Invoke-Bridge -Root $fixture.Root -Slot $fixture.Slot -Arguments @('agent', 'snapshot')
-            Assert-Success $cursor 'agent snapshot'
+            Assert-Success $cursor 'agent snapshot before readiness release'
+            $cursorSequence = [int64]$cursor.Json.sequence
+            $cursorEpoch = [string]$cursor.Json.epoch
+            New-Item -ItemType File -Force -Path $fixture.ReadyGatePath | Out-Null
             $event = Invoke-Bridge -Root $fixture.Root -Slot $fixture.Slot -Arguments @(
-                'agent', 'wait-event', '--since-seq', [string]$cursor.Json.sequence,
-                '--epoch', [string]$cursor.Json.epoch, '--until', 'ready', '--timeout-ms', '3000')
+                'agent', 'wait-event', '--since-seq', [string]$cursorSequence,
+                '--epoch', $cursorEpoch, '--until', 'ready', '--timeout-ms', '3000')
             Assert-Success $event 'agent wait-event'
+            if ([string]$event.Json.result -ne 'condition-met' -or
+                [int64]$event.Json.toSeq -le $cursorSequence) {
+                throw "Agent wait-event did not observe a later ready transition: $($event.Output)"
+            }
         } finally {
             Wait-Process -Id $restart.Id -Timeout 5 -ErrorAction SilentlyContinue
         }
@@ -379,6 +668,113 @@ $results.Add((Invoke-Case 'quicktest recipe succeeds through process IPC' {
         $response = Invoke-Bridge -Root $fixture.Root -Slot $fixture.Slot -Arguments @(
             'test', 'recipe', 'run', 'quicktest-smoke')
         Assert-Success $response 'quicktest recipe'
+    } finally { Remove-Fixture $fixture }
+}))
+
+$results.Add((Invoke-Case 'v1 read-only recipe remains compatible' {
+    $fixture = New-Fixture 'recipe-v1-readonly' -RimBridgeMode required
+    try {
+        Add-BehavioralRecipes $fixture
+        $response = Invoke-Bridge -Root $fixture.Root -Slot $fixture.Slot -Arguments @(
+            'test', 'recipe', 'run', 'v1-readonly-fixture')
+        Assert-Success $response 'v1 read-only recipe'
+        if ($response.Json.operations.Count -ne 1 -or
+            $response.Json.operations[0].PSObject.Properties.Name -contains 'expectedSuccess') {
+            throw "v1 recipe result changed its read-only contract: $($response.Output)"
+        }
+    } finally { Remove-Fixture $fixture }
+}))
+
+$results.Add((Invoke-Case 'v2 authorized mutation and structured assertion succeed' {
+    $fixture = New-Fixture 'recipe-behavioral' -RimBridgeMode required
+    try {
+        Add-BehavioralRecipes $fixture
+        $response = Invoke-Bridge -Root $fixture.Root -Slot $fixture.Slot -Arguments @(
+            'test', 'recipe', 'run', 'behavioral-fixture')
+        Assert-Success $response 'v2 behavioral recipe'
+        if ([string]::IsNullOrWhiteSpace([string]$response.Json.leaseId) -or
+            $response.Json.operations.Count -ne 2 -or
+            [string]$response.Json.operations[0].result.value -ne 'behavioral-ready' -or
+            [int]$response.Json.operations[1].result.mutationCount -le 0 -or
+            $response.Json.operations[0].assertions.Count -ne 2) {
+            throw "v2 behavioral result was not structured as expected: $($response.Output)"
+        }
+    } finally { Remove-Fixture $fixture }
+}))
+
+$results.Add((Invoke-Case 'failed v2 assertion is stable and repeated failure short-circuits' {
+    $fixture = New-Fixture 'recipe-behavioral-repeat' -RimBridgeMode required
+    try {
+        Add-BehavioralRecipes $fixture
+        $first = Invoke-Bridge -Root $fixture.Root -Slot $fixture.Slot -Arguments @(
+            'test', 'recipe', 'run', 'behavioral-assertion-failure')
+        if ($first.ExitCode -eq 0 -or [string]$first.Json.errorCode -ne 'RECIPE_ASSERTION_FAILED' -or
+            [string]::IsNullOrWhiteSpace([string]$first.Json.failureFingerprint)) {
+            throw "Failed assertion did not produce normalized evidence: $($first.Output)"
+        }
+        $second = Invoke-Bridge -Root $fixture.Root -Slot $fixture.Slot -Arguments @(
+            'test', 'recipe', 'run', 'behavioral-assertion-failure')
+        if ([string]$second.Json.errorCode -ne 'AUTONOMOUS_REPEATED_FAILURE') {
+            throw "Repeated assertion failure was not short-circuited: $($second.Output)"
+        }
+    } finally { Remove-Fixture $fixture }
+}))
+
+$results.Add((Invoke-Case 'recipe planning does not execute behavioral mutation' {
+    $fixture = New-Fixture 'recipe-behavioral-plan' -RimBridgeMode required
+    $leaseId = $null
+    try {
+        Add-BehavioralRecipes $fixture
+        $plan = Invoke-Bridge -Root $fixture.Root -Slot $fixture.Slot -Arguments @(
+            'test', 'recipe', 'plan', 'behavioral-fixture')
+        Assert-Success $plan 'behavioral recipe plan'
+        if ([int]$plan.Json.estimatedRimWorldLaunches -ne 1) {
+            throw "Behavioral plan did not report its bounded launch estimate: $($plan.Output)"
+        }
+        $status = Start-Ready $fixture
+        $leaseId = Begin-TestLease $fixture
+        $observed = Invoke-Bridge -Root $fixture.Root -Slot $fixture.Slot -Arguments @(
+            'bridge', 'call', 'rimworld/inspect_fixture', '{}', '--lease', $leaseId)
+        Assert-Success $observed 'post-plan observation'
+        if ([int]$observed.Json.result.mutationCount -ne 0) {
+            throw "Recipe planning executed an in-game mutation: $($observed.Output)"
+        }
+    } finally {
+        if ($null -ne $leaseId) { try { End-TestLease $fixture $leaseId } catch { } }
+        Remove-Fixture $fixture
+    }
+}))
+
+$results.Add((Invoke-Case 'in-game mutation without a valid lease is blocked' {
+    $fixture = New-Fixture 'recipe-mutation-lease' -RimBridgeMode required
+    try {
+        Start-Ready $fixture | Out-Null
+        $response = Invoke-Bridge -Root $fixture.Root -Slot $fixture.Slot -Arguments @(
+            'bridge', 'call', 'rimworld/fixture_mutate', '{"value":"unauthorized"}')
+        if ($response.ExitCode -eq 0 -or [string]$response.Json.errorCode -ne 'RIMBRIDGE_LEASE_REQUIRED') {
+            throw "Unleased in-game mutation was not blocked: $($response.Output)"
+        }
+        $invalid = Invoke-Bridge -Root $fixture.Root -Slot $fixture.Slot -Arguments @(
+            'bridge', 'call', 'rimworld/fixture_mutate', '{"value":"invalid"}',
+            '--lease', 'not-a-valid-lease')
+        if ($invalid.ExitCode -eq 0 -or [string]$invalid.Json.errorCode -ne 'RIMBRIDGE_LEASE_REQUIRED') {
+            throw "In-game mutation with an invalid lease was not blocked: $($invalid.Output)"
+        }
+    } finally { Remove-Fixture $fixture }
+}))
+
+$results.Add((Invoke-Case 'profile and lifecycle recipe mutation remain blocked' {
+    $fixture = New-Fixture 'recipe-ownership-boundary' -RimBridgeMode required
+    try {
+        Start-Ready $fixture | Out-Null
+        foreach ($tool in @('rimworld/set_mod_enabled', 'rimworld/restart')) {
+            $response = Invoke-Bridge -Root $fixture.Root -Slot $fixture.Slot -Arguments @(
+                'bridge', 'call', $tool, '{}')
+            if ($response.ExitCode -eq 0 -or
+                [string]$response.Json.errorCode -ne 'RIMBRIDGE_OPERATION_BLOCKED_BY_DEVBRIDGE_POLICY') {
+                throw "Ownership boundary allowed $($tool): $($response.Output)"
+            }
+        }
     } finally { Remove-Fixture $fixture }
 }))
 
@@ -508,6 +904,140 @@ $results.Add((Invoke-Case 'coordinator-only refresh leaves fake child running' {
     } finally { Remove-Fixture $fixture }
 }))
 
+$results.Add((Invoke-Case 'bounded mod build deploy run test transaction' {
+    $fixture = New-Fixture 'mod-test-transaction' -RimBridgeMode off
+    $transactionRoot = Join-Path $fixture.Root 'ManagedMod'
+    $descriptorPath = Join-Path $fixture.Root 'mod-development.json'
+    try {
+        New-Item -ItemType Directory -Force -Path (Join-Path $fixture.Root 'InstalledMods\lan.frontier\About') | Out-Null
+        Write-Utf8File (Join-Path $fixture.Root 'InstalledMods\lan.frontier\About\About.xml') @'
+<ModMetaData><name>Frontier fixture</name><packageId>lan.frontier</packageId><supportedVersions><li>1.6</li></supportedVersions></ModMetaData>
+'@
+        New-Item -ItemType Directory -Force -Path (Join-Path $transactionRoot '1.6\Assemblies') | Out-Null
+        Write-Utf8File $descriptorPath @'
+{
+  "schemaVersion": "devbridge-mod-development/v1",
+  "project": "frontier",
+  "sourceProject": "TestSupport/ModDevelopmentFixture/DevBridge.ModFixture.csproj",
+  "configuration": "Release",
+  "expectedAssembly": "DevBridge.ModFixture.dll",
+  "deploymentTarget": "1.6/Assemblies/DevBridge.ModFixture.dll",
+  "testRecipe": "mod-development-smoke"
+}
+'@
+        $transactionScript = Join-Path $repoRoot 'scripts\mod-test.ps1'
+        $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $transactionScript,
+            '-Project', 'frontier', '-DescriptorPath', $descriptorPath,
+            '-DevelopmentRoot', $repoRoot, '-DeploymentRoot', $transactionRoot,
+            '-CoordinatorRoot', $fixture.Root, '-RuntimeSlot', $fixture.Slot, '-Json')
+        $output = & pwsh @arguments 2>&1 | Out-String
+        $exitCode = $LASTEXITCODE
+        $report = Get-JsonResponse $output
+        if ($exitCode -ne 0 -or -not [bool]$report.success) {
+            throw "mod-test transaction failed (exit $exitCode): $output"
+        }
+        if ([bool]$report.deployment.changed -ne $true -or
+            [string]$report.deployment.stagedSha256 -ne [string]$report.deployment.deployedSha256After -or
+            -not [bool]$report.cleanup.leaseReleased -or
+            -not [bool]$report.cleanup.registrationReleased) {
+            throw "mod-test did not report hash-verified deployment and owned cleanup: $output"
+        }
+        $secondOutput = & pwsh @arguments 2>&1 | Out-String
+        $secondExitCode = $LASTEXITCODE
+        $second = Get-JsonResponse $secondOutput
+        if ($secondExitCode -ne 0 -or -not [bool]$second.success -or [bool]$second.deployment.changed) {
+            throw "identical mod-test transaction was not a no-op: $secondOutput"
+        }
+
+        $suppliedLeaseId = Begin-TestLease $fixture
+        try {
+            $suppliedArguments = @($arguments) + @('-LeaseId', $suppliedLeaseId)
+            $suppliedOutput = & pwsh @suppliedArguments 2>&1 | Out-String
+            $suppliedExitCode = $LASTEXITCODE
+            $supplied = Get-JsonResponse $suppliedOutput
+            if ($suppliedExitCode -ne 0 -or -not [bool]$supplied.success -or
+                [string]$supplied.runtime.leaseId -ne $suppliedLeaseId -or
+                [bool]$supplied.cleanup.leaseReleased) {
+                throw "caller-held lease was not reused without automatic ending: $suppliedOutput"
+            }
+        } finally {
+            End-TestLease $fixture $suppliedLeaseId
+        }
+
+        $deploymentTarget = Join-Path $transactionRoot '1.6\Assemblies\DevBridge.ModFixture.dll'
+        Write-Utf8File $deploymentTarget 'stale deployed assembly'
+        $deploymentLock = [IO.File]::Open($deploymentTarget, [IO.FileMode]::Open,
+            [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        try {
+            $lockedOutput = & pwsh @arguments 2>&1 | Out-String
+            $lockedExitCode = $LASTEXITCODE
+            $locked = Get-JsonResponse $lockedOutput
+            if ($lockedExitCode -eq 0 -or [string]$locked.stage -ne 'deployment' -or
+                -not [bool]$locked.runtime.maintenanceReady -or
+                -not [bool]$locked.cleanup.deferred) {
+                throw "locked deployment did not preserve confirmed maintenance ownership: $lockedOutput"
+            }
+            $lockedStatus = Get-Status $fixture
+            if ([string]$lockedStatus.gameState -ne 'STOPPED' -or
+                [int]$lockedStatus.rimworldPid -ne 0 -or
+                -not [bool]$lockedStatus.maintenanceReady) {
+                throw "failed deployment launched or lost maintenance state: $($lockedStatus | ConvertTo-Json -Compress)"
+            }
+        } finally {
+            $deploymentLock.Dispose()
+        }
+
+        $cleanupAgent = [Environment]::GetEnvironmentVariable('DEVBRIDGE_AGENT', 'Process')
+        $cleanupSession = [Environment]::GetEnvironmentVariable('DEVBRIDGE_SESSION', 'Process')
+        try {
+            $env:DEVBRIDGE_AGENT = 'mod-test-' + [string]$locked.transactionId
+            $env:DEVBRIDGE_SESSION = 'mod-test-' + [string]$locked.transactionId
+            End-TestLease $fixture ([string]$locked.runtime.leaseId)
+            $release = Invoke-Bridge -Root $fixture.Root -Slot $fixture.Slot -Arguments @(
+                'project', 'release', [string]$locked.runtime.registrationId)
+            Assert-Success $release 'failed deployment registration cleanup'
+        } finally {
+            $env:DEVBRIDGE_AGENT = $cleanupAgent
+            $env:DEVBRIDGE_SESSION = $cleanupSession
+        }
+
+        $badProjectRoot = Join-Path $fixture.Root 'FailingBuild'
+        New-Item -ItemType Directory -Force -Path $badProjectRoot | Out-Null
+        $badProject = Join-Path $badProjectRoot 'FailingBuild.csproj'
+        Write-Utf8File $badProject @'
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup><Compile Include="FailingBuild.cs" /></ItemGroup>
+</Project>
+'@
+        Write-Utf8File (Join-Path $badProjectRoot 'FailingBuild.cs') 'public static class FailingBuild {'
+        $badDescriptor = Join-Path $fixture.Root 'bad-mod-development.json'
+        $badSourceProject = [System.IO.Path]::GetRelativePath($repoRoot, $badProject).Replace('\', '/')
+        $badDescriptorData = [ordered]@{
+            schemaVersion = 'devbridge-mod-development/v1'
+            project = 'frontier'
+            sourceProject = $badSourceProject
+            configuration = 'Release'
+            expectedAssembly = 'FailingBuild.dll'
+            deploymentTarget = '1.6/Assemblies/FailingBuild.dll'
+            testRecipe = 'mod-development-smoke'
+        }
+        Write-Utf8File $badDescriptor ($badDescriptorData | ConvertTo-Json -Depth 4)
+        $badOutput = & pwsh @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $transactionScript,
+            '-Project', 'frontier', '-DescriptorPath', $badDescriptor,
+            '-DevelopmentRoot', $repoRoot, '-DeploymentRoot', $transactionRoot,
+            '-CoordinatorRoot', $fixture.Root, '-RuntimeSlot', $fixture.Slot, '-Json') 2>&1 | Out-String
+        if ($LASTEXITCODE -eq 0) { throw "invalid build unexpectedly succeeded: $badOutput" }
+        $bad = Get-JsonResponse $badOutput
+        if ([string]$bad.stage -ne 'build' -or [string]$bad.failure.errorCode -ne 'DEVELOPMENT_BUILD_FAILED') {
+            throw "failed build did not fail before lifecycle work: $badOutput"
+        }
+    } finally { Remove-Fixture $fixture }
+}))
+
 $planJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repoRoot 'scripts\dev-plan.ps1') `
     -ChangedFiles 'Source/Mod/IntegrationMarker.cs' -Json 2>&1 | Out-String
 if ($LASTEXITCODE -ne 0) { throw "Development plan command failed: $planJson" }
@@ -524,7 +1054,10 @@ Write-Host "PROCESS E2E: $passed passed, $failed failed, $duration ms total, 0 r
 Write-Host ("Scenarios: " + (($results | ForEach-Object Name) -join ', '))
 
 if ($failed -gt 0) {
-    throw "Process-level E2E failed: $failed scenario(s)."
+    $failureSummary = ($results | Where-Object { -not $_.Passed } | ForEach-Object {
+        "[$($_.Name)] artifacts: $($_.ArtifactPaths -join ', ')"
+    }) -join "`n"
+    throw "Process-level E2E failed: $failed scenario(s).`n$failureSummary"
 }
 
 if (-not $KeepRoots) {

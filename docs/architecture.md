@@ -70,15 +70,41 @@ request and one terminal response, regardless of how long it remains pending; th
 written until a matching change, condition, timeout, shutdown, or disconnect occurs. Both use the existing
 IPC v2 frame limits; the agent projection is deliberately much smaller than the legacy response.
 
-Autonomous test recipes are repository-owned files under `TestRecipes/`. Each file uses the
-`devbridge-test-recipe/v1` schema and is parsed by a strict allow-list: project aliases, typed
-generation inputs, readiness/Quicktest and companion evidence requirements, bounded budgets, and
-policy-approved read-only RimBridge calls. Shell commands, arbitrary argv or environment values,
+Autonomous test recipes are repository-owned files under `TestRecipes/`. `devbridge-test-recipe/v1`
+retains its strict read-only contract: project aliases, typed generation inputs, readiness/Quicktest
+and companion evidence requirements, bounded budgets, and policy-approved read-only RimBridge calls.
+V1 does not acquire a new mutation meaning. Shell commands, arbitrary argv or environment values,
 filesystem writes, profile mutation, and RimWorld lifecycle tools are not recipe concepts. Discovery
 uses `test recipe list|show|plan`; `agent plan --recipe <id>` returns the versioned
 `devbridge-agent-plan/v1` projection without acquiring a lease, registering intent, saving state,
 restarting, writing ModsConfig, or calling RimBridge. The planner reuses project/profile resolution
 and frozen-generation evidence, so an already-satisfied recipe reports zero estimated launches.
+
+`devbridge-test-recipe/v2` adds a deliberately smaller behavioral-fixture contract. A recipe must set
+`allowInGameMutation: true` before it may include policy-classified in-game tools, and each operation
+may declare expected success plus bounded JSON-pointer assertions (`exists`, scalar `equals`,
+`greaterThan`, or `lessThan`). For example:
+
+```json
+{
+  "schemaVersion": "devbridge-test-recipe/v2",
+  "id": "fixture-smoke",
+  "allowInGameMutation": true,
+  "requiresReady": true,
+  "operations": [
+    { "tool": "rimworld/fixture_mutate", "arguments": { "value": "ok" },
+      "expect": { "success": true, "assertions": [
+        { "pointer": "/value", "equals": "ok" }
+      ] } }
+  ]
+}
+```
+
+Every routed operation still passes the normal RimBridge generation, process, endpoint, policy, and
+lease checks. Behavioral recipes may mutate only temporary in-game test state under a valid DevBridge
+lease; profile/ModsConfig and RimWorld lifecycle mutation remain unconditionally DevBridge-owned and
+are rejected. Plans remain mutation-free, budgets bound time, operations, launches, attempts, refreshes,
+and repeated failures, and credentials are never stored in recipes or evidence.
 
 `test recipe run <id>` is a bounded coordinator operation. Caller timeout, launch, attempt, refresh,
 and repeated-failure limits are intersected with stricter coordinator limits. A run joins compatible
@@ -124,6 +150,13 @@ launch identity, process evidence, and readiness evidence. Generation numbers ne
 history and manifests are immutable evidence; later STOPPED or failure records do not rewrite a
 completed accepted generation. A replacement launch cannot silently consume another owner's lease or
 replenish a finite launch/isolation budget.
+
+For a deterministic configuration-versus-failure investigation, use `history`, then
+`history diagnose <failed-generation>`. The diagnosis compares the failed generation with the nearest
+prior valid READY generation and attaches only bounded normalized evidence. Follow an evidence reference
+with `evidence show <id>`, and use `logs query ...` when launch-bound log evidence is still available.
+The diff separates semantic profile/build changes from runtime identity changes such as PID and launch ID;
+it reports added packages as facts, not as proof of causality.
 
 ## Durable state and authority boundaries
 
@@ -194,6 +227,26 @@ build-plan --json` is a compact read-only projection of coordinator, mod, and
 BridgeTools disk identities, artifact hashes, and `requiredRefresh`; its
 `loadedStatus` is `unknown-not-proven` for externally loaded mod/companion code.
 Git, build, and deployment decisions remain in PowerShell.
+
+For the normal rebuild-and-test workflow, use the bounded external transaction:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\mod-test.ps1 `
+  -Project frontier -DescriptorPath .\DevelopmentProjects\frontier.json `
+  -DevelopmentRoot . -DeploymentRoot . `
+  -CoordinatorRoot <runtime-root> -Json
+```
+
+The `devbridge-mod-development/v1` descriptor contains only the project alias, source `.csproj`,
+`Debug`/`Release` configuration, expected assembly, deployment-relative path, and declared recipe.
+The transaction plans first, builds into bounded staging, compares SHA-256 bytes, then uses the
+existing project registration, lease, `stop`, deployment, `ensure-ready`, and recipe contracts. A
+caller may pass its complete `lease-<32 hex>` capability with `-LeaseId`; ownership is validated,
+never transferred, and never ended by the transaction. A byte-identical artifact with an already
+satisfied generation/recipe is a no-op. On uncertainty the report preserves maintenance ownership
+and gives a stable stage/next action; it never kills, restarts, edits ModsConfig, or rewrites a
+baseline. Lower-level `project`, `test`, `stop`, `ensure-ready`, `wait-ready`, and `status` commands
+remain the recovery and advanced-use interface.
 
 ## Process-level fake-host verification
 

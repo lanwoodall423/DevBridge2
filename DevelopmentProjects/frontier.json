@@ -1,0 +1,9 @@
+{
+  "schemaVersion": "devbridge-mod-development/v1",
+  "project": "frontier",
+  "sourceProject": "TestSupport/ModDevelopmentFixture/DevBridge.ModFixture.csproj",
+  "configuration": "Release",
+  "expectedAssembly": "DevBridge.ModFixture.dll",
+  "deploymentTarget": "TestSupport/ModDevelopmentFixture/deployed/1.6/Assemblies/DevBridge.ModFixture.dll",
+  "testRecipe": "mod-development-smoke"
+}

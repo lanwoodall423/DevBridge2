@@ -17,8 +17,10 @@ internal sealed partial class CoordinatorState
     internal int Execute(BridgeRequest request, Action<string> emit, Func<bool> connected)
     {
         request ??= new BridgeRequest();
-        using IDisposable traceScope = BeginTraceRequest(request);
-        TraceCommandStarted(request);
+        bool pureHistoryAnalysis = IsPureHistoryAnalysisRequest(request);
+        using IDisposable traceScope = pureHistoryAnalysis ? null : BeginTraceRequest(request);
+        if (!pureHistoryAnalysis)
+            TraceCommandStarted(request);
         int exitCode = -1;
         try
         {
@@ -27,8 +29,18 @@ internal sealed partial class CoordinatorState
         }
         finally
         {
-            TraceCommandCompleted(request, exitCode >= 0 ? exitCode : null);
+            if (!pureHistoryAnalysis)
+                TraceCommandCompleted(request, exitCode >= 0 ? exitCode : null);
         }
+    }
+
+    private static bool IsPureHistoryAnalysisRequest(BridgeRequest request)
+    {
+        if (!string.Equals(request?.Command, "history", StringComparison.OrdinalIgnoreCase))
+            return false;
+        string operation = request.Arguments?.FirstOrDefault();
+        return string.Equals(operation, "diff", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(operation, "diagnose", StringComparison.OrdinalIgnoreCase);
     }
 
     private int ExecuteCore(BridgeRequest request, Action<string> emit, Func<bool> connected)

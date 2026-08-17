@@ -97,6 +97,7 @@ internal sealed partial class CoordinatorState
         state.LaunchGeneration = target;
         state.ProcessId = 0;
         state.ProcessStartUtcTicks = 0;
+        state.OwnedProcessExecutablePath = null;
         state.LaunchProfileFingerprint = null;
         state.LaunchProfileInstalled = false;
         state.LaunchAttemptStarted = false;
@@ -158,6 +159,7 @@ internal sealed partial class CoordinatorState
         {
             int oldProcessId;
             long oldStartTicks;
+            bool allowCachedOwnershipProof;
             // Process-control operations remain serialized. The gate is intentionally
             // not taken by status, doctor, wait-ready, or lease cleanup, so those
             // commands remain responsive while this worker waits on a lease.
@@ -181,8 +183,32 @@ internal sealed partial class CoordinatorState
                             continue;
                         }
 
-                        bool ownedProcessRunning = state.ProcessId > 0 &&
-                            IsOwnedProcess(state.ProcessId, state.ProcessStartUtcTicks);
+                        bool ownedProcessRunning = false;
+                        if (state.ProcessId > 0)
+                        {
+                            bool cachedOwnershipProof = HasCachedOwnedProcessPathProofLocked(
+                                state.ProcessId, state.ProcessStartUtcTicks);
+                            if (cachedOwnershipProof)
+                            {
+                                ProcessOwnershipObservation observation =
+                                    InspectOwnedProcessForLifecycle(state.ProcessId,
+                                        state.ProcessStartUtcTicks, allowCachedPathProof: true);
+                                if (observation.Classification is
+                                    ProcessOwnershipClassification.IdentityMismatch or
+                                    ProcessOwnershipClassification.InspectionUnavailable)
+                                    throw ProcessInspection.Failure(observation.Stage);
+                                ownedProcessRunning = observation.Classification ==
+                                    ProcessOwnershipClassification.OwnedRunning;
+                            }
+                            else
+                            {
+                                // Legacy/unmigrated state has no durable static
+                                // install proof, so retain the original strict,
+                                // bounded full-identity preflight.
+                                ownedProcessRunning = IsOwnedProcess(state.ProcessId,
+                                    state.ProcessStartUtcTicks);
+                            }
+                        }
                         if (state.Leases.Count > 0 && ownedProcessRunning)
                         {
                             if (state.Phase != BridgePhase.WAITING_FOR_BRIDGE)
@@ -206,6 +232,8 @@ internal sealed partial class CoordinatorState
                         state.MaintenanceReady = false;
                         oldProcessId = state.ProcessId;
                         oldStartTicks = state.ProcessStartUtcTicks;
+                        allowCachedOwnershipProof = HasCachedOwnedProcessPathProofLocked(
+                            oldProcessId, oldStartTicks);
                         DeleteReadinessLocked();
                         DeleteQuicktestFailureArtifactLocked();
                         SaveStateLocked();
@@ -220,7 +248,8 @@ internal sealed partial class CoordinatorState
                 }
 
                 ThrowIfShutdownRequested();
-                (bool stopped, string stopErrorCode, string stopError) = StopOwnedProcess(oldProcessId, oldStartTicks);
+                (bool stopped, string stopErrorCode, string stopError) = StopOwnedProcess(
+                    oldProcessId, oldStartTicks, allowCachedOwnershipProof);
                 ThrowIfShutdownRequested();
                 if (!stopped)
                 {
@@ -306,6 +335,7 @@ internal sealed partial class CoordinatorState
                 // was durably recorded for this launch intent.
                 state.ProcessId = 0;
                 state.ProcessStartUtcTicks = 0;
+                state.OwnedProcessExecutablePath = null;
                 state.Error = null;
                 state.ErrorCode = null;
                 state.TerminalFailureSchemaVersion = 0;

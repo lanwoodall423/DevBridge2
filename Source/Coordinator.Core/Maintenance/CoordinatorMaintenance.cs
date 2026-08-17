@@ -95,6 +95,7 @@ internal sealed partial class CoordinatorState
                 state.Phase = BridgePhase.STOPPED;
                 state.ProcessId = 0;
                 state.ProcessStartUtcTicks = 0;
+                state.OwnedProcessExecutablePath = null;
                 state.MaintenanceReady = true;
                 state.SessionDirty = true;
                 state.Error = null;

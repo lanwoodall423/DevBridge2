@@ -32,6 +32,7 @@ internal static partial class OfflineTests
         Run("restart retains immediate launch behavior", TestImmediateRestart);
         Run("restart accepts an exact owned process at the exit-inspection boundary", TestRestartOwnedExitInspectionBoundary);
         Run("restart retries transient pre-termination process inspection", TestRestartRetriesTransientPreterminationInspection);
+        Run("restart preserves verified live ownership when path reinspection is unavailable", TestRestartPreservesVerifiedLiveOwnership);
         Run("launch monitoring retries transient process inspection failures", TestLaunchMonitoringRetriesTransientInspection);
         Run("matching late readiness repairs process inspection quarantine", TestInspectionQuarantineAcceptsMatchingReadiness);
         Run("duplicate stop is idempotent", TestDuplicateStop);
@@ -728,6 +729,7 @@ internal static partial class OfflineTests
         public int Id { get; }
         internal bool ThrowOnStartIdentity { get; set; }
         internal bool ThrowOnExecutablePath { get; set; }
+        internal string ExecutablePathOverride { get; set; }
         internal bool ThrowOnHasExited { get; set; }
         internal bool ReportExitedOnFirstHasExited { get; set; }
         internal bool InvalidateInspectionAfterExitObservation { get; set; }
@@ -744,7 +746,7 @@ internal static partial class OfflineTests
                     ExecutablePathFailuresRemaining--;
                     throw new InvalidOperationException("path unavailable");
                 }
-                return executablePath;
+                return ExecutablePathOverride ?? executablePath;
             }
         }
         public bool HasExited

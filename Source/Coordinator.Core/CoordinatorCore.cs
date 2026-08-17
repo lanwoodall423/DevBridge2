@@ -240,6 +240,11 @@ internal sealed class PersistedState
     public int LaunchGeneration { get; set; }
     public int ProcessId { get; set; }
     public long ProcessStartUtcTicks { get; set; }
+    // Established only after the process has passed the full executable and
+    // start-identity ownership check. During restart this static proof may
+    // survive a transient MainModule boundary, but PID/start identity and
+    // the replacement census are still revalidated independently.
+    public string OwnedProcessExecutablePath { get; set; }
     public DateTime LaunchStartedUtc { get; set; }
     public int TargetGeneration { get; set; }
     public bool RestartPending { get; set; }
@@ -953,11 +958,34 @@ internal sealed class ProcessEnumeration
     internal IReadOnlyList<IManagedProcess> Processes { get; init; } = Array.Empty<IManagedProcess>();
 }
 
+internal enum ProcessOwnershipClassification
+{
+    OwnedRunning,
+    OwnedExited,
+    Missing,
+    IdentityMismatch,
+    InspectionUnavailable
+}
+
+internal sealed class ProcessOwnershipObservation
+{
+    internal ProcessOwnershipClassification Classification { get; init; }
+    internal int ProcessId { get; init; }
+    internal string Stage { get; init; }
+    internal bool? ProcessIdMatch { get; init; }
+    internal bool? StartIdentityMatch { get; init; }
+    internal bool? ExecutableIdentityMatch { get; init; }
+    internal string OwnershipSource { get; init; }
+}
+
 internal sealed class ProcessInspectionException : Exception
 {
-    internal ProcessInspectionException() : base(ProcessInspection.Message)
+    internal ProcessInspectionException(string stage = null) : base(ProcessInspection.Message)
     {
+        Stage = string.IsNullOrWhiteSpace(stage) ? null : stage[..Math.Min(stage.Length, 64)];
     }
+
+    internal string Stage { get; }
 }
 
 internal static class ProcessInspection
@@ -965,7 +993,7 @@ internal static class ProcessInspection
     internal const string ErrorCode = "PROCESS_INSPECTION_AMBIGUOUS";
     internal const string Message = "RimWorld process inspection was incomplete; process state is ambiguous.";
 
-    internal static ProcessInspectionException Failure() => new();
+    internal static ProcessInspectionException Failure(string stage = null) => new(stage);
 }
 
 internal interface IProcessAdapter
@@ -1883,7 +1911,7 @@ internal sealed class SystemManagedProcess : IManagedProcess
         get
         {
             try { return process.Id; }
-            catch { throw ProcessInspection.Failure(); }
+            catch { throw ProcessInspection.Failure("process.id"); }
         }
     }
 
@@ -1897,7 +1925,7 @@ internal sealed class SystemManagedProcess : IManagedProcess
             {
                 string path = process.MainModule?.FileName;
                 if (string.IsNullOrWhiteSpace(path))
-                    throw ProcessInspection.Failure();
+                    throw ProcessInspection.Failure("process.main-module");
                 return path;
             }
             catch (ProcessInspectionException)
@@ -1906,7 +1934,7 @@ internal sealed class SystemManagedProcess : IManagedProcess
             }
             catch
             {
-                throw ProcessInspection.Failure();
+                throw ProcessInspection.Failure("process.main-module");
             }
         }
     }
@@ -1916,7 +1944,7 @@ internal sealed class SystemManagedProcess : IManagedProcess
         get
         {
             try { return process.HasExited; }
-            catch { throw ProcessInspection.Failure(); }
+            catch { throw ProcessInspection.Failure("process.has-exited"); }
         }
     }
 
@@ -1952,7 +1980,7 @@ internal sealed class SystemManagedProcess : IManagedProcess
         }
         catch
         {
-            throw ProcessInspection.Failure();
+            throw ProcessInspection.Failure("process.termination");
         }
     }
 
@@ -1970,7 +1998,7 @@ internal sealed class SystemManagedProcess : IManagedProcess
         }
         catch
         {
-            throw ProcessInspection.Failure();
+            throw ProcessInspection.Failure("process.wait-for-exit");
         }
     }
 
@@ -1989,7 +2017,7 @@ internal sealed class SystemManagedProcess : IManagedProcess
         }
         catch
         {
-            throw ProcessInspection.Failure();
+            throw ProcessInspection.Failure("process.force-terminate");
         }
     }
 
@@ -2001,7 +2029,7 @@ internal sealed class SystemManagedProcess : IManagedProcess
         {
             long ticks = process.StartTime.ToUniversalTime().Ticks;
             if (ticks <= 0)
-                throw ProcessInspection.Failure();
+                throw ProcessInspection.Failure("process.start-time");
             return ticks;
         }
         catch (ProcessInspectionException)
@@ -2010,7 +2038,7 @@ internal sealed class SystemManagedProcess : IManagedProcess
         }
         catch
         {
-            throw ProcessInspection.Failure();
+            throw ProcessInspection.Failure("process.start-time");
         }
     }
 }
@@ -2021,7 +2049,7 @@ internal sealed class SystemProcessAdapter : IProcessAdapter
     {
         try { return new SystemManagedProcess(Process.GetProcessById(processId)); }
         catch (ArgumentException) { return null; }
-        catch { throw ProcessInspection.Failure(); }
+        catch { throw ProcessInspection.Failure("process.open"); }
     }
 
     public ProcessEnumeration EnumerateRimWorld(string executablePath)

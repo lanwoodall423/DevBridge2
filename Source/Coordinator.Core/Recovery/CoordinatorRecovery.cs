@@ -587,6 +587,7 @@ internal sealed partial class CoordinatorState
             state.LaunchId = null;
             state.ProcessId = 0;
             state.ProcessStartUtcTicks = 0;
+            state.OwnedProcessExecutablePath = null;
             state.LaunchProfileFingerprint = profile.ProfileFingerprint;
             state.LaunchProfileInstalled = false;
             state.LaunchAttemptStarted = false;
@@ -645,6 +646,7 @@ internal sealed partial class CoordinatorState
         incident.CurrentAttemptProfileInstalled = false;
         state.ProcessId = 0;
         state.ProcessStartUtcTicks = 0;
+        state.OwnedProcessExecutablePath = null;
         state.LaunchId = null;
         state.LaunchProfileFingerprint = null;
         state.LaunchProfileInstalled = false;
@@ -1088,6 +1090,7 @@ internal sealed partial class CoordinatorState
         {
             state.ProcessId = 0;
             state.ProcessStartUtcTicks = 0;
+            state.OwnedProcessExecutablePath = null;
             state.LaunchId = null;
             state.LaunchProfileFingerprint = null;
             state.LaunchProfileInstalled = false;

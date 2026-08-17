@@ -142,7 +142,8 @@ internal sealed partial class CoordinatorState
         return exception.GetType().Name + ": " + exception.Message;
     }
 
-    private (bool success, string errorCode, string error) StopOwnedProcess(int processId, long startTicks)
+    private (bool success, string errorCode, string error) StopOwnedProcess(int processId,
+        long startTicks, bool allowCachedOwnershipProof = false)
     {
         if (processId <= 0)
             return (true, null, null);
@@ -180,7 +181,8 @@ internal sealed partial class CoordinatorState
                     // termination. If it crosses into exit while this proof is
                     // being read, the bounded observation below can re-open it
                     // and validate the exited start identity safely.
-                    if (!IsExactProcessIdentity(process, startTicks))
+                    if (!IsExactProcessIdentityForTermination(process, processId, startTicks,
+                            allowCachedOwnershipProof))
                         return (false, "PROCESS_IDENTITY_CHANGED",
                             "the persisted RimWorld process identity no longer matches");
 
@@ -290,6 +292,12 @@ internal sealed partial class CoordinatorState
         if (DetectExternalModsConfigMutationLocked(allowTransition: true,
                 generationOverride: targetGeneration))
             return;
+
+        // This path is the static install proof that was accepted together
+        // with the READY generation. Restart may carry it through a transient
+        // MainModule boundary, while fresh PID/start and absence checks remain
+        // mandatory for lifecycle control.
+        state.OwnedProcessExecutablePath = rimWorldExe;
 
         if (state.CrashIsolation != null &&
             !string.IsNullOrWhiteSpace(state.CrashIsolation.CurrentAttemptId))
@@ -503,6 +511,7 @@ internal sealed partial class CoordinatorState
         state.ErrorCode = null;
         state.ProcessId = 0;
         state.ProcessStartUtcTicks = 0;
+        state.OwnedProcessExecutablePath = null;
         state.LaunchId = null;
         state.LaunchStartedUtc = default;
         state.RestartPending = false;
@@ -573,7 +582,29 @@ internal sealed partial class CoordinatorState
         {
             try
             {
-                owned = IsOwnedProcess(state.ProcessId, state.ProcessStartUtcTicks);
+                bool cachedOwnershipProof = HasCachedOwnedProcessPathProofLocked(
+                    state.ProcessId, state.ProcessStartUtcTicks);
+                if (cachedOwnershipProof)
+                {
+                    ProcessOwnershipObservation observation = InspectOwnedProcessForLifecycle(
+                        state.ProcessId, state.ProcessStartUtcTicks, allowCachedPathProof: true);
+                    if (observation.Classification is ProcessOwnershipClassification.IdentityMismatch or
+                        ProcessOwnershipClassification.InspectionUnavailable)
+                    {
+                        MarkProcessInspectionAmbiguousLocked();
+                        return;
+                    }
+                    owned = observation.Classification == ProcessOwnershipClassification.OwnedRunning;
+                }
+                else
+                {
+                    // Older state files have no persisted static install
+                    // proof. Keep their original strict, bounded identity
+                    // probe and establish the proof only after it succeeds.
+                    owned = IsOwnedProcess(state.ProcessId, state.ProcessStartUtcTicks);
+                    if (owned)
+                        state.OwnedProcessExecutablePath = rimWorldExe;
+                }
             }
             catch (ProcessInspectionException)
             {
@@ -596,6 +627,7 @@ internal sealed partial class CoordinatorState
                     "The accepted RimWorld process is no longer running."));
             state.ProcessId = 0;
             state.ProcessStartUtcTicks = 0;
+            state.OwnedProcessExecutablePath = null;
             SaveStateLocked();
             Monitor.PulseAll(gate);
         }

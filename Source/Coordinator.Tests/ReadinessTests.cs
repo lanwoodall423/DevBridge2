@@ -326,6 +326,50 @@ internal static partial class OfflineTests
             "persistent pre-termination process inspection uncertainty must fail closed");
     }
 
+    private static void TestRestartPreservesVerifiedLiveOwnership()
+    {
+        using Fixture fixture = Fixture.ReadyWithoutLease();
+        fixture.Adapter.ReadyOnLaunch = true;
+
+        BridgeRequest establish = Request("status");
+        int establishExit = fixture.State.Execute(establish, _ => { }, () => true);
+        Assert(establishExit == 0,
+            "the live process ownership proof must be established before the transient module boundary");
+
+        FakeProcess owned = fixture.Adapter.Current;
+        owned.ThrowOnExecutablePath = true;
+
+        BridgeRequest restart = Request("restart");
+        int exitCode = fixture.State.Execute(restart, _ => { }, () => true);
+        JsonCommandResponse response = fixture.State.CreateJsonResponse(restart, exitCode, Array.Empty<string>());
+
+        Assert(exitCode == 0 && response.State == "READY" && response.Generation == 2 &&
+               response.ErrorCode == null && fixture.Adapter.LaunchCalls == 1,
+            "a verified live owned process must survive a non-essential MainModule reinspection failure");
+        Assert(fixture.Adapter.TerminationRequests == 1 && owned.HasExited,
+            "restart must request termination of the exact previously verified process");
+        Assert(fixture.Adapter.EnumerationCalls > 0,
+            "replacement launch must follow an authoritative absence census");
+
+        using Fixture contradictory = Fixture.ReadyWithoutLease();
+        contradictory.Adapter.ReadyOnLaunch = true;
+        BridgeRequest contradictoryStatus = Request("status");
+        Assert(contradictory.State.Execute(contradictoryStatus, _ => { }, () => true) == 0,
+            "the counter-test must establish an initial ownership proof");
+        contradictory.Adapter.Current.ExecutablePathOverride =
+            Path.Combine(contradictory.Root, "OtherInstall", "RimWorldWin64.exe");
+
+        BridgeRequest contradictoryRestart = Request("restart");
+        int contradictoryExit = contradictory.State.Execute(contradictoryRestart, _ => { }, () => true);
+        JsonCommandResponse contradictoryResponse = contradictory.State.CreateJsonResponse(
+            contradictoryRestart, contradictoryExit, Array.Empty<string>());
+
+        Assert(contradictoryExit != 0 && contradictory.Adapter.TerminationRequests == 0 &&
+               contradictory.Adapter.LaunchCalls == 0 &&
+               contradictoryResponse.ErrorCode == ProcessInspection.ErrorCode,
+            "a path contradiction must remain an ambiguous ownership failure without termination or launch");
+    }
+
     private static void TestLaunchMonitoringRetriesTransientInspection()
     {
         using Fixture fixture = Fixture.ReadyWithoutLease();

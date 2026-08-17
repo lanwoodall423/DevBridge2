@@ -126,6 +126,209 @@ internal sealed partial class CoordinatorState
         }
     }
 
+    private bool HasCachedOwnedProcessPathProofLocked(int processId, long startTicks)
+    {
+        if (state == null || processId <= 0 || startTicks <= 0 ||
+            state.ProcessId != processId || state.ProcessStartUtcTicks != startTicks ||
+            string.IsNullOrWhiteSpace(state.OwnedProcessExecutablePath))
+            return false;
+
+        try
+        {
+            return RuntimeScope.PathsEqual(state.OwnedProcessExecutablePath, rimWorldExe);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private ProcessOwnershipObservation InspectOwnedProcessForLifecycle(int processId,
+        long startTicks, bool allowCachedPathProof)
+    {
+        const string freshProof = "fresh-executable-proof";
+        const string cachedProof = "durable-executable-proof";
+        string ownershipSource = allowCachedPathProof ? cachedProof : freshProof;
+
+        if (processId <= 0 || startTicks <= 0)
+            return ObserveOwnership(ProcessOwnershipClassification.IdentityMismatch, processId,
+                stage: "process.identity", processIdMatch: false, startIdentityMatch: false,
+                executableIdentityMatch: false, ownershipSource: ownershipSource);
+
+        IManagedProcess process = null;
+        try
+        {
+            process = processAdapter.Open(processId);
+            if (process == null)
+                return ObserveOwnership(ProcessOwnershipClassification.Missing, processId,
+                    stage: "process.open", processIdMatch: null, startIdentityMatch: null,
+                    executableIdentityMatch: null, ownershipSource: ownershipSource);
+
+            int actualProcessId = process.Id;
+            if (actualProcessId <= 0)
+                return ObserveOwnership(ProcessOwnershipClassification.InspectionUnavailable,
+                    processId, stage: "process.id", processIdMatch: null,
+                    startIdentityMatch: null, executableIdentityMatch: null, ownershipSource: ownershipSource);
+            if (actualProcessId != processId)
+                return ObserveOwnership(ProcessOwnershipClassification.IdentityMismatch,
+                    processId, stage: "process.id", processIdMatch: false,
+                    startIdentityMatch: null, executableIdentityMatch: null, ownershipSource: ownershipSource);
+
+            bool exited = process.HasExited;
+            long actualStartTicks = process.StartIdentity;
+            if (actualStartTicks <= 0)
+                return ObserveOwnership(ProcessOwnershipClassification.InspectionUnavailable,
+                    processId, stage: "process.start-time", processIdMatch: true,
+                    startIdentityMatch: null, executableIdentityMatch: null, ownershipSource: ownershipSource);
+            if (actualStartTicks != startTicks)
+                return ObserveOwnership(ProcessOwnershipClassification.IdentityMismatch,
+                    processId, stage: "process.start-time", processIdMatch: true,
+                    startIdentityMatch: false, executableIdentityMatch: null, ownershipSource: ownershipSource);
+
+            if (allowCachedPathProof)
+            {
+                bool pathAvailable = TryReadOptionalExecutableIdentity(process,
+                    out bool pathMatches, out string pathStage);
+                if (pathAvailable && !pathMatches)
+                    return ObserveOwnership(ProcessOwnershipClassification.IdentityMismatch,
+                        processId, pathStage, processIdMatch: true, startIdentityMatch: true,
+                        executableIdentityMatch: false, ownershipSource: ownershipSource);
+
+                return ObserveOwnership(exited ? ProcessOwnershipClassification.OwnedExited :
+                        ProcessOwnershipClassification.OwnedRunning,
+                    processId, pathAvailable ? null : pathStage, processIdMatch: true,
+                    startIdentityMatch: true, executableIdentityMatch: pathAvailable ? true : null,
+                    ownershipSource);
+            }
+
+            bool requiredPathAvailable = TryReadOptionalExecutableIdentity(process,
+                out bool requiredPathMatches, out string requiredPathStage);
+            if (!requiredPathAvailable)
+                return ObserveOwnership(ProcessOwnershipClassification.InspectionUnavailable,
+                    processId, requiredPathStage, processIdMatch: true, startIdentityMatch: true,
+                    executableIdentityMatch: null, ownershipSource: ownershipSource);
+            if (!requiredPathMatches)
+                return ObserveOwnership(ProcessOwnershipClassification.IdentityMismatch,
+                    processId, requiredPathStage, processIdMatch: true, startIdentityMatch: true,
+                    executableIdentityMatch: false, ownershipSource: ownershipSource);
+
+            return ObserveOwnership(exited ? ProcessOwnershipClassification.OwnedExited :
+                    ProcessOwnershipClassification.OwnedRunning,
+                processId, requiredPathStage, processIdMatch: true, startIdentityMatch: true,
+                executableIdentityMatch: true, ownershipSource: ownershipSource);
+        }
+        catch (ProcessInspectionException exception)
+        {
+            return ObserveOwnership(ProcessOwnershipClassification.InspectionUnavailable,
+                processId, exception.Stage ?? "process.identity", processIdMatch: null,
+                startIdentityMatch: null, executableIdentityMatch: null, ownershipSource: ownershipSource);
+        }
+        catch
+        {
+            return ObserveOwnership(ProcessOwnershipClassification.InspectionUnavailable,
+                processId, "process.identity", processIdMatch: null,
+                startIdentityMatch: null, executableIdentityMatch: null, ownershipSource: ownershipSource);
+        }
+        finally
+        {
+            process?.Dispose();
+        }
+    }
+
+    private bool TryReadOptionalExecutableIdentity(IManagedProcess process,
+        out bool matches, out string stage)
+    {
+        matches = false;
+        stage = "process.main-module";
+        try
+        {
+            string executablePath = process.ExecutablePath;
+            if (string.IsNullOrWhiteSpace(executablePath))
+                return false;
+
+            try
+            {
+                matches = RuntimeScope.PathsEqual(executablePath, rimWorldExe);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+        catch (ProcessInspectionException exception)
+        {
+            stage = exception.Stage ?? stage;
+            return false;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private ProcessOwnershipObservation ObserveOwnership(ProcessOwnershipClassification classification,
+        int processId, string stage, bool? processIdMatch, bool? startIdentityMatch,
+        bool? executableIdentityMatch, string ownershipSource)
+    {
+        ProcessOwnershipObservation observation = new()
+        {
+            Classification = classification,
+            ProcessId = processId,
+            Stage = stage,
+            ProcessIdMatch = processIdMatch,
+            StartIdentityMatch = startIdentityMatch,
+            ExecutableIdentityMatch = executableIdentityMatch,
+            OwnershipSource = ownershipSource
+        };
+        string category = classification.ToString().ToUpperInvariant();
+        string detail = "pid=" + processId.ToString(CultureInfo.InvariantCulture) +
+            ";pidMatch=" + FormatInspectionMatch(processIdMatch) +
+            ";startIdentityMatch=" + FormatInspectionMatch(startIdentityMatch) +
+            ";executableIdentityMatch=" + FormatInspectionMatch(executableIdentityMatch) +
+            ";ownershipSource=" + (ownershipSource ?? "none") +
+            ";stage=" + (stage ?? "none");
+        TraceEvent("process.ownership.classified", detail: detail, category: category,
+            errorCode: classification is ProcessOwnershipClassification.IdentityMismatch or
+                ProcessOwnershipClassification.InspectionUnavailable
+                ? ProcessInspection.ErrorCode : null);
+        return observation;
+    }
+
+    private static string FormatInspectionMatch(bool? value) =>
+        value.HasValue ? value.Value.ToString().ToLowerInvariant() : "unknown";
+
+    private bool IsExactProcessIdentityForTermination(IManagedProcess process, int processId,
+        long startTicks, bool allowCachedPathProof)
+    {
+        if (!allowCachedPathProof)
+            return IsExactProcessIdentity(process, startTicks);
+
+        try
+        {
+            if (process == null || processId <= 0 || startTicks <= 0 || process.Id != processId)
+                return false;
+
+            long actualStartTicks = process.StartIdentity;
+            if (actualStartTicks <= 0)
+                throw ProcessInspection.Failure("process.start-time");
+            if (actualStartTicks != startTicks)
+                return false;
+
+            bool pathAvailable = TryReadOptionalExecutableIdentity(process,
+                out bool pathMatches, out _);
+            return !pathAvailable || pathMatches;
+        }
+        catch (ProcessInspectionException)
+        {
+            throw;
+        }
+        catch
+        {
+            throw ProcessInspection.Failure("process.identity");
+        }
+    }
+
     private bool IsExactProcessIdentity(IManagedProcess process, long startTicks)
     {
         try

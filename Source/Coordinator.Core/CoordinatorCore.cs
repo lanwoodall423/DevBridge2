@@ -1962,8 +1962,7 @@ internal sealed class SystemManagedProcess : IManagedProcess
             string signalPath = Environment.GetEnvironmentVariable(
                 "DEVBRIDGE_TEST_GRACEFUL_STOP_SIGNAL");
             if (string.IsNullOrWhiteSpace(signalPath) &&
-                process.StartInfo.Environment.TryGetValue(
-                    "DEVBRIDGE_TEST_GRACEFUL_STOP_SIGNAL", out string childSignalPath))
+                TryReadChildStopSignal(process, out string childSignalPath))
                 signalPath = childSignalPath;
             if (!string.IsNullOrWhiteSpace(signalPath))
             {
@@ -1972,6 +1971,8 @@ internal sealed class SystemManagedProcess : IManagedProcess
                 return true;
             }
 
+            if (process.MainWindowHandle == IntPtr.Zero)
+                return false;
             return process.CloseMainWindow();
         }
         catch (ProcessInspectionException)
@@ -1981,6 +1982,25 @@ internal sealed class SystemManagedProcess : IManagedProcess
         catch
         {
             throw ProcessInspection.Failure("process.termination");
+        }
+    }
+
+    private static bool TryReadChildStopSignal(Process process, out string signalPath)
+    {
+        signalPath = null;
+        try
+        {
+            ProcessStartInfo startInfo = process.StartInfo;
+            var childEnvironment = startInfo?.Environment;
+            return childEnvironment != null && childEnvironment.TryGetValue(
+                "DEVBRIDGE_TEST_GRACEFUL_STOP_SIGNAL", out signalPath);
+        }
+        catch (InvalidOperationException)
+        {
+            // An attached Process has no launch-owned StartInfo. The current
+            // coordinator environment remains the only valid signal source.
+            signalPath = null;
+            return false;
         }
     }
 

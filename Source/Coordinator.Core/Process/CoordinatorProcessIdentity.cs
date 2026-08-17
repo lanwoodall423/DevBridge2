@@ -301,23 +301,52 @@ internal sealed partial class CoordinatorState
     private bool IsExactProcessIdentityForTermination(IManagedProcess process, int processId,
         long startTicks, bool allowCachedPathProof)
     {
-        if (!allowCachedPathProof)
-            return IsExactProcessIdentity(process, startTicks);
-
         try
         {
-            if (process == null || processId <= 0 || startTicks <= 0 || process.Id != processId)
+            if (process == null || processId <= 0 || startTicks <= 0)
+            {
+                TraceEvent("termination.identity.pid_match", success: false,
+                    detail: "invalid-target");
+                return false;
+            }
+
+            int actualProcessId = process.Id;
+            bool processIdMatch = actualProcessId == processId;
+            TraceEvent("termination.identity.pid_match", success: processIdMatch,
+                detail: "expected=" + processId + ";actual=" + actualProcessId);
+            if (!processIdMatch)
                 return false;
 
             long actualStartTicks = process.StartIdentity;
             if (actualStartTicks <= 0)
                 throw ProcessInspection.Failure("process.start-time");
-            if (actualStartTicks != startTicks)
+
+            bool startIdentityMatch = actualStartTicks == startTicks;
+            TraceEvent("termination.identity.start_match", success: startIdentityMatch,
+                detail: "expected=" + startTicks + ";actual=" + actualStartTicks);
+            if (!startIdentityMatch)
                 return false;
 
             bool pathAvailable = TryReadOptionalExecutableIdentity(process,
-                out bool pathMatches, out _);
-            return !pathAvailable || pathMatches;
+                out bool pathMatches, out string pathStage);
+            if (!pathAvailable)
+            {
+                TraceEvent("termination.path.unavailable", success: null,
+                    errorCode: ProcessInspection.ErrorCode,
+                    detail: "stage=" + (pathStage ?? "process.main-module") +
+                        ";cached-path-proof=" + allowCachedPathProof.ToString().ToLowerInvariant());
+                return allowCachedPathProof;
+            }
+            if (!pathMatches)
+            {
+                TraceEvent("termination.path.contradiction", success: false,
+                    errorCode: "PROCESS_IDENTITY_CHANGED", detail: "executable-path-mismatch");
+                return false;
+            }
+
+            TraceEvent("termination.path.match", success: true,
+                detail: "executable-install-proof-matched");
+            return true;
         }
         catch (ProcessInspectionException)
         {

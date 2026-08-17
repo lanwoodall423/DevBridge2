@@ -460,7 +460,7 @@ internal sealed partial class CoordinatorState
             // A process may have appeared after the pre-write census. Check again at the
             // launch boundary so an external RimWorld start cannot become a duplicate launch.
             ThrowIfShutdownRequested();
-            EnsureNoMatchingRimWorldProcess();
+            EnsureNoMatchingRimWorldProcess(isRestart);
             lock (gate)
             {
                 // Profile application is complete immediately before the only raw launch call.

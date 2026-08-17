@@ -33,6 +33,7 @@ internal static partial class OfflineTests
         Run("restart accepts an exact owned process at the exit-inspection boundary", TestRestartOwnedExitInspectionBoundary);
         Run("restart retries transient pre-termination process inspection", TestRestartRetriesTransientPreterminationInspection);
         Run("restart preserves verified live ownership when path reinspection is unavailable", TestRestartPreservesVerifiedLiveOwnership);
+        Run("attached process termination tolerates missing child start environment", TestAttachedProcessTerminationBoundary);
         Run("launch monitoring retries transient process inspection failures", TestLaunchMonitoringRetriesTransientInspection);
         Run("matching late readiness repairs process inspection quarantine", TestInspectionQuarantineAcceptsMatchingReadiness);
         Run("duplicate stop is idempotent", TestDuplicateStop);

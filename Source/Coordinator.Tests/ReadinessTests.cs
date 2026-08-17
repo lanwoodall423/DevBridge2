@@ -340,6 +340,7 @@ internal static partial class OfflineTests
             "the setup generation must reach READY through the normal launch path");
 
         FakeProcess owned = fixture.Adapter.Current;
+        int ownedTerminationRequestsBeforeRestart = owned.TerminationRequests;
         PersistedState durable = JsonSerializer.Deserialize<PersistedState>(
             File.ReadAllText(Path.Combine(fixture.Root, "Runtime", "state.json")), Program.JsonOptions);
         Assert(durable != null && durable.Phase == BridgePhase.READY && durable.Generation == 2 &&
@@ -360,8 +361,44 @@ internal static partial class OfflineTests
             "a rehydrated verified live owned process must survive a non-essential MainModule reinspection failure");
         Assert(fixture.Adapter.TerminationRequests == 2 && owned.HasExited,
             "restart must request termination of the exact previously verified process");
+        Assert(owned.TerminationRequests == ownedTerminationRequestsBeforeRestart + 1,
+            "the target generation must request termination exactly once for the persisted PID");
         Assert(fixture.Adapter.EnumerationCalls > 0,
             "replacement launch must follow an authoritative absence census");
+
+        List<TraceView> trace = ReadTrace(fixture.Root);
+        int restartTraceStart = trace.FindLastIndex(value =>
+            value.Event == "command.dispatch.started" && value.Command == "restart");
+        Assert(restartTraceStart >= 0, "the target restart trace was not recorded");
+        List<TraceView> restartTrace = trace.Skip(restartTraceStart).ToList();
+        string[] terminationSequence =
+        {
+            "termination.identity.pid_match",
+            "termination.identity.start_match",
+            "termination.path.unavailable",
+            "termination.authorization.accepted",
+            "process.termination.requested",
+            "process.termination.confirmed",
+            "post_termination.census.completed",
+            "process.launch.initiated"
+        };
+        int previous = -1;
+        foreach (string eventName in terminationSequence)
+        {
+            int current = IndexOf(restartTrace, eventName);
+            Assert(current > previous, eventName + " was missing or out of order for the restart; events=" +
+                string.Join(", ", restartTrace
+                    .Select(value => value.Event + "[" + value.Detail + "]")));
+            previous = current;
+        }
+        TraceView requestEvent = restartTrace.FirstOrDefault(value =>
+            value.Event == "process.termination.requested");
+        TraceView censusEvent = restartTrace.FirstOrDefault(value =>
+            value.Event == "post_termination.census.completed");
+        Assert(requestEvent?.Success == true,
+            "termination request trace must prove the request was accepted");
+        Assert(censusEvent?.Success == true && censusEvent.Detail == "complete=true;matching=0",
+            "replacement launch must be preceded by a complete zero-process census");
 
         using Fixture contradictory = Fixture.ReadyWithoutLease();
         contradictory.Adapter.ReadyOnLaunch = true;
@@ -380,6 +417,66 @@ internal static partial class OfflineTests
                contradictory.Adapter.LaunchCalls == 0 &&
                contradictoryResponse.ErrorCode == ProcessInspection.ErrorCode,
             "a path contradiction must remain an ambiguous ownership failure without termination or launch");
+    }
+
+    private static void TestAttachedProcessTerminationBoundary()
+    {
+        const string signalVariable = "DEVBRIDGE_TEST_GRACEFUL_STOP_SIGNAL";
+        string previousSignal = Environment.GetEnvironmentVariable(signalVariable);
+        Environment.SetEnvironmentVariable(signalVariable, null);
+        System.Diagnostics.Process child = null;
+        try
+        {
+            System.Diagnostics.ProcessStartInfo start = new()
+            {
+                FileName = Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe",
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            start.ArgumentList.Add("/c");
+            start.ArgumentList.Add("ping.exe -n 120 127.0.0.1 > nul");
+            child = System.Diagnostics.Process.Start(start);
+            Assert(child != null, "the attached-process termination fixture did not start");
+
+            using SystemManagedProcess attached = new(
+                System.Diagnostics.Process.GetProcessById(child.Id));
+            bool requestResult;
+            try
+            {
+                requestResult = attached.RequestTermination();
+            }
+            catch (ProcessInspectionException exception)
+            {
+                throw new InvalidOperationException("attached RequestTermination failed at " +
+                    (exception.Stage ?? "unknown"), exception);
+            }
+            Assert(!requestResult,
+                "a headless console child should not claim a graceful window termination request");
+            try
+            {
+                Assert(attached.ForceTerminate(),
+                    "the attached process must remain force-terminable after the graceful request boundary");
+            }
+            catch (ProcessInspectionException exception)
+            {
+                throw new InvalidOperationException("attached ForceTerminate failed at " +
+                    (exception.Stage ?? "unknown"), exception);
+            }
+            child.WaitForExit(5000);
+            Assert(child.HasExited, "the attached process cleanup did not confirm exit");
+        }
+        finally
+        {
+            try
+            {
+                if (child != null && !child.HasExited)
+                    child.Kill(entireProcessTree: true);
+                child?.WaitForExit(5000);
+            }
+            catch { }
+            child?.Dispose();
+            Environment.SetEnvironmentVariable(signalVariable, previousSignal);
+        }
     }
 
     private static void TestLaunchMonitoringRetriesTransientInspection()

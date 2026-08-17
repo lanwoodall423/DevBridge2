@@ -621,14 +621,35 @@ internal sealed partial class CoordinatorState
     private static bool IsValidHash(string value) =>
         !string.IsNullOrWhiteSpace(value) && value.Length == 64 && value.All(Uri.IsHexDigit);
 
-    private void EnsureNoMatchingRimWorldProcess()
+    private void EnsureNoMatchingRimWorldProcess(bool postTermination = false)
     {
         ProcessStatusSnapshot processes;
-        lock (gate)
-            processes = EnumerateStatusProcessesLocked();
+        try
+        {
+            lock (gate)
+                processes = EnumerateStatusProcessesLocked();
+        }
+        catch (Exception exception)
+        {
+            if (postTermination)
+                TraceEvent("post_termination.census.completed", success: false,
+                    errorCode: exception is ProcessInspectionException
+                        ? ProcessInspection.ErrorCode : "CENSUS_FAILED",
+                    detail: "complete=false");
+            throw;
+        }
         if (processes.MatchingProcessCount > 0)
+        {
+            if (postTermination)
+                TraceEvent("post_termination.census.completed", success: false,
+                    errorCode: "PROCESS_PRESENT",
+                    detail: "complete=true;matching=" + processes.MatchingProcessCount);
             throw new ProfileException("MODS_CONFIG_PROCESS_RUNNING",
                 "a matching RimWorld process is running; ModsConfig.xml was not changed");
+        }
+        if (postTermination)
+            TraceEvent("post_termination.census.completed", success: true,
+                detail: "complete=true;matching=0");
     }
 
     private static void AtomicWriteFile(string path, byte[] contents,

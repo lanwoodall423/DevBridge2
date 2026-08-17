@@ -150,6 +150,7 @@ internal sealed partial class CoordinatorState
 
         IManagedProcess process = null;
         bool terminationRequested = false;
+        bool terminationAuthorizationAccepted = false;
         try
         {
             DateTime inspectionDeadline = clock.UtcNow.Add(options.ProcessInspectionRetryTimeout);
@@ -181,10 +182,31 @@ internal sealed partial class CoordinatorState
                     // termination. If it crosses into exit while this proof is
                     // being read, the bounded observation below can re-open it
                     // and validate the exited start identity safely.
-                    if (!IsExactProcessIdentityForTermination(process, processId, startTicks,
-                            allowCachedOwnershipProof))
+                    bool authorized;
+                    try
+                    {
+                        authorized = IsExactProcessIdentityForTermination(process, processId,
+                            startTicks, allowCachedOwnershipProof);
+                    }
+                    catch (ProcessInspectionException exception)
+                    {
+                        TraceEvent("termination.authorization.rejected", success: false,
+                            errorCode: ProcessInspection.ErrorCode,
+                            detail: "identity-inspection;stage=" + (exception.Stage ?? "unknown"));
+                        throw;
+                    }
+                    if (!authorized)
+                    {
+                        TraceEvent("termination.authorization.rejected", success: false,
+                            errorCode: "PROCESS_IDENTITY_CHANGED", detail: "identity-mismatch");
                         return (false, "PROCESS_IDENTITY_CHANGED",
                             "the persisted RimWorld process identity no longer matches");
+                    }
+
+                    terminationAuthorizationAccepted = true;
+                    TraceEvent("termination.authorization.accepted", success: true,
+                        detail: "pid/start identity verified;cached-path-proof=" +
+                            allowCachedOwnershipProof.ToString().ToLowerInvariant());
 
                     bool requested = process.RequestTermination();
                     terminationRequested = true;
@@ -207,8 +229,16 @@ internal sealed partial class CoordinatorState
                     // Only the pre-termination identity observation may be
                     // retried. Once termination was requested, uncertainty is
                     // terminal and remains fail-closed.
-                    if (terminationRequested || clock.UtcNow >= inspectionDeadline)
+                    if (terminationAuthorizationAccepted || terminationRequested ||
+                        clock.UtcNow >= inspectionDeadline)
+                    {
+                        TraceEvent("process.termination.failed", success: false,
+                            errorCode: ProcessInspection.ErrorCode,
+                            detail: terminationAuthorizationAccepted
+                                ? "termination-dispatch-or-post-request-inspection"
+                                : "pre-termination-inspection-timeout");
                         return (false, ProcessInspection.ErrorCode, ProcessInspection.Message);
+                    }
 
                     process?.Dispose();
                     process = null;

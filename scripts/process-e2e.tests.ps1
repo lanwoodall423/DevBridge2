@@ -904,6 +904,140 @@ $results.Add((Invoke-Case 'coordinator-only refresh leaves fake child running' {
     } finally { Remove-Fixture $fixture }
 }))
 
+$results.Add((Invoke-Case 'bounded mod build deploy run test transaction' {
+    $fixture = New-Fixture 'mod-test-transaction' -RimBridgeMode off
+    $transactionRoot = Join-Path $fixture.Root 'ManagedMod'
+    $descriptorPath = Join-Path $fixture.Root 'mod-development.json'
+    try {
+        New-Item -ItemType Directory -Force -Path (Join-Path $fixture.Root 'InstalledMods\lan.frontier\About') | Out-Null
+        Write-Utf8File (Join-Path $fixture.Root 'InstalledMods\lan.frontier\About\About.xml') @'
+<ModMetaData><name>Frontier fixture</name><packageId>lan.frontier</packageId><supportedVersions><li>1.6</li></supportedVersions></ModMetaData>
+'@
+        New-Item -ItemType Directory -Force -Path (Join-Path $transactionRoot '1.6\Assemblies') | Out-Null
+        Write-Utf8File $descriptorPath @'
+{
+  "schemaVersion": "devbridge-mod-development/v1",
+  "project": "frontier",
+  "sourceProject": "TestSupport/ModDevelopmentFixture/DevBridge.ModFixture.csproj",
+  "configuration": "Release",
+  "expectedAssembly": "DevBridge.ModFixture.dll",
+  "deploymentTarget": "1.6/Assemblies/DevBridge.ModFixture.dll",
+  "testRecipe": "mod-development-smoke"
+}
+'@
+        $transactionScript = Join-Path $repoRoot 'scripts\mod-test.ps1'
+        $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $transactionScript,
+            '-Project', 'frontier', '-DescriptorPath', $descriptorPath,
+            '-DevelopmentRoot', $repoRoot, '-DeploymentRoot', $transactionRoot,
+            '-CoordinatorRoot', $fixture.Root, '-RuntimeSlot', $fixture.Slot, '-Json')
+        $output = & pwsh @arguments 2>&1 | Out-String
+        $exitCode = $LASTEXITCODE
+        $report = Get-JsonResponse $output
+        if ($exitCode -ne 0 -or -not [bool]$report.success) {
+            throw "mod-test transaction failed (exit $exitCode): $output"
+        }
+        if ([bool]$report.deployment.changed -ne $true -or
+            [string]$report.deployment.stagedSha256 -ne [string]$report.deployment.deployedSha256After -or
+            -not [bool]$report.cleanup.leaseReleased -or
+            -not [bool]$report.cleanup.registrationReleased) {
+            throw "mod-test did not report hash-verified deployment and owned cleanup: $output"
+        }
+        $secondOutput = & pwsh @arguments 2>&1 | Out-String
+        $secondExitCode = $LASTEXITCODE
+        $second = Get-JsonResponse $secondOutput
+        if ($secondExitCode -ne 0 -or -not [bool]$second.success -or [bool]$second.deployment.changed) {
+            throw "identical mod-test transaction was not a no-op: $secondOutput"
+        }
+
+        $suppliedLeaseId = Begin-TestLease $fixture
+        try {
+            $suppliedArguments = @($arguments) + @('-LeaseId', $suppliedLeaseId)
+            $suppliedOutput = & pwsh @suppliedArguments 2>&1 | Out-String
+            $suppliedExitCode = $LASTEXITCODE
+            $supplied = Get-JsonResponse $suppliedOutput
+            if ($suppliedExitCode -ne 0 -or -not [bool]$supplied.success -or
+                [string]$supplied.runtime.leaseId -ne $suppliedLeaseId -or
+                [bool]$supplied.cleanup.leaseReleased) {
+                throw "caller-held lease was not reused without automatic ending: $suppliedOutput"
+            }
+        } finally {
+            End-TestLease $fixture $suppliedLeaseId
+        }
+
+        $deploymentTarget = Join-Path $transactionRoot '1.6\Assemblies\DevBridge.ModFixture.dll'
+        Write-Utf8File $deploymentTarget 'stale deployed assembly'
+        $deploymentLock = [IO.File]::Open($deploymentTarget, [IO.FileMode]::Open,
+            [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        try {
+            $lockedOutput = & pwsh @arguments 2>&1 | Out-String
+            $lockedExitCode = $LASTEXITCODE
+            $locked = Get-JsonResponse $lockedOutput
+            if ($lockedExitCode -eq 0 -or [string]$locked.stage -ne 'deployment' -or
+                -not [bool]$locked.runtime.maintenanceReady -or
+                -not [bool]$locked.cleanup.deferred) {
+                throw "locked deployment did not preserve confirmed maintenance ownership: $lockedOutput"
+            }
+            $lockedStatus = Get-Status $fixture
+            if ([string]$lockedStatus.gameState -ne 'STOPPED' -or
+                [int]$lockedStatus.rimworldPid -ne 0 -or
+                -not [bool]$lockedStatus.maintenanceReady) {
+                throw "failed deployment launched or lost maintenance state: $($lockedStatus | ConvertTo-Json -Compress)"
+            }
+        } finally {
+            $deploymentLock.Dispose()
+        }
+
+        $cleanupAgent = [Environment]::GetEnvironmentVariable('DEVBRIDGE_AGENT', 'Process')
+        $cleanupSession = [Environment]::GetEnvironmentVariable('DEVBRIDGE_SESSION', 'Process')
+        try {
+            $env:DEVBRIDGE_AGENT = 'mod-test-' + [string]$locked.transactionId
+            $env:DEVBRIDGE_SESSION = 'mod-test-' + [string]$locked.transactionId
+            End-TestLease $fixture ([string]$locked.runtime.leaseId)
+            $release = Invoke-Bridge -Root $fixture.Root -Slot $fixture.Slot -Arguments @(
+                'project', 'release', [string]$locked.runtime.registrationId)
+            Assert-Success $release 'failed deployment registration cleanup'
+        } finally {
+            $env:DEVBRIDGE_AGENT = $cleanupAgent
+            $env:DEVBRIDGE_SESSION = $cleanupSession
+        }
+
+        $badProjectRoot = Join-Path $fixture.Root 'FailingBuild'
+        New-Item -ItemType Directory -Force -Path $badProjectRoot | Out-Null
+        $badProject = Join-Path $badProjectRoot 'FailingBuild.csproj'
+        Write-Utf8File $badProject @'
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup><Compile Include="FailingBuild.cs" /></ItemGroup>
+</Project>
+'@
+        Write-Utf8File (Join-Path $badProjectRoot 'FailingBuild.cs') 'public static class FailingBuild {'
+        $badDescriptor = Join-Path $fixture.Root 'bad-mod-development.json'
+        $badSourceProject = [System.IO.Path]::GetRelativePath($repoRoot, $badProject).Replace('\', '/')
+        $badDescriptorData = [ordered]@{
+            schemaVersion = 'devbridge-mod-development/v1'
+            project = 'frontier'
+            sourceProject = $badSourceProject
+            configuration = 'Release'
+            expectedAssembly = 'FailingBuild.dll'
+            deploymentTarget = '1.6/Assemblies/FailingBuild.dll'
+            testRecipe = 'mod-development-smoke'
+        }
+        Write-Utf8File $badDescriptor ($badDescriptorData | ConvertTo-Json -Depth 4)
+        $badOutput = & pwsh @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $transactionScript,
+            '-Project', 'frontier', '-DescriptorPath', $badDescriptor,
+            '-DevelopmentRoot', $repoRoot, '-DeploymentRoot', $transactionRoot,
+            '-CoordinatorRoot', $fixture.Root, '-RuntimeSlot', $fixture.Slot, '-Json') 2>&1 | Out-String
+        if ($LASTEXITCODE -eq 0) { throw "invalid build unexpectedly succeeded: $badOutput" }
+        $bad = Get-JsonResponse $badOutput
+        if ([string]$bad.stage -ne 'build' -or [string]$bad.failure.errorCode -ne 'DEVELOPMENT_BUILD_FAILED') {
+            throw "failed build did not fail before lifecycle work: $badOutput"
+        }
+    } finally { Remove-Fixture $fixture }
+}))
+
 $planJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repoRoot 'scripts\dev-plan.ps1') `
     -ChangedFiles 'Source/Mod/IntegrationMarker.cs' -Json 2>&1 | Out-String
 if ($LASTEXITCODE -ne 0) { throw "Development plan command failed: $planJson" }

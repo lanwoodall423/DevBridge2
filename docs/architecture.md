@@ -151,6 +151,13 @@ history and manifests are immutable evidence; later STOPPED or failure records d
 completed accepted generation. A replacement launch cannot silently consume another owner's lease or
 replenish a finite launch/isolation budget.
 
+For a deterministic configuration-versus-failure investigation, use `history`, then
+`history diagnose <failed-generation>`. The diagnosis compares the failed generation with the nearest
+prior valid READY generation and attaches only bounded normalized evidence. Follow an evidence reference
+with `evidence show <id>`, and use `logs query ...` when launch-bound log evidence is still available.
+The diff separates semantic profile/build changes from runtime identity changes such as PID and launch ID;
+it reports added packages as facts, not as proof of causality.
+
 ## Durable state and authority boundaries
 
 State and semantic history are written atomically under `Runtime`. Important artifacts include
@@ -220,6 +227,26 @@ build-plan --json` is a compact read-only projection of coordinator, mod, and
 BridgeTools disk identities, artifact hashes, and `requiredRefresh`; its
 `loadedStatus` is `unknown-not-proven` for externally loaded mod/companion code.
 Git, build, and deployment decisions remain in PowerShell.
+
+For the normal rebuild-and-test workflow, use the bounded external transaction:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\mod-test.ps1 `
+  -Project frontier -DescriptorPath .\DevelopmentProjects\frontier.json `
+  -DevelopmentRoot . -DeploymentRoot . `
+  -CoordinatorRoot <runtime-root> -Json
+```
+
+The `devbridge-mod-development/v1` descriptor contains only the project alias, source `.csproj`,
+`Debug`/`Release` configuration, expected assembly, deployment-relative path, and declared recipe.
+The transaction plans first, builds into bounded staging, compares SHA-256 bytes, then uses the
+existing project registration, lease, `stop`, deployment, `ensure-ready`, and recipe contracts. A
+caller may pass its complete `lease-<32 hex>` capability with `-LeaseId`; ownership is validated,
+never transferred, and never ended by the transaction. A byte-identical artifact with an already
+satisfied generation/recipe is a no-op. On uncertainty the report preserves maintenance ownership
+and gives a stable stage/next action; it never kills, restarts, edits ModsConfig, or rewrites a
+baseline. Lower-level `project`, `test`, `stop`, `ensure-ready`, `wait-ready`, and `status` commands
+remain the recovery and advanced-use interface.
 
 ## Process-level fake-host verification
 

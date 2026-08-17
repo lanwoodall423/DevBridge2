@@ -135,6 +135,10 @@ internal static partial class OfflineTests
         Run("last-known-good survives normal termination", TestGenerationHistoryLastGoodAfterStop);
         Run("failed generations do not become last-known-good", TestGenerationHistoryFailedLaunch);
         Run("generation history corruption is visible and not rewritten", TestGenerationHistoryCorruption);
+        Run("history diff compares immutable semantic evidence", TestHistoryDiffSemanticChanges);
+        Run("history diagnosis uses nearest known-good evidence", TestHistoryDiagnosisUsesNearestGoodEvidence);
+        Run("history analysis corruption is mutation-free", TestHistoryAnalysisCorruptionIsMutationFree);
+        Run("history diagnosis bounds crash-isolation evidence", TestHistoryAnalysisBoundsAndCrashIsolation);
         Run("corrupt persisted profiles quarantine recovery", TestCorruptPersistedProfileQuarantine);
         Run("baseline restore is byte-for-byte and rejects external edits", TestBaselineRestoreSafety);
         Run("accepted project failure isolates and restores the control profile", TestCrashIsolationSingleProject);

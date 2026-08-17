@@ -1114,9 +1114,48 @@ internal sealed partial class CoordinatorState
         int launchesConsumed = 0;
         bool leavePendingForRecovery = false;
         string leaseId = null;
+        bool ownsLease = false;
         List<RecipeOperationResult> operationResults = new();
         try
         {
+            if (!string.IsNullOrWhiteSpace(callerBudget.SuppliedLeaseId))
+            {
+                TestLease suppliedLease;
+                lock (gate)
+                {
+                    SynchronizeLocked();
+                    if (!TryGetLeaseHolderLocked(callerBudget.SuppliedLeaseId, request,
+                            out suppliedLease))
+                    {
+                        return SetRecipeFailure(request, id, "RECIPE_SUPPLIED_LEASE_NOT_HELD",
+                            "The supplied lease is not held by this stable agent identity.",
+                            state.Generation, restartRequired, launchesConsumed,
+                            callerBudget.SuppliedLeaseId, budgetResult, "acquire-lease", null, plan);
+                    }
+
+                    if (state.Phase != BridgePhase.READY || state.RestartPending ||
+                        state.Generation <= 0 || suppliedLease.Generation != state.Generation)
+                    {
+                        return SetRecipeFailure(request, id,
+                            "RECIPE_SUPPLIED_LEASE_GENERATION_MISMATCH",
+                            "The supplied lease is not valid for the current READY generation; " +
+                            "no lifecycle operation was attempted.", state.Generation,
+                            restartRequired, launchesConsumed, suppliedLease.Id, budgetResult,
+                            "inspect-evidence", null, plan);
+                    }
+                }
+
+                leaseId = callerBudget.SuppliedLeaseId;
+                if (restartRequired)
+                {
+                    return SetRecipeFailure(request, id, "RECIPE_SUPPLIED_LEASE_REQUIRES_READY",
+                        "A supplied lease cannot authorize an autonomous restart; plan and accept " +
+                        "the intended generation before running the recipe.", initialGeneration,
+                        restartRequired, launchesConsumed, leaseId, budgetResult,
+                        "ensure-ready", null, plan);
+                }
+            }
+
             if (restartRequired)
             {
                 bool matchingPending = pendingBefore && plan.EstimatedRimWorldLaunches == 0;
@@ -1151,7 +1190,8 @@ internal sealed partial class CoordinatorState
                     CurrentGenerationForRecipe(), restartRequired, launchesConsumed, null,
                     WithConsumed(budgetResult, launchesConsumed, 0), "wait-event", null, plan);
 
-            if (recipe.RequiresReady || recipe.Operations.Count > 0)
+            if (string.IsNullOrWhiteSpace(leaseId) &&
+                (recipe.RequiresReady || recipe.Operations.Count > 0))
             {
                 TestLease lease = null;
                 int beginResult = BeginLease(request, SilentRecipeEmit, connected,
@@ -1169,6 +1209,7 @@ internal sealed partial class CoordinatorState
                         leavePendingForRecovery ? "wait-event" : "acquire-lease", null, plan);
                 }
                 leaseId = lease.Id;
+                ownsLease = true;
             }
 
             foreach (RecipeOperationDefinition operation in recipe.Operations)
@@ -1207,7 +1248,7 @@ internal sealed partial class CoordinatorState
         }
         finally
         {
-            if (!string.IsNullOrWhiteSpace(leaseId))
+            if (ownsLease && !string.IsNullOrWhiteSpace(leaseId))
                 EndLease(request, new[] { "end", leaseId }, SilentRecipeEmit);
             lock (gate)
                 leavePendingForRecovery |= state.RestartPending;
@@ -1635,6 +1676,7 @@ internal sealed partial class CoordinatorState
 
     private sealed class RecipeCallerBudget
     {
+        internal string SuppliedLeaseId { get; init; }
         internal int? TimeoutSeconds { get; init; }
         internal int? MaxRimWorldLaunches { get; init; }
         internal int? MaxRecipeAttempts { get; init; }
@@ -1687,6 +1729,7 @@ internal sealed partial class CoordinatorState
         if (string.IsNullOrWhiteSpace(id))
             return RecipeParseFailure("TEST_RECIPE_USAGE", "recipe run requires one recipe id.",
                 out errorCode, out error);
+        string suppliedLeaseId = null;
         int? timeout = null, launches = null, attempts = null, refreshes = null, repeated = null;
         bool? stop = null;
         HashSet<string> seenOptions = new(StringComparer.OrdinalIgnoreCase);
@@ -1695,6 +1738,21 @@ internal sealed partial class CoordinatorState
             string option = arguments[index]?.Trim() ?? string.Empty;
             if (string.Equals(option, "--json", StringComparison.OrdinalIgnoreCase))
                 continue;
+            if (string.Equals(option, "--lease", StringComparison.OrdinalIgnoreCase) ||
+                option.StartsWith("--lease=", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!string.IsNullOrWhiteSpace(suppliedLeaseId))
+                    return RecipeParseFailure("TEST_RECIPE_LEASE_INVALID",
+                        "a supplied lease may be declared only once.", out errorCode, out error);
+                string candidate = option.StartsWith("--lease=", StringComparison.OrdinalIgnoreCase)
+                    ? option.Substring("--lease=".Length).Trim()
+                    : (++index < arguments.Count ? arguments[index]?.Trim() : null);
+                if (!IsFullLeaseId(candidate))
+                    return RecipeParseFailure("TEST_RECIPE_LEASE_INVALID",
+                        "--lease requires the complete lease capability ID.", out errorCode, out error);
+                suppliedLeaseId = candidate;
+                continue;
+            }
             if (option is "--timeout-seconds" or "--budget-seconds" or "--max-rimworld-launches" or
                 "--max-recipe-attempts" or "--max-coordinator-refreshes" or "--max-repeated-failure-count")
             {
@@ -1743,6 +1801,7 @@ internal sealed partial class CoordinatorState
                 out errorCode, out error);
         budget = new RecipeCallerBudget
         {
+            SuppliedLeaseId = suppliedLeaseId,
             TimeoutSeconds = timeout,
             MaxRimWorldLaunches = launches,
             MaxRecipeAttempts = attempts,
@@ -1755,6 +1814,15 @@ internal sealed partial class CoordinatorState
 
     private static bool BoundedCaller(int? value, int min, int max) =>
         !value.HasValue || value.Value >= min && value.Value <= max;
+
+    private static bool IsFullLeaseId(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value) || value.Length != 38 ||
+            !value.StartsWith("lease-", StringComparison.OrdinalIgnoreCase))
+            return false;
+        return value.Skip(6).All(character =>
+            character is >= '0' and <= '9' or >= 'A' and <= 'F' or >= 'a' and <= 'f');
+    }
 
     private static bool RecipeParseFailure(string code, string message, out string errorCode, out string error)
     {

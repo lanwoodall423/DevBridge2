@@ -10,12 +10,30 @@ internal sealed partial class CoordinatorState
         string operation = arguments.Count == 0 ? string.Empty : arguments[0].Trim().ToLowerInvariant();
         int? selectedGeneration = null;
         bool lastGood = false;
+        if (operation == "diff")
+        {
+            if (arguments.Count != 3)
+            {
+                emit("Usage: DevBridge.cmd history | history show <generation> | history last-good | history diff <from-generation> <to-generation> | history diagnose <generation>");
+                return 2;
+            }
+            return ExecuteHistoryDiff(arguments.Skip(1).ToList(), request, emit);
+        }
+        if (operation == "diagnose")
+        {
+            if (arguments.Count != 2)
+            {
+                emit("Usage: DevBridge.cmd history | history show <generation> | history last-good | history diff <from-generation> <to-generation> | history diagnose <generation>");
+                return 2;
+            }
+            return ExecuteHistoryDiagnose(arguments.Skip(1).ToList(), request, emit);
+        }
         if (operation == "show")
         {
             if (arguments.Count != 2 || !int.TryParse(arguments[1], NumberStyles.None,
                     CultureInfo.InvariantCulture, out int generation) || generation <= 0)
             {
-                emit("Usage: DevBridge.cmd history | history show <generation> | history last-good");
+                emit("Usage: DevBridge.cmd history | history show <generation> | history last-good | history diff <from-generation> <to-generation> | history diagnose <generation>");
                 return 2;
             }
             selectedGeneration = generation;
@@ -24,14 +42,14 @@ internal sealed partial class CoordinatorState
         {
             if (arguments.Count != 1)
             {
-                emit("Usage: DevBridge.cmd history | history show <generation> | history last-good");
+                emit("Usage: DevBridge.cmd history | history show <generation> | history last-good | history diff <from-generation> <to-generation> | history diagnose <generation>");
                 return 2;
             }
             lastGood = true;
         }
         else if (!string.IsNullOrWhiteSpace(operation))
         {
-            emit("Usage: DevBridge.cmd history | history show <generation> | history last-good");
+            emit("Usage: DevBridge.cmd history | history show <generation> | history last-good | history diff <from-generation> <to-generation> | history diagnose <generation>");
             return 2;
         }
 

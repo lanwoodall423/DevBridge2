@@ -1,0 +1,21 @@
+{
+  "schemaVersion": "devbridge-test-recipe/v1",
+  "id": "mod-development-smoke",
+  "description": "Confirm the declared development project is loaded and the quicktest map is ready.",
+  "projects": ["frontier"],
+  "inputs": {
+    "quicktest": true
+  },
+  "requiresReady": true,
+  "success": {
+    "quicktestReady": true
+  },
+  "budget": {
+    "timeoutSeconds": 120,
+    "maxRimWorldLaunches": 1,
+    "maxRecipeAttempts": 1,
+    "maxCoordinatorRefreshes": 4,
+    "stopOnRepeatedFailureFingerprint": true,
+    "maxRepeatedFailureCount": 1
+  }
+}

@@ -307,6 +307,8 @@ internal sealed class FakeGabpServer : IDisposable
     private readonly long processStartIdentity;
     private readonly CancellationTokenSource lifetime = new();
     private readonly Task acceptLoop;
+    private int fixtureMutationCount;
+    private string fixtureValue = "initial";
     private bool disposed;
 
     private FakeGabpServer(TcpListener listener, FakeScenario scenario, string launchId, int generation,
@@ -396,8 +398,13 @@ internal sealed class FakeGabpServer : IDisposable
             return Result(id, new { sessionId = "fake-session", success = true });
         if (method == "tools/list")
         {
-            object[] tools = scenario.CompanionAvailable
-                ? new object[] { new { name = "devbridge/get_generation_context" } }
+        object[] tools = scenario.CompanionAvailable
+                ? new object[]
+                {
+                    new { name = "devbridge/get_generation_context" },
+                    new { name = "rimworld/fixture_mutate" },
+                    new { name = "rimworld/inspect_fixture" }
+                }
                 : Array.Empty<object>();
             return Result(id, new { tools });
         }
@@ -407,9 +414,45 @@ internal sealed class FakeGabpServer : IDisposable
             if (request.TryGetProperty("params", out JsonElement parameters) &&
                 parameters.TryGetProperty("name", out JsonElement nameValue))
                 name = nameValue.GetString() ?? string.Empty;
-            if (!string.Equals(name, "devbridge/get_generation_context", StringComparison.Ordinal))
-                return Error(id, -32601, "tool not found");
             if (!scenario.CompanionAvailable)
+                return Error(id, -32601, "tool not found");
+            if (string.Equals(name, "rimworld/fixture_mutate", StringComparison.Ordinal))
+            {
+                string value = "mutated";
+                if (request.TryGetProperty("params", out JsonElement callParameters) &&
+                    callParameters.TryGetProperty("arguments", out JsonElement arguments) &&
+                    arguments.ValueKind == JsonValueKind.Object &&
+                    arguments.TryGetProperty("value", out JsonElement requestedValue))
+                    value = requestedValue.GetString() ?? string.Empty;
+                if (value.Length > 128)
+                    return Error(id, -32602, "fixture value is bounded");
+                lock (this)
+                {
+                    fixtureValue = value;
+                    fixtureMutationCount++;
+                    return Result(id, new
+                    {
+                        success = true,
+                        action = "fixture-mutated",
+                        value = fixtureValue,
+                        mutationCount = fixtureMutationCount
+                    });
+                }
+            }
+            if (string.Equals(name, "rimworld/inspect_fixture", StringComparison.Ordinal))
+            {
+                lock (this)
+                {
+                    return Result(id, new
+                    {
+                        success = true,
+                        action = "fixture-observed",
+                        value = fixtureValue,
+                        mutationCount = fixtureMutationCount
+                    });
+                }
+            }
+            if (!string.Equals(name, "devbridge/get_generation_context", StringComparison.Ordinal))
                 return Error(id, -32601, "tool not found");
             int reportedGeneration = scenario.CompanionGenerationMismatch ? generation + 1 : generation;
             return Result(id, new

@@ -214,6 +214,7 @@ internal static partial class OfflineTests
         Run("agent wait-event timeout and shutdown are terminal", TestAgentWaitEventTimeoutAndShutdown);
         Run("agent IPC preserves one versioned terminal result", TestAgentIpc);
         Run("recipe parsing and compact discovery are strict", TestRecipeParsingAndDiscovery);
+        Run("v2 behavioral recipe contract is explicit and bounded", TestV2RecipeContractIsExplicitAndBounded);
         Run("recipe and agent planning are pure and bounded", TestRecipePlanningIsPureAndBounded);
         Run("satisfied recipe execution avoids restart", TestRecipeAlreadySatisfiedAvoidsRestart);
         Run("recipe execution uses one launch and enforces caller budget", TestRecipeRunUsesOneLaunchAndEnforcesBudget);

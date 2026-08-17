@@ -27,6 +27,7 @@ public static class DevBridgeSchemaVersions
     public const string AgentDeltaContract = "devbridge-agent-delta/v1";
     public const string AgentEventContract = "devbridge-agent-event/v1";
     public const string TestRecipeContract = "devbridge-test-recipe/v1";
+    public const string TestRecipeV2Contract = "devbridge-test-recipe/v2";
     public const string TestRecipeListContract = "devbridge-test-recipe-list/v1";
     public const string TestRecipeShowContract = "devbridge-test-recipe-show/v1";
     public const string TestRecipePlanContract = "devbridge-test-recipe-plan/v1";

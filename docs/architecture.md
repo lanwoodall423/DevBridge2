@@ -70,15 +70,41 @@ request and one terminal response, regardless of how long it remains pending; th
 written until a matching change, condition, timeout, shutdown, or disconnect occurs. Both use the existing
 IPC v2 frame limits; the agent projection is deliberately much smaller than the legacy response.
 
-Autonomous test recipes are repository-owned files under `TestRecipes/`. Each file uses the
-`devbridge-test-recipe/v1` schema and is parsed by a strict allow-list: project aliases, typed
-generation inputs, readiness/Quicktest and companion evidence requirements, bounded budgets, and
-policy-approved read-only RimBridge calls. Shell commands, arbitrary argv or environment values,
+Autonomous test recipes are repository-owned files under `TestRecipes/`. `devbridge-test-recipe/v1`
+retains its strict read-only contract: project aliases, typed generation inputs, readiness/Quicktest
+and companion evidence requirements, bounded budgets, and policy-approved read-only RimBridge calls.
+V1 does not acquire a new mutation meaning. Shell commands, arbitrary argv or environment values,
 filesystem writes, profile mutation, and RimWorld lifecycle tools are not recipe concepts. Discovery
 uses `test recipe list|show|plan`; `agent plan --recipe <id>` returns the versioned
 `devbridge-agent-plan/v1` projection without acquiring a lease, registering intent, saving state,
 restarting, writing ModsConfig, or calling RimBridge. The planner reuses project/profile resolution
 and frozen-generation evidence, so an already-satisfied recipe reports zero estimated launches.
+
+`devbridge-test-recipe/v2` adds a deliberately smaller behavioral-fixture contract. A recipe must set
+`allowInGameMutation: true` before it may include policy-classified in-game tools, and each operation
+may declare expected success plus bounded JSON-pointer assertions (`exists`, scalar `equals`,
+`greaterThan`, or `lessThan`). For example:
+
+```json
+{
+  "schemaVersion": "devbridge-test-recipe/v2",
+  "id": "fixture-smoke",
+  "allowInGameMutation": true,
+  "requiresReady": true,
+  "operations": [
+    { "tool": "rimworld/fixture_mutate", "arguments": { "value": "ok" },
+      "expect": { "success": true, "assertions": [
+        { "pointer": "/value", "equals": "ok" }
+      ] } }
+  ]
+}
+```
+
+Every routed operation still passes the normal RimBridge generation, process, endpoint, policy, and
+lease checks. Behavioral recipes may mutate only temporary in-game test state under a valid DevBridge
+lease; profile/ModsConfig and RimWorld lifecycle mutation remain unconditionally DevBridge-owned and
+are rejected. Plans remain mutation-free, budgets bound time, operations, launches, attempts, refreshes,
+and repeated failures, and credentials are never stored in recipes or evidence.
 
 `test recipe run <id>` is a bounded coordinator operation. Caller timeout, launch, attempt, refresh,
 and repeated-failure limits are intersected with stricter coordinator limits. A run joins compatible

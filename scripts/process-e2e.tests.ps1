@@ -61,6 +61,90 @@ function Write-InstalledMetadata {
     Write-Utf8File (Join-Path $about 'About.xml') $xml
 }
 
+function Write-TestRecipe {
+    param([Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$Id,
+        [Parameter(Mandatory = $true)]$Definition)
+    Write-Utf8File (Join-Path $Root 'TestRecipes' ($Id + '.json')) `
+        ($Definition | ConvertTo-Json -Depth 12)
+}
+
+function Add-BehavioralRecipes {
+    param([Parameter(Mandatory = $true)]$Fixture)
+    $successOperations = @(
+        [ordered]@{
+            tool = 'rimworld/fixture_mutate'
+            arguments = [ordered]@{ value = 'behavioral-ready' }
+            expect = [ordered]@{
+                success = $true
+                assertions = @(
+                    [ordered]@{ pointer = '/value'; equals = 'behavioral-ready' }
+                    [ordered]@{ pointer = '/mutationCount'; greaterThan = 0 }
+                )
+            }
+        }
+        [ordered]@{
+            tool = 'rimworld/inspect_fixture'
+            arguments = [ordered]@{}
+            expect = [ordered]@{
+                success = $true
+                assertions = @(
+                    [ordered]@{ pointer = '/value'; equals = 'behavioral-ready' }
+                    [ordered]@{ pointer = '/mutationCount'; greaterThan = 0 }
+                )
+            }
+        }
+    )
+    $base = [ordered]@{
+        description = 'Temporary behavioral fixture mutation and observation.'
+        projects = @()
+        inputs = [ordered]@{}
+        requiresReady = $true
+        allowInGameMutation = $true
+        success = [ordered]@{ quicktestReady = $true }
+        budget = [ordered]@{
+            timeoutSeconds = 30
+            maxRimWorldLaunches = 1
+            maxRecipeAttempts = 1
+            maxCoordinatorRefreshes = 4
+            stopOnRepeatedFailureFingerprint = $true
+            maxRepeatedFailureCount = 1
+        }
+    }
+
+    $behavioral = [ordered]@{} + $base
+    $behavioral.schemaVersion = 'devbridge-test-recipe/v2'
+    $behavioral.id = 'behavioral-fixture'
+    $behavioral.operations = $successOperations
+    Write-TestRecipe $Fixture.Root $behavioral.id $behavioral
+
+    $v1 = [ordered]@{} + $base
+    $v1.schemaVersion = 'devbridge-test-recipe/v1'
+    $v1.id = 'v1-readonly-fixture'
+    $v1.Remove('allowInGameMutation')
+    $v1.operations = @([ordered]@{
+        tool = 'rimworld/inspect_fixture'
+        arguments = [ordered]@{}
+    })
+    Write-TestRecipe $Fixture.Root $v1.id $v1
+
+    $failure = [ordered]@{} + $base
+    $failure.schemaVersion = 'devbridge-test-recipe/v2'
+    $failure.id = 'behavioral-assertion-failure'
+    $failure.operations = @(
+        $successOperations[0]
+        [ordered]@{
+            tool = 'rimworld/inspect_fixture'
+            arguments = [ordered]@{}
+            expect = [ordered]@{
+                success = $true
+                assertions = @([ordered]@{ pointer = '/value'; equals = 'not-the-value' })
+            }
+        }
+    )
+    Write-TestRecipe $Fixture.Root $failure.id $failure
+}
+
 function New-Fixture {
     param([Parameter(Mandatory = $true)][string]$Name,
         [string]$ScenarioName = 'ready-immediately',
@@ -362,6 +446,22 @@ function Start-Ready {
     return $ready
 }
 
+function Begin-TestLease {
+    param([Parameter(Mandatory = $true)]$Fixture)
+    $response = Invoke-Bridge -Root $Fixture.Root -Slot $Fixture.Slot -Arguments @('test', 'begin')
+    Assert-Success $response 'test begin'
+    $leaseId = [string]$response.Json.leaseId
+    if ([string]::IsNullOrWhiteSpace($leaseId)) { throw 'test begin returned no leaseId.' }
+    return $leaseId
+}
+
+function End-TestLease {
+    param([Parameter(Mandatory = $true)]$Fixture,
+        [Parameter(Mandatory = $true)][string]$LeaseId)
+    $response = Invoke-Bridge -Root $Fixture.Root -Slot $Fixture.Slot -Arguments @('test', 'end', $LeaseId)
+    Assert-Success $response 'test end'
+}
+
 function Stop-Ready {
     param([Parameter(Mandatory = $true)]$Fixture)
     $lease = Invoke-Bridge -Root $Fixture.Root -Slot $Fixture.Slot -Arguments @('test', 'begin')
@@ -568,6 +668,113 @@ $results.Add((Invoke-Case 'quicktest recipe succeeds through process IPC' {
         $response = Invoke-Bridge -Root $fixture.Root -Slot $fixture.Slot -Arguments @(
             'test', 'recipe', 'run', 'quicktest-smoke')
         Assert-Success $response 'quicktest recipe'
+    } finally { Remove-Fixture $fixture }
+}))
+
+$results.Add((Invoke-Case 'v1 read-only recipe remains compatible' {
+    $fixture = New-Fixture 'recipe-v1-readonly' -RimBridgeMode required
+    try {
+        Add-BehavioralRecipes $fixture
+        $response = Invoke-Bridge -Root $fixture.Root -Slot $fixture.Slot -Arguments @(
+            'test', 'recipe', 'run', 'v1-readonly-fixture')
+        Assert-Success $response 'v1 read-only recipe'
+        if ($response.Json.operations.Count -ne 1 -or
+            $response.Json.operations[0].PSObject.Properties.Name -contains 'expectedSuccess') {
+            throw "v1 recipe result changed its read-only contract: $($response.Output)"
+        }
+    } finally { Remove-Fixture $fixture }
+}))
+
+$results.Add((Invoke-Case 'v2 authorized mutation and structured assertion succeed' {
+    $fixture = New-Fixture 'recipe-behavioral' -RimBridgeMode required
+    try {
+        Add-BehavioralRecipes $fixture
+        $response = Invoke-Bridge -Root $fixture.Root -Slot $fixture.Slot -Arguments @(
+            'test', 'recipe', 'run', 'behavioral-fixture')
+        Assert-Success $response 'v2 behavioral recipe'
+        if ([string]::IsNullOrWhiteSpace([string]$response.Json.leaseId) -or
+            $response.Json.operations.Count -ne 2 -or
+            [string]$response.Json.operations[0].result.value -ne 'behavioral-ready' -or
+            [int]$response.Json.operations[1].result.mutationCount -le 0 -or
+            $response.Json.operations[0].assertions.Count -ne 2) {
+            throw "v2 behavioral result was not structured as expected: $($response.Output)"
+        }
+    } finally { Remove-Fixture $fixture }
+}))
+
+$results.Add((Invoke-Case 'failed v2 assertion is stable and repeated failure short-circuits' {
+    $fixture = New-Fixture 'recipe-behavioral-repeat' -RimBridgeMode required
+    try {
+        Add-BehavioralRecipes $fixture
+        $first = Invoke-Bridge -Root $fixture.Root -Slot $fixture.Slot -Arguments @(
+            'test', 'recipe', 'run', 'behavioral-assertion-failure')
+        if ($first.ExitCode -eq 0 -or [string]$first.Json.errorCode -ne 'RECIPE_ASSERTION_FAILED' -or
+            [string]::IsNullOrWhiteSpace([string]$first.Json.failureFingerprint)) {
+            throw "Failed assertion did not produce normalized evidence: $($first.Output)"
+        }
+        $second = Invoke-Bridge -Root $fixture.Root -Slot $fixture.Slot -Arguments @(
+            'test', 'recipe', 'run', 'behavioral-assertion-failure')
+        if ([string]$second.Json.errorCode -ne 'AUTONOMOUS_REPEATED_FAILURE') {
+            throw "Repeated assertion failure was not short-circuited: $($second.Output)"
+        }
+    } finally { Remove-Fixture $fixture }
+}))
+
+$results.Add((Invoke-Case 'recipe planning does not execute behavioral mutation' {
+    $fixture = New-Fixture 'recipe-behavioral-plan' -RimBridgeMode required
+    $leaseId = $null
+    try {
+        Add-BehavioralRecipes $fixture
+        $plan = Invoke-Bridge -Root $fixture.Root -Slot $fixture.Slot -Arguments @(
+            'test', 'recipe', 'plan', 'behavioral-fixture')
+        Assert-Success $plan 'behavioral recipe plan'
+        if ([int]$plan.Json.estimatedRimWorldLaunches -ne 1) {
+            throw "Behavioral plan did not report its bounded launch estimate: $($plan.Output)"
+        }
+        $status = Start-Ready $fixture
+        $leaseId = Begin-TestLease $fixture
+        $observed = Invoke-Bridge -Root $fixture.Root -Slot $fixture.Slot -Arguments @(
+            'bridge', 'call', 'rimworld/inspect_fixture', '{}', '--lease', $leaseId)
+        Assert-Success $observed 'post-plan observation'
+        if ([int]$observed.Json.result.mutationCount -ne 0) {
+            throw "Recipe planning executed an in-game mutation: $($observed.Output)"
+        }
+    } finally {
+        if ($null -ne $leaseId) { try { End-TestLease $fixture $leaseId } catch { } }
+        Remove-Fixture $fixture
+    }
+}))
+
+$results.Add((Invoke-Case 'in-game mutation without a valid lease is blocked' {
+    $fixture = New-Fixture 'recipe-mutation-lease' -RimBridgeMode required
+    try {
+        Start-Ready $fixture | Out-Null
+        $response = Invoke-Bridge -Root $fixture.Root -Slot $fixture.Slot -Arguments @(
+            'bridge', 'call', 'rimworld/fixture_mutate', '{"value":"unauthorized"}')
+        if ($response.ExitCode -eq 0 -or [string]$response.Json.errorCode -ne 'RIMBRIDGE_LEASE_REQUIRED') {
+            throw "Unleased in-game mutation was not blocked: $($response.Output)"
+        }
+        $invalid = Invoke-Bridge -Root $fixture.Root -Slot $fixture.Slot -Arguments @(
+            'bridge', 'call', 'rimworld/fixture_mutate', '{"value":"invalid"}',
+            '--lease', 'not-a-valid-lease')
+        if ($invalid.ExitCode -eq 0 -or [string]$invalid.Json.errorCode -ne 'RIMBRIDGE_LEASE_REQUIRED') {
+            throw "In-game mutation with an invalid lease was not blocked: $($invalid.Output)"
+        }
+    } finally { Remove-Fixture $fixture }
+}))
+
+$results.Add((Invoke-Case 'profile and lifecycle recipe mutation remain blocked' {
+    $fixture = New-Fixture 'recipe-ownership-boundary' -RimBridgeMode required
+    try {
+        Start-Ready $fixture | Out-Null
+        foreach ($tool in @('rimworld/set_mod_enabled', 'rimworld/restart')) {
+            $response = Invoke-Bridge -Root $fixture.Root -Slot $fixture.Slot -Arguments @(
+                'bridge', 'call', $tool, '{}')
+            if ($response.ExitCode -eq 0 -or
+                [string]$response.Json.errorCode -ne 'RIMBRIDGE_OPERATION_BLOCKED_BY_DEVBRIDGE_POLICY') {
+                throw "Ownership boundary allowed $($tool): $($response.Output)"
+            }
+        }
     } finally { Remove-Fixture $fixture }
 }))
 

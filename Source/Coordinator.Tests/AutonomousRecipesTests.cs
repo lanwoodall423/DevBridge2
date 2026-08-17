@@ -58,6 +58,66 @@ internal static partial class OfflineTests
             "shell and arbitrary command injection fields must be rejected");
     }
 
+    private static void TestV2RecipeContractIsExplicitAndBounded()
+    {
+        using Fixture fixture = Fixture.ReadyWithoutLease();
+        string v2 = """
+            {
+              "schemaVersion": "devbridge-test-recipe/v2",
+              "id": "behavioral-fixture",
+              "description": "Bounded behavioral fixture.",
+              "projects": [],
+              "inputs": {},
+              "requiresReady": true,
+              "allowInGameMutation": true,
+              "success": { "quicktestReady": true },
+              "operations": [
+                {
+                  "tool": "rimworld/fixture_mutate",
+                  "arguments": { "value": "ok" },
+                  "expect": {
+                    "success": true,
+                    "assertions": [
+                      { "pointer": "/value", "equals": "ok" },
+                      { "pointer": "/count", "greaterThan": 0 }
+                    ]
+                  }
+                }
+              ]
+            }
+            """;
+        WriteRecipe(fixture, "behavioral-fixture", v2);
+        Assert(RecipeCatalog.TryLoad(fixture.Root, out RecipeCatalog catalog,
+                   out string errorCode, out string error) &&
+               catalog.TryGet("behavioral-fixture", out TestRecipeDefinition recipe) &&
+               recipe.SchemaVersion == "devbridge-test-recipe/v2" &&
+               recipe.AllowsInGameMutation && recipe.Operations.Count == 1 &&
+               recipe.Operations[0].Expectation.ExpectedSuccess &&
+               recipe.Operations[0].Expectation.Assertions.Count == 2 &&
+               errorCode == null && error == null,
+            "v2 must parse its explicit mutation opt-in and bounded assertions");
+
+        string noOptIn = v2.Replace("\"allowInGameMutation\": true,", "", StringComparison.Ordinal);
+        WriteRecipe(fixture, "behavioral-fixture", noOptIn);
+        Assert(!RecipeCatalog.TryLoad(fixture.Root, out _, out errorCode, out _) &&
+               errorCode == "TEST_RECIPE_IN_GAME_MUTATION_OPT_IN_REQUIRED",
+            "v2 in-game mutation must require an explicit opt-in");
+
+        string v1Mutation = v2.Replace("devbridge-test-recipe/v2", "devbridge-test-recipe/v1",
+            StringComparison.Ordinal);
+        WriteRecipe(fixture, "behavioral-fixture", v1Mutation);
+        Assert(!RecipeCatalog.TryLoad(fixture.Root, out _, out errorCode, out _) &&
+               errorCode == "TEST_RECIPE_UNSUPPORTED_FIELD",
+            "v1 must not acquire v2 mutation fields silently");
+
+        string profileMutation = v2.Replace("rimworld/fixture_mutate", "rimworld/set_mod_enabled",
+            StringComparison.Ordinal);
+        WriteRecipe(fixture, "behavioral-fixture", profileMutation);
+        Assert(!RecipeCatalog.TryLoad(fixture.Root, out _, out errorCode, out _) &&
+               errorCode == "TEST_RECIPE_RIMBRIDGE_FORBIDDEN",
+            "profile mutation must remain forbidden in v2 recipes");
+    }
+
     private static void TestRecipePlanningIsPureAndBounded()
     {
         using Fixture fixture = Fixture.ReadyWithoutLease();

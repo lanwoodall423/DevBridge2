@@ -851,6 +851,9 @@ internal sealed class RecipeRunResponse : RecipeResponse
 {
     [JsonPropertyName("schemaVersion")] public string SchemaVersion { get; init; } = DevBridgeSchemaVersions.TestRecipeRun;
     [JsonPropertyName("recipe")] public string Recipe { get; init; }
+    [JsonPropertyName("runId")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string RunId { get; init; }
     [JsonPropertyName("workflowId")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string WorkflowId { get; init; }
@@ -1082,7 +1085,8 @@ internal sealed partial class CoordinatorState
                 out string parseCode, out string parseError))
         {
             request.RecipeResponse = RecipeRunFailure(id, parseCode, parseError, null, 0, 0,
-                "inspect-evidence", callerBudget: null, workflowId: request.WorkflowId);
+                "inspect-evidence", callerBudget: null, workflowId: request.WorkflowId,
+                runId: RecipeRunId(request));
             return 2;
         }
 
@@ -1092,7 +1096,7 @@ internal sealed partial class CoordinatorState
         if (plan.ErrorCode != null)
         {
             request.RecipeResponse = RecipeRunFailure(id, plan.ErrorCode, plan.Error, null, 0, 0,
-                "inspect-evidence", null, request.WorkflowId);
+                "inspect-evidence", null, request.WorkflowId, RecipeRunId(request));
             return 4;
         }
         RecipeCatalog.TryLoad(root, out RecipeCatalog catalog, out _, out _);
@@ -1122,7 +1126,8 @@ internal sealed partial class CoordinatorState
                     id,
                     repeated,
                     budgetResult,
-                    request.WorkflowId);
+                    request.WorkflowId,
+                    RecipeRunId(request));
                 return 4;
             }
         }
@@ -1130,7 +1135,8 @@ internal sealed partial class CoordinatorState
         {
             request.RecipeResponse = RecipeRunFailure(id, "AUTONOMOUS_BUDGET_EXHAUSTED",
                 "The effective recipe-attempt budget is zero; no durable action was attempted.",
-                null, 0, 0, "run-recipe", budgetResult);
+                null, 0, 0, "run-recipe", budgetResult,
+                runId: RecipeRunId(request));
             return 4;
         }
         budgetResult = WithAttemptConsumed(budgetResult);
@@ -1329,6 +1335,7 @@ internal sealed partial class CoordinatorState
         return new RecipeRunResponse
         {
             Recipe = id,
+            RunId = RecipeRunId(request),
             WorkflowId = request.WorkflowId,
             Success = success,
             Generation = generation,
@@ -1366,6 +1373,7 @@ internal sealed partial class CoordinatorState
         {
             ExitCode = 4,
             Recipe = id,
+            RunId = RecipeRunId(request),
             WorkflowId = request.WorkflowId,
             Success = false,
             Generation = generation,
@@ -1385,12 +1393,13 @@ internal sealed partial class CoordinatorState
 
     private static RecipeRunResponse RecipeRunFailure(string id, string code, string error,
         string leaseId, int generation, int launchesConsumed, string nextAction,
-        RecipeBudgetResult callerBudget, string workflowId = null)
+        RecipeBudgetResult callerBudget, string workflowId = null, string runId = null)
     {
         return new RecipeRunResponse
         {
             ExitCode = 4,
             Recipe = id,
+            RunId = runId,
             WorkflowId = workflowId,
             Success = false,
             Generation = generation,
@@ -1406,12 +1415,13 @@ internal sealed partial class CoordinatorState
 
     private static RecipeRunResponse RecipeRepeatedFailure(string id,
         FailureOccurrenceSummary occurrence, RecipeBudgetResult budget,
-        string workflowId = null)
+        string workflowId = null, string runId = null)
     {
         return new RecipeRunResponse
         {
             ExitCode = 4,
             Recipe = id,
+            RunId = runId,
             WorkflowId = workflowId,
             Success = false,
             Generation = occurrence?.LastSeenGeneration ?? 0,
@@ -1455,6 +1465,13 @@ internal sealed partial class CoordinatorState
     {
         lock (gate)
             return state.Generation;
+    }
+
+    private static string RecipeRunId(BridgeRequest request)
+    {
+        if (string.IsNullOrWhiteSpace(request?.RequestId))
+            return null;
+        return "run-" + request.RequestId;
     }
 
     private static RecipeOperationResult EvaluateRecipeOperation(RecipeOperationDefinition operation,

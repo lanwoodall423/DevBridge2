@@ -19,7 +19,8 @@ internal static class RimBridgeProtocolContract
     internal const int GabpMajor = 1;
     internal const int BridgeToolsSdkMajor = 2;
     internal const string BridgeToolsSdkPackageVersion = "2.0.0";
-    internal const string TestedRimBridgeServerVersions = "none; live smoke verification is local/release-only";
+    internal const string TestedRimBridgeServerVersions =
+        "see RimBridgeProtocolCompatibility.json; no implicit version claim";
     internal const bool CompanionIsOptional = true;
     internal const int MaxHeaderBytes = 8192;
     internal const int MaxMessageBytes = 16 * 1024 * 1024;

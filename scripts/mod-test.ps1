@@ -10,12 +10,20 @@ param(
     [string]$RuntimeSlot,
     [string]$DeploymentRoot,
     [string[]]$DevelopmentRoot,
+    [string[]]$AdditionalDevelopmentRoot,
     [ValidatePattern('^lease-[0-9A-Fa-f]{32}$')]
     [string]$LeaseId,
+    [ValidatePattern('^[A-Za-z0-9._:-]{1,64}$')]
+    [string]$WorkflowId,
+    [ValidatePattern('^[0-9a-fA-F]{64}$')]
+    [string]$SourceFingerprint,
+    [switch]$SkipRecipe,
     [ValidateSet('Debug', 'Release')]
     [string]$Configuration,
     [ValidateRange(30, 1800)]
     [int]$BuildTimeoutSeconds = 300,
+    [ValidateRange(60, 1800)]
+    [int]$CoordinatorTimeoutSeconds = 300,
     [switch]$Json
 )
 
@@ -28,7 +36,11 @@ if ($null -eq $DevelopmentRoot -or $DevelopmentRoot.Count -eq 0) { $DevelopmentR
 
 $coordinatorRoot = [IO.Path]::GetFullPath($CoordinatorRoot)
 $deploymentRoot = [IO.Path]::GetFullPath($DeploymentRoot)
-$developmentRoots = @($DevelopmentRoot | ForEach-Object { [IO.Path]::GetFullPath($_) })
+$developmentRoots = @(
+    @($DevelopmentRoot) + @($AdditionalDevelopmentRoot) |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        ForEach-Object { [IO.Path]::GetFullPath($_) }
+)
 $transactionId = [Guid]::NewGuid().ToString('N')
 $sessionId = 'mod-test-' + $transactionId
 $registrationId = 'mod-test-' + $transactionId
@@ -38,12 +50,15 @@ $descriptorPath = if ([string]::IsNullOrWhiteSpace($DescriptorPath)) {
 $transactionRoot = Join-Path ([IO.Path]::GetTempPath()) ('DevBridge2-mod-test-' + $transactionId)
 $stagingRoot = Join-Path $transactionRoot 'staging'
 $tracePath = Join-Path $transactionRoot 'transaction-trace.jsonl'
+$artifactStatePath = Join-Path $coordinatorRoot 'Runtime\mod-development-artifact.json'
 
 $script:Report = [ordered]@{
     schemaVersion = 'devbridge-mod-development/v1'
     transactionId = $transactionId
     project = $Project
     descriptor = $descriptorPath
+    workflowId = $WorkflowId
+    sourceFingerprint = $SourceFingerprint
     success = $false
     stage = 'preflight'
     nextAction = 'inspect-result'
@@ -52,6 +67,8 @@ $script:Report = [ordered]@{
     deployment = $null
     runtime = [ordered]@{
         generation = 0
+        generationBefore = $null
+        generationAfter = $null
         leaseId = $LeaseId
         registrationId = $registrationId
         maintenanceReady = $false
@@ -60,6 +77,21 @@ $script:Report = [ordered]@{
         requestedProjects = @()
     }
     recipe = $null
+    artifactFreshness = [ordered]@{
+        sourceFingerprint = $SourceFingerprint
+        builtArtifactSha256 = $null
+        deployedArtifactSha256 = $null
+        deploymentDecision = $null
+        generationBefore = $null
+        generationAfter = $null
+        generation = $null
+        transactionId = $transactionId
+        workflowId = $WorkflowId
+        leaseId = $LeaseId
+        loadedArtifactFreshnessProven = $false
+        proof = $null
+        errorCode = $null
+    }
     cleanup = [ordered]@{
         registrationReleased = $false
         leaseReleased = $false
@@ -232,6 +264,50 @@ function Get-Hash {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+function Read-ArtifactState {
+    if (-not (Test-Path -LiteralPath $artifactStatePath -PathType Leaf)) { return $null }
+    try {
+        if ((Get-Item -LiteralPath $artifactStatePath -Force).Length -gt 32768) { return $null }
+        $state = Get-Content -LiteralPath $artifactStatePath -Raw | ConvertFrom-Json -Depth 8
+        if ([string]$state.schemaVersion -ne 'devbridge-artifact-state/v1' -or
+            [string]::IsNullOrWhiteSpace([string]$state.project) -or
+            [string]::IsNullOrWhiteSpace([string]$state.deployedArtifactSha256) -or
+            [int]$state.generation -lt 1) { return $null }
+        return $state
+    } catch {
+        return $null
+    }
+}
+
+function Write-ArtifactState {
+    param([Parameter(Mandatory = $true)][int]$Generation,
+        [Parameter(Mandatory = $true)][string]$DeployedHash)
+    $parentInfo = [IO.Directory]::GetParent($artifactStatePath)
+    $parent = if ($null -eq $parentInfo) { $null } else { $parentInfo.FullName }
+    Assert-Directory $parent 'artifact-state parent'
+    Assert-NoReparsePath $artifactStatePath
+    $temporary = Join-Path $parent ('.devbridge-artifact-' + $transactionId + '.tmp')
+    $state = [ordered]@{
+        schemaVersion = 'devbridge-artifact-state/v1'
+        project = $Project
+        deploymentTarget = [IO.Path]::GetFullPath($script:Report.deployment.targetPath)
+        deployedArtifactSha256 = $DeployedHash
+        generation = $Generation
+        transactionId = $transactionId
+        sourceFingerprint = $SourceFingerprint
+        workflowId = $WorkflowId
+        updatedUtc = [DateTime]::UtcNow.ToString('o')
+    }
+    try {
+        $json = $state | ConvertTo-Json -Depth 8 -Compress
+        [IO.File]::WriteAllText($temporary, $json, [Text.UTF8Encoding]::new($false))
+        Assert-NoReparsePath $temporary
+        [IO.File]::Move($temporary, $artifactStatePath, $true)
+    } finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 function Get-ArtifactPaths {
     $paths = @(
         $script:TracePath,
@@ -240,6 +316,7 @@ function Get-ArtifactPaths {
         (Join-Path $coordinatorRoot 'Runtime\state.json'),
         (Join-Path $coordinatorRoot 'Runtime\readiness.json'),
         (Join-Path $coordinatorRoot 'Runtime\coordinator-events.jsonl'),
+        $artifactStatePath,
         (Join-Path $coordinatorRoot 'Player.log'),
         $script:Report.deployment.targetPath
     )
@@ -263,6 +340,10 @@ function Set-Failure {
         errorCode = $ErrorCode
         message = Limit-Text $Message
         output = Limit-Text ([string]$Output)
+    }
+    if ($null -ne $script:Report.artifactFreshness) {
+        $script:Report.artifactFreshness.errorCode = $ErrorCode
+        $script:Report.artifactFreshness.loadedArtifactFreshnessProven = $false
     }
     $script:KeepOwnership = $KeepOwnership
     $script:FailureRaised = $true
@@ -306,7 +387,9 @@ function Invoke-BridgeJson {
             PassThru = $true
         }
         $process = Start-Process @startParameters
-        if (-not $process.WaitForExit(65000)) {
+        $coordinatorTimeoutMilliseconds = [Math]::Min([int]::MaxValue,
+            [Math]::Max(60, $CoordinatorTimeoutSeconds) * 1000)
+        if (-not $process.WaitForExit($coordinatorTimeoutMilliseconds)) {
             $timedOut = $true
             try { $process.Kill() } catch { }
             try { $process.WaitForExit(5000) } catch { }
@@ -530,9 +613,16 @@ try {
         deployedSha256After = $deployedBefore
         stagingPath = $stagingRoot
     }
+    $script:Report.artifactFreshness.builtArtifactSha256 = $builtHash
+    $script:Report.artifactFreshness.deployedArtifactSha256 = $deployedBefore
+    $script:Report.artifactFreshness.deploymentDecision = if ($script:Report.deployment.changed) { 'deployed' } else { 'unchanged' }
+    $artifactState = Read-ArtifactState
 
     $statusBefore = Invoke-BridgeJson @('status')
     $statusBeforeResponse = Require-BridgeSuccess 'planning' 'inspect-runtime-status' 'status-before-registration' $statusBefore
+    $generationBefore = [int]$statusBeforeResponse.generation
+    $script:Report.runtime.generationBefore = $generationBefore
+    $script:Report.artifactFreshness.generationBefore = $generationBefore
     $profileIncludesProject = @($statusBeforeResponse.requestedProjects | ForEach-Object { [string]$_ }) -contains $Project
 
     # A READY generation that does not include the requested alias cannot grant
@@ -570,7 +660,13 @@ try {
 
     $postPlanResult = Invoke-BridgeJson @('test', 'recipe', 'plan', [string]$descriptor.testRecipe)
     $postPlan = Require-BridgeSuccess 'planning' 'fix-recipe-plan' 'recipe-plan-after-registration' $postPlanResult
-    $noOp = (-not [bool]$script:Report.deployment.changed) -and [bool]$postPlan.alreadySatisfied
+    $artifactStateMatches = $null -ne $artifactState -and
+        [string]$artifactState.project -eq $Project -and
+        [string]$artifactState.deployedArtifactSha256 -eq $builtHash -and
+        [int]$artifactState.generation -eq $generationBefore
+    $noOp = (-not [bool]$script:Report.deployment.changed) -and
+        [bool]$postPlan.alreadySatisfied -and
+        $artifactStateMatches
     if (-not $noOp) {
         $renew = Invoke-BridgeJson @('test', 'renew', [string]$script:Report.runtime.leaseId)
         Require-BridgeSuccess 'lease' 'renew-or-end-lease' 'test-renew-before-stop' $renew | Out-Null
@@ -583,10 +679,16 @@ try {
         $script:Report.runtime.maintenanceReady = $true
         $script:Report.runtime.intentionallyInMaintenance = $true
 
-        Copy-AtomicFile $expectedArtifact $descriptor.ResolvedTarget
+        if ($script:Report.deployment.changed) {
+            try {
+                Copy-AtomicFile $expectedArtifact $descriptor.ResolvedTarget
+            } catch {
+                Set-Failure 'deployment' 'repair-deployment-then-ensure-ready' 'DEVELOPMENT_DEPLOYMENT_FAILED' $_.Exception.Message 'atomic deployment' 4 $null $true
+            }
+        }
         $deployedAfter = Get-Hash $descriptor.ResolvedTarget
         $script:Report.deployment.deployedSha256After = $deployedAfter
-        $script:Report.deployment.atomicReplacement = $true
+        $script:Report.deployment.atomicReplacement = [bool]$script:Report.deployment.changed
         if ($deployedAfter -ne $builtHash) {
             Set-Failure 'deployment' 'repair-deployment-then-ensure-ready' 'DEVELOPMENT_DEPLOYMENT_HASH_MISMATCH' 'deployed artifact hash does not match the staged build' 'atomic deployment' 4 $deployedAfter $true
         }
@@ -605,26 +707,63 @@ try {
         if ([string]$readyResponse.state -ne 'READY' -or ($expectedProjects | Where-Object { $_ -notin $actualProjects }).Count -gt 0) {
             Set-Failure 'ensure-ready' 'reconnect-and-inspect-generation' 'DEVELOPMENT_GENERATION_PROFILE_MISMATCH' 'accepted generation is not READY with the intended project profile' $ready.Command $ready.ExitCode $ready.Output $true
         }
+        $generationAfter = [int]$readyResponse.generation
+        if ($generationAfter -le $generationBefore) {
+            Set-Failure 'ensure-ready' 'reconnect-and-inspect-generation' 'DEVELOPMENT_GENERATION_MISMATCH' 'deployment did not establish a newer accepted generation' $ready.Command $ready.ExitCode $ready.Output $true
+        }
+    } else {
+        $deployedAfter = Get-Hash $descriptor.ResolvedTarget
+        $script:Report.deployment.deployedSha256After = $deployedAfter
+        if ($deployedAfter -ne $builtHash) {
+            Set-Failure 'freshness' 'repair-deployment-then-ensure-ready' 'DEVELOPMENT_DEPLOYED_ARTIFACT_CHANGED' 'the deployed artifact changed after the byte-identical fast path check' 'artifact hash verification' 4 $deployedAfter $false
+        }
+        $generationAfter = $generationBefore
     }
 
-    $renew = Invoke-BridgeJson @('test', 'renew', [string]$script:Report.runtime.leaseId)
-    Require-BridgeSuccess 'lease' 'renew-or-end-lease' 'test-renew-before-recipe' $renew | Out-Null
-    $recipeArguments = @('test', 'recipe', 'run', [string]$descriptor.testRecipe, '--lease', [string]$script:Report.runtime.leaseId)
-    $recipeRun = Invoke-BridgeJson $recipeArguments
-    $recipeResponse = Require-BridgeSuccess 'recipe' 'inspect-recipe-evidence' 'recipe-run' $recipeRun $false
-    $script:Report.recipe = [ordered]@{
-        id = [string]$descriptor.testRecipe
-        success = [bool]$recipeResponse.success
-        generation = [int]$recipeResponse.generation
-        leaseId = [string]$recipeResponse.leaseId
-        failureFingerprint = [string]$recipeResponse.failureFingerprint
-        evidence = [string]$recipeResponse.evidence
-        finalNextAction = Limit-Text ([string]$recipeResponse.finalNextAction)
-        output = $recipeRun.Output
+    $script:Report.runtime.generationAfter = $generationAfter
+    $script:Report.runtime.generation = $generationAfter
+    $script:Report.artifactFreshness.deployedArtifactSha256 = $script:Report.deployment.deployedSha256After
+    $script:Report.artifactFreshness.generationAfter = $generationAfter
+    $script:Report.artifactFreshness.generation = $generationAfter
+    if ($script:Report.deployment.changed -or $generationAfter -gt $generationBefore) {
+        $script:Report.artifactFreshness.loadedArtifactFreshnessProven = $true
+        $script:Report.artifactFreshness.proof = 'deployment-hash-plus-new-owned-generation'
+    } elseif ($artifactStateMatches) {
+        $script:Report.artifactFreshness.loadedArtifactFreshnessProven = $true
+        $script:Report.artifactFreshness.proof = 'identical-deployment-hash-plus-owned-generation-state'
+    } else {
+        Set-Failure 'freshness' 'rebuild-or-establish-artifact-state' 'DEVELOPMENT_ARTIFACT_FRESHNESS_UNKNOWN' 'the current generation has no matching DevBridge artifact state evidence' 'artifact freshness proof' 4 $null $false
     }
-    $script:Report.runtime.generation = [int]$recipeResponse.generation
-    $script:Report.runtime.acceptedProfileFingerprint = [string]$recipeResponse.profileFingerprint
-    $script:Report.runtime.requestedProjects = @($recipeResponse.requestedProjects)
+    Write-ArtifactState $generationAfter ([string]$script:Report.deployment.deployedSha256After)
+
+    if (-not $SkipRecipe) {
+        $renew = Invoke-BridgeJson @('test', 'renew', [string]$script:Report.runtime.leaseId)
+        Require-BridgeSuccess 'lease' 'renew-or-end-lease' 'test-renew-before-recipe' $renew | Out-Null
+        $recipeArguments = @('test', 'recipe', 'run', [string]$descriptor.testRecipe, '--lease', [string]$script:Report.runtime.leaseId)
+        if (-not [string]::IsNullOrWhiteSpace($WorkflowId)) {
+            $recipeArguments += @('--workflow-id', $WorkflowId)
+        }
+        $recipeRun = Invoke-BridgeJson $recipeArguments
+        $recipeResponse = Require-BridgeSuccess 'recipe' 'inspect-recipe-evidence' 'recipe-run' $recipeRun $false
+        $script:Report.recipe = [ordered]@{
+            id = [string]$descriptor.testRecipe
+            success = [bool]$recipeResponse.success
+            generation = [int]$recipeResponse.generation
+            leaseId = [string]$recipeResponse.leaseId
+            runId = [string]$recipeResponse.runId
+            workflowId = [string]$recipeResponse.workflowId
+            operationIds = @($recipeResponse.operations | ForEach-Object { [string]$_.operationId } | Where-Object { $_ }) | Select-Object -First 8
+            failureFingerprint = [string]$recipeResponse.failureFingerprint
+            evidence = [string]$recipeResponse.evidence
+            finalNextAction = Limit-Text ([string]$recipeResponse.finalNextAction)
+            output = $recipeRun.Output
+        }
+        $script:Report.runtime.acceptedProfileFingerprint = [string]$recipeResponse.profileFingerprint
+        $script:Report.runtime.requestedProjects = @($recipeResponse.requestedProjects)
+    }
+    $script:Report.artifactFreshness.transactionId = $transactionId
+    $script:Report.artifactFreshness.workflowId = $WorkflowId
+    $script:Report.artifactFreshness.leaseId = $script:Report.runtime.leaseId
     $script:Report.success = $true
     $script:Report.stage = 'complete'
     $script:Report.nextAction = 'safe-next-action'
@@ -643,6 +782,8 @@ catch {
             message = Limit-Text $_.Exception.Message
             output = Limit-Text $_.ScriptStackTrace
         }
+        $script:Report.artifactFreshness.errorCode = 'DEVELOPMENT_TRANSACTION_FAILED'
+        $script:Report.artifactFreshness.loadedArtifactFreshnessProven = $false
         $script:KeepOwnership = $script:MaintenanceEstablished
     }
 }
@@ -657,8 +798,85 @@ finally {
     [Environment]::SetEnvironmentVariable('DEVBRIDGE_SESSION', $script:OldSession, 'Process')
 }
 
+function Get-CompactJsonReport {
+    $build = if ($null -eq $script:Report.build) {
+        $null
+    } else {
+        [ordered]@{
+            exitCode = [int]$script:Report.build.exitCode
+            timedOut = [bool]$script:Report.build.timedOut
+            builtSha256 = [string]$script:Report.build.builtSha256
+        }
+    }
+    $deployment = if ($null -eq $script:Report.deployment) {
+        $null
+    } else {
+        [ordered]@{
+            changed = [bool]$script:Report.deployment.changed
+            atomicReplacement = [bool]$script:Report.deployment.atomicReplacement
+            builtSha256 = [string]$script:Report.deployment.builtSha256
+            stagedSha256 = [string]$script:Report.deployment.stagedSha256
+            deployedSha256Before = [string]$script:Report.deployment.deployedSha256Before
+            deployedSha256After = [string]$script:Report.deployment.deployedSha256After
+        }
+    }
+    $runtime = [ordered]@{
+        generation = [int]$script:Report.runtime.generation
+        generationBefore = $script:Report.runtime.generationBefore
+        generationAfter = $script:Report.runtime.generationAfter
+        leaseId = $script:Report.runtime.leaseId
+        registrationId = $script:Report.runtime.registrationId
+        maintenanceReady = [bool]$script:Report.runtime.maintenanceReady
+        requestedProjects = @($script:Report.runtime.requestedProjects | Select-Object -First 8)
+    }
+    $recipe = if ($null -eq $script:Report.recipe) {
+        $null
+    } else {
+        [ordered]@{
+            id = [string]$script:Report.recipe.id
+            success = [bool]$script:Report.recipe.success
+            generation = [int]$script:Report.recipe.generation
+            runId = [string]$script:Report.recipe.runId
+            workflowId = [string]$script:Report.recipe.workflowId
+            operationIds = @($script:Report.recipe.operationIds | Select-Object -First 8)
+            failureFingerprint = [string]$script:Report.recipe.failureFingerprint
+        }
+    }
+    $failure = if ($null -eq $script:Report.failure) {
+        $null
+    } else {
+        [ordered]@{
+            stage = [string]$script:Report.failure.stage
+            errorCode = [string]$script:Report.failure.errorCode
+            message = Limit-Text ([string]$script:Report.failure.message) 1024
+        }
+    }
+    return [ordered]@{
+        schemaVersion = $script:Report.schemaVersion
+        transactionId = $script:Report.transactionId
+        project = $script:Report.project
+        workflowId = $script:Report.workflowId
+        sourceFingerprint = $script:Report.sourceFingerprint
+        success = [bool]$script:Report.success
+        stage = $script:Report.stage
+        nextAction = $script:Report.nextAction
+        exitCode = [int]$script:Report.exitCode
+        build = $build
+        deployment = $deployment
+        runtime = $runtime
+        artifactFreshness = $script:Report.artifactFreshness
+        recipe = $recipe
+        failure = $failure
+        cleanup = [ordered]@{
+            registrationReleased = [bool]$script:Report.cleanup.registrationReleased
+            leaseReleased = [bool]$script:Report.cleanup.leaseReleased
+            deferred = [bool]$script:Report.cleanup.deferred
+        }
+    }
+}
+
 if ($Json) {
-    $script:Report | ConvertTo-Json -Depth 20 -Compress
+    Get-CompactJsonReport | ConvertTo-Json -Depth 20 -Compress
 } else {
     if ($script:Report.success) {
         Write-Output ("PASS mod-test project={0} generation={1} builtSha256={2} deployedSha256={3}" -f

@@ -1,0 +1,163 @@
+name: Live autonomous stack smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live-stack-smoke:
+    name: DevBridge2 RimBridgeServer RimWorld smoke
+    runs-on: [self-hosted, Windows, rimworld]
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out DevBridge2
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          path: DevBridge2
+
+      - name: Check out RimTest
+        uses: actions/checkout@v5
+        with:
+          repository: lanwoodall423/RimTest
+          fetch-depth: 0
+          path: RimTest
+
+      - name: Check out RimError
+        uses: actions/checkout@v5
+        with:
+          repository: lanwoodall423/RimError
+          fetch-depth: 0
+          path: RimError
+
+      - name: Build offline dependencies and stage runtime inputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:RIMWORLD_ROOT)) {
+              throw 'LIVE_PREREQUISITE_MISSING: set RIMWORLD_ROOT on the self-hosted Windows runner.'
+          }
+          dotnet build .\RimTest\RimTest.sln --configuration Release --nologo
+          if ($LASTEXITCODE -ne 0) { throw 'RimTest Release build failed.' }
+          dotnet build .\RimError\RimError.sln --configuration Release --nologo
+          if ($LASTEXITCODE -ne 0) { throw 'RimError Release build failed.' }
+          Push-Location .\DevBridge2
+          try {
+              pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\validate.ps1
+              if ($LASTEXITCODE -ne 0) { throw 'DevBridge2 offline validation failed.' }
+              $sourceRoot = (Resolve-Path .).Path
+              $runtimeRoot = Join-Path $env:RIMWORLD_ROOT 'Mods\DevBridge2'
+              if (-not (Test-Path -LiteralPath $runtimeRoot -PathType Container)) {
+                  throw "LIVE_PREREQUISITE_MISSING: active DevBridge2 mod root is missing: $runtimeRoot"
+              }
+              $runtimeFiles = @(
+                  'DevBridge.cmd',
+                  'global.json',
+                  'scripts\mod-test.ps1',
+                  'DevelopmentProjects\frontier.json',
+                  'DevelopmentProjects\live-stack-fixture.json',
+                  'TestRecipes\mod-development-smoke.json',
+                  'TestRecipes\live-stack-smoke.json',
+                  'TestRecipes\live-stack-diagnostic.json',
+                  'Source\BridgeTools\DevBridge2.BridgeTools.csproj',
+                  'TestSupport\ModDevelopmentFixture\DevBridge.ModFixture.csproj',
+                  'TestSupport\ModDevelopmentFixture\FixtureMarker.cs'
+              )
+              foreach ($relative in $runtimeFiles) {
+                  $source = Join-Path $sourceRoot $relative
+                  $destination = Join-Path $runtimeRoot $relative
+                  if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Source runtime input is missing: $source" }
+                  New-Item -ItemType Directory -Force -Path (Split-Path $destination -Parent) | Out-Null
+                  Copy-Item -LiteralPath $source -Destination $destination -Force
+              }
+              $compatibilityDestination = Join-Path $runtimeRoot 'RimBridgeProtocolCompatibility.json'
+              if (-not (Test-Path -LiteralPath $compatibilityDestination -PathType Leaf)) {
+                  Copy-Item -LiteralPath (Join-Path $sourceRoot 'RimBridgeProtocolCompatibility.json') -Destination $compatibilityDestination
+              }
+          } finally {
+              Pop-Location
+          }
+
+      - name: Require self-hosted RimWorld prerequisite
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sourceRoot = Join-Path $env:GITHUB_WORKSPACE 'DevBridge2'
+          $runtimeRoot = Join-Path $env:RIMWORLD_ROOT 'Mods\DevBridge2'
+          $rimTestRoot = Join-Path $env:GITHUB_WORKSPACE 'RimTest'
+          $rimErrorRoot = Join-Path $env:GITHUB_WORKSPACE 'RimError'
+          $testExe = Join-Path $rimTestRoot 'src\RimTest.Cli\bin\Release\net8.0\RimTest.Cli.exe'
+          $errorExe = Join-Path $rimErrorRoot 'src\RimError.Cli\bin\Release\net8.0\rimerror.exe'
+          $planArgs = @(
+              '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+              (Join-Path $sourceRoot 'scripts\live-stack-smoke.ps1'),
+              '-Plan', '-Json',
+              '-DevBridgeRoot', $runtimeRoot,
+              '-SourceRepositoryRoot', $sourceRoot,
+              '-RimWorldRoot', $env:RIMWORLD_ROOT,
+              '-RimTestRoot', $rimTestRoot,
+              '-RimTestPath', $testExe,
+              '-RimErrorPath', $errorExe
+          )
+          $planOutput = & pwsh @planArgs 2>&1
+          $planExit = $LASTEXITCODE
+          Write-Output ($planOutput -join [Environment]::NewLine)
+          if ($planExit -ne 0) {
+              throw "LIVE_PREREQUISITE_MISSING: live-stack-smoke plan refused to run (exit $planExit)."
+          }
+
+      - name: Publish current DevBridge runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Push-Location .\DevBridge2
+          try {
+              $runtimeRoot = Join-Path $env:RIMWORLD_ROOT 'Mods\DevBridge2'
+              pwsh -NoProfile -ExecutionPolicy Bypass -File .\Publish-DevBridge.ps1 `
+                  -CoordinatorOutput (Join-Path $runtimeRoot 'Coordinator') `
+                  -DeploymentRoot $runtimeRoot `
+                  -DeployCompanion -SkipIfIdentical
+              if ($LASTEXITCODE -ne 0) { throw 'DevBridge2 coordinator/companion publish failed.' }
+              pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\dev-publish.ps1 `
+                  -DeploymentRoot $runtimeRoot `
+                  -RimWorldManagedDir (Join-Path $env:RIMWORLD_ROOT 'RimWorldWin64_Data\Managed') `
+                  -ChangedFile 'Source/Mod/DevBridge2Mod.cs' -Json
+              if ($LASTEXITCODE -ne 0) { throw 'DevBridge2 mod deployment failed.' }
+          } finally {
+              Pop-Location
+          }
+
+      - name: Run canonical live stack smoke
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sourceRoot = Join-Path $env:GITHUB_WORKSPACE 'DevBridge2'
+          $runtimeRoot = Join-Path $env:RIMWORLD_ROOT 'Mods\DevBridge2'
+          $rimTestRoot = Join-Path $env:GITHUB_WORKSPACE 'RimTest'
+          $rimErrorRoot = Join-Path $env:GITHUB_WORKSPACE 'RimError'
+          $report = Join-Path $env:GITHUB_WORKSPACE 'live-stack-smoke-ci.json'
+          $smokeArgs = @(
+              '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+              (Join-Path $sourceRoot 'scripts\live-stack-smoke.ps1'),
+              '-Json',
+              '-DevBridgeRoot', $runtimeRoot,
+              '-SourceRepositoryRoot', $sourceRoot,
+              '-RimWorldRoot', $env:RIMWORLD_ROOT,
+              '-RimTestRoot', $rimTestRoot,
+              '-RimTestPath', (Join-Path $rimTestRoot 'src\RimTest.Cli\bin\Release\net8.0\RimTest.Cli.exe'),
+              '-RimErrorPath', (Join-Path $rimErrorRoot 'src\RimError.Cli\bin\Release\net8.0\rimerror.exe'),
+              '-ReportPath', $report
+          )
+          & pwsh @smokeArgs
+          if ($LASTEXITCODE -ne 0) { throw "Canonical live stack smoke failed (exit $LASTEXITCODE)." }
+
+      - name: Upload compact smoke report
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: live-stack-smoke-report
+          path: ${{ github.workspace }}/live-stack-smoke-ci.json
+          if-no-files-found: warn

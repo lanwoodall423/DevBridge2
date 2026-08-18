@@ -21,3 +21,11 @@ The value is request-scoped and is not added to durable lifecycle state or a dup
 For owner lookup, use the returned recipe runId, generation, leaseId, evidenceId, and
 DevBridge.cmd status --json / DevBridge.cmd evidence show <id> --json; use
 DevBridge.cmd history diagnose <generation> for generation comparisons.
+
+The `scripts/mod-test.ps1` owner transaction also accepts `--source-fingerprint` and
+`--skip-recipe`. Its `devbridge-mod-development/v1` JSON reports artifactFreshness and binds the
+fingerprint to staged/deployed hashes and generation-before/after. Since the runtime cannot
+introspect an external DLL hash directly, the loaded-artifact proof is intentionally conservative:
+a changed deployment requires a newer owned generation, and an identical deployment requires a
+matching DevBridge-owned artifact-state marker. Missing or contradictory evidence is failure, not
+an inferred causal match.

@@ -237,6 +237,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\mod-test.ps1 `
   -CoordinatorRoot <runtime-root> -Json
 ```
 
+`-DevelopmentRoot` may be repeated as `-AdditionalDevelopmentRoot` when the descriptor and
+source project live in different authoritative roots. RimTest uses one target repository root plus
+the DevBridge coordinator root; the owner still validates every resolved source path before build.
+
 The `devbridge-mod-development/v1` descriptor contains only the project alias, source `.csproj`,
 `Debug`/`Release` configuration, expected assembly, deployment-relative path, and declared recipe.
 The transaction plans first, builds into bounded staging, compares SHA-256 bytes, then uses the
@@ -247,6 +251,19 @@ satisfied generation/recipe is a no-op. On uncertainty the report preserves main
 and gives a stable stage/next action; it never kills, restarts, edits ModsConfig, or rewrites a
 baseline. Lower-level `project`, `test`, `stop`, `ensure-ready`, `wait-ready`, and `status` commands
 remain the recovery and advanced-use interface.
+
+RimTest uses this transaction in owner mode with `-SourceFingerprint` and `-SkipRecipe`: DevBridge2
+performs the build/deploy/generation/readiness work once, then RimTest runs the selected affected
+recipes through its normal catalog path. The bounded `-Json` projection includes
+`artifactFreshness` with the source fingerprint, staged/deployed hashes, deployment decision,
+generation-before/after, transaction/workflow/lease identities, and a boolean proof. DevBridge2
+does not introspect a loaded external DLL hash. Instead, proof is conservative: a changed artifact
+must be followed by a newer generation owned by this transaction, while a byte-identical fast path
+requires matching DevBridge-owned artifact state for the current generation. Missing state,
+generation mismatch, deployment failure, or readiness uncertainty fails closed. The marker at
+`Runtime/mod-development-artifact.json` is owner-written transaction evidence; it is not a second
+lifecycle authority. The `mod-development-smoke` recipe alone only establishes declared-project
+and Quicktest readiness and must not be described as current-source build/load proof.
 
 ## Process-level fake-host verification
 

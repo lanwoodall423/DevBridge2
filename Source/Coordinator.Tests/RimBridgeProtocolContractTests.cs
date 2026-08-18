@@ -17,11 +17,13 @@ internal static partial class OfflineTests
         JsonElement server = root.GetProperty("rimBridgeServer");
         JsonElement bridgeTools = root.GetProperty("bridgeTools");
 
-        Assert(root.GetProperty("contractVersion").GetInt32() == 1 &&
+        JsonElement testedVersions = server.GetProperty("testedVersions");
+        Assert(testedVersions.ValueKind == JsonValueKind.Array &&
+               testedVersions.EnumerateArray().All(IsValidTestedVersionRecord) &&
+               root.GetProperty("contractVersion").GetInt32() == 1 &&
                gabp.GetProperty("major").GetInt32() == RimBridgeProtocolContract.GabpMajor &&
                gabp.GetProperty("envelopeVersion").GetString() ==
                    RimBridgeProtocolContract.EnvelopeVersion &&
-               server.GetProperty("testedVersions").GetArrayLength() == 0 &&
                bridgeTools.GetProperty("sdkPackage").GetString() == "RimBridgeServer.Sdk" &&
                bridgeTools.GetProperty("sdkPackageVersion").GetString() ==
                    RimBridgeProtocolContract.BridgeToolsSdkPackageVersion &&
@@ -39,6 +41,27 @@ internal static partial class OfflineTests
         Assert(sdkVersion.Success && sdkVersion.Groups[1].Value ==
                    RimBridgeProtocolContract.BridgeToolsSdkPackageVersion,
             "BridgeTools SDK package version must be updated together with compatibility metadata");
+    }
+
+    private static bool IsValidTestedVersionRecord(JsonElement value)
+    {
+        if (value.ValueKind != JsonValueKind.Object)
+            return false;
+        string[] required =
+        [
+            "rimWorldVersion",
+            "rimBridgeServerVersion",
+            "rimBridgeServerSdkVersion",
+            "devBridge2Commit",
+            "verifiedAtUtc",
+            "result"
+        ];
+        return required.All(name =>
+            value.TryGetProperty(name, out JsonElement property) &&
+            property.ValueKind == JsonValueKind.String &&
+            !string.IsNullOrWhiteSpace(property.GetString())) &&
+            string.Equals(value.GetProperty("result").GetString(), "pass",
+                StringComparison.OrdinalIgnoreCase);
     }
 
     private static void TestRimBridgeProtocolTypedFixtures()

@@ -193,6 +193,8 @@ internal static partial class OfflineTests
             "wait-ready must remain a durable wait");
         Assert(!CoordinatorResponsePolicy.IsFinite("restart", Array.Empty<string>()),
             "restart must remain a durable wait");
+        Assert(!CoordinatorResponsePolicy.IsFinite("ensure-ready", Array.Empty<string>()),
+            "ensure-ready must remain a durable wait");
         Assert(!CoordinatorResponsePolicy.IsFinite("test", new[] { "begin" }),
             "test begin must remain a durable wait");
         Assert(!CoordinatorResponsePolicy.IsFinite("test", new[] { "session" }),

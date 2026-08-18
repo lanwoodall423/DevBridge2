@@ -1,6 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
+    <!-- The live-stack gate places this deterministic assembly in an active
+         RimWorld mod, so it must be loadable by RimWorld's net472 runtime. -->
+    <TargetFramework>net472</TargetFramework>
+    <LangVersion>latest</LangVersion>
     <AssemblyName>DevBridge.ModFixture</AssemblyName>
     <RootNamespace>DevBridge.ModFixture</RootNamespace>
     <Nullable>enable</Nullable>

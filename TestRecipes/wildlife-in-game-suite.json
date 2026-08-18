@@ -1,0 +1,39 @@
+{
+  "schemaVersion": "devbridge-test-recipe/v2",
+  "id": "wildlife-in-game-suite",
+  "description": "Run the Wildlife gameplay assertion suite through its authenticated RimBridgeServer companion.",
+  "projects": ["wildlife"],
+  "inputs": {
+    "quicktest": true
+  },
+  "requiresReady": true,
+  "allowInGameMutation": true,
+  "success": {
+    "quicktestReady": true,
+    "companionVerified": true,
+    "rimBridgeReady": true
+  },
+  "operations": [
+    {
+      "tool": "wildlife/run-test-suite",
+      "arguments": {},
+      "expect": {
+        "success": true,
+        "assertions": [
+          { "pointer": "/success", "equals": true },
+          { "pointer": "/status", "equals": "PASS" },
+          { "pointer": "/suite", "equals": "WildlifeInGameTestSuite" },
+          { "pointer": "/reportPath", "exists": true }
+        ]
+      }
+    }
+  ],
+  "budget": {
+    "timeoutSeconds": 900,
+    "maxRimWorldLaunches": 1,
+    "maxRecipeAttempts": 1,
+    "maxCoordinatorRefreshes": 4,
+    "stopOnRepeatedFailureFingerprint": true,
+    "maxRepeatedFailureCount": 1
+  }
+}

@@ -4,7 +4,7 @@ DevBridge2 is a Windows/.NET developer coordinator for RimWorld. It owns safe lo
 operations, test leases, readiness evidence, ModsConfig profiles, generation history, recovery, and
 optional authenticated RimBridgeServer routing. It is designed for multiple agents sharing one local
 RimWorld installation; it does not replace RimBridgeServer's live-game tools.
-When RimTest is present, it is the normal agent entry point. DevBridge2 remains the sole lifecycle
+When RimLiaison is present, it is the normal agent entry point. DevBridge2 remains the sole lifecycle
 owner: agents must not start RimWorld independently through GABS, and profile/ModsConfig mutations
 remain with DevBridge2 while it owns a generation.
 
@@ -49,7 +49,7 @@ It is a self-hosted Windows operation. It first runs `-Plan -Json` checks, then 
 deterministic, net472-loadable fixture into staging, hash and deploy it into the active declared
 project mod's RimWorld `1.6\Assemblies` path when needed, and establish a verified generation. It
 then runs the `live-stack-smoke` semantic recipe,
-RimTest capability discovery, a bounded RimTest UI target/screenshot capture, and the controlled
+RimLiaison capability discovery, a bounded RimLiaison UI target/screenshot capture, and the controlled
 `live-stack-diagnostic` recipe. The resulting operation is ingested through RimError and must retain
 the operation, workflow, and generation identities. Cleanup ends the owner lease and verifies that it
 is absent. No step launches GABS, edits `ModsConfig.xml`, or treats `_quarantine` as an installed mod.
@@ -99,14 +99,14 @@ More operational guidance is in [`START_HERE.md`](START_HERE.md) and [`MAINTENAN
 The ownership and state model is summarized in [`docs/architecture.md`](docs/architecture.md).
 The optional cross-stack workflow correlation contract is summarized in [`docs/correlation.md`](docs/correlation.md).
 
-When working from a RimTest target repository, the normal loop is simply edit, run
-`rimtest affected --run --json`, inspect the result, and edit again. RimTest automatically invokes
+When working from a RimLiaison target repository, the normal loop is simply edit, run
+`rimliaison affected --run --json`, inspect the result, and edit again. RimLiaison automatically invokes
 the owner transaction for build-relevant changes. Inspect `artifactFreshness` before treating a
 source-change PASS as valid; `loadedArtifactFreshnessProven: false` is a fail-closed result, not a
 successful Quicktest.
 
 DevBridge2's independent Windows validation includes the complete deterministic fake/process-host
-E2E suite. The no-RimWorld cross-stack contract gate is owned by RimTest and consumes pinned
+E2E suite. The no-RimWorld cross-stack contract gate is owned by RimLiaison and consumes pinned
 DevBridge2 revisions through the versioned recipe, generation, and artifact-freshness envelopes;
 it is a composition check, not a replacement for this repository's lifecycle tests or the
 self-hosted real-RimWorld smoke.

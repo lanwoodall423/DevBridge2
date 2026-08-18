@@ -3,8 +3,10 @@ param(
     [string]$DevBridgeRoot,
     [string]$SourceRepositoryRoot,
     [string]$RimWorldRoot,
-    [string]$RimTestRoot,
-    [string]$RimTestPath,
+    [Alias('RimTestRoot')]
+    [string]$RimLiaisonRoot,
+    [Alias('RimTestPath')]
+    [string]$RimLiaisonPath,
     [string]$RimErrorPath,
     [string]$RimErrorStorePath,
     [string]$RimErrorLogPath,
@@ -58,13 +60,16 @@ if ([string]::IsNullOrWhiteSpace($RimWorldRoot)) {
 }
 $RimWorldRoot = Resolve-FullPath $RimWorldRoot
 
-if ([string]::IsNullOrWhiteSpace($RimTestRoot)) {
-    $RimTestRoot = [Environment]::GetEnvironmentVariable('RIMTEST_ROOT')
+if ([string]::IsNullOrWhiteSpace($RimLiaisonRoot)) {
+    $RimLiaisonRoot = [Environment]::GetEnvironmentVariable('RIMLIAISON_ROOT')
 }
-if ([string]::IsNullOrWhiteSpace($RimTestRoot)) {
-    $RimTestRoot = Join-Path (Split-Path $DevBridgeRoot -Parent) 'RimTest'
+if ([string]::IsNullOrWhiteSpace($RimLiaisonRoot)) {
+    $RimLiaisonRoot = [Environment]::GetEnvironmentVariable('RIMTEST_ROOT')
 }
-$RimTestRoot = Resolve-FullPath $RimTestRoot
+if ([string]::IsNullOrWhiteSpace($RimLiaisonRoot)) {
+    $RimLiaisonRoot = Join-Path (Split-Path $DevBridgeRoot -Parent) 'RimLiaison'
+}
+$RimLiaisonRoot = Resolve-FullPath $RimLiaisonRoot
 
 $devBridgeCommand = Join-Path $DevBridgeRoot 'DevBridge.cmd'
 $modTestScript = Join-Path $DevBridgeRoot 'scripts\mod-test.ps1'
@@ -74,21 +79,24 @@ $descriptorPath = if ([string]::IsNullOrWhiteSpace($DescriptorPath)) {
     Resolve-FullPath $DescriptorPath
 }
 
-if ([string]::IsNullOrWhiteSpace($RimTestPath)) {
-    $RimTestPath = [Environment]::GetEnvironmentVariable('RIMTEST_CMD')
+if ([string]::IsNullOrWhiteSpace($RimLiaisonPath)) {
+    $RimLiaisonPath = [Environment]::GetEnvironmentVariable('RIMLIAISON_CMD')
 }
-if ([string]::IsNullOrWhiteSpace($RimTestPath)) {
-    $RimTestPath = Join-Path $RimTestRoot 'src\RimTest.Cli\bin\Release\net8.0\RimTest.Cli.exe'
+if ([string]::IsNullOrWhiteSpace($RimLiaisonPath)) {
+    $RimLiaisonPath = [Environment]::GetEnvironmentVariable('RIMTEST_CMD')
 }
-if (-not [string]::IsNullOrWhiteSpace($RimTestPath) -and $RimTestPath -notmatch '^[A-Za-z]:[\\/]') {
-    $RimTestPath = Resolve-FullPath $RimTestPath
+if ([string]::IsNullOrWhiteSpace($RimLiaisonPath)) {
+    $RimLiaisonPath = Join-Path $RimLiaisonRoot 'src\RimLiaison.Cli\bin\Release\net8.0\rimliaison.exe'
+}
+if (-not [string]::IsNullOrWhiteSpace($RimLiaisonPath) -and $RimLiaisonPath -notmatch '^[A-Za-z]:[\\/]') {
+    $RimLiaisonPath = Resolve-FullPath $RimLiaisonPath
 }
 
 if ([string]::IsNullOrWhiteSpace($RimErrorPath)) {
     $RimErrorPath = [Environment]::GetEnvironmentVariable('RIMERROR_CMD')
 }
 if ([string]::IsNullOrWhiteSpace($RimErrorPath)) {
-    $rimErrorRoot = Join-Path (Split-Path $RimTestRoot -Parent) 'RimError'
+    $rimErrorRoot = Join-Path (Split-Path $RimLiaisonRoot -Parent) 'RimError'
     $RimErrorPath = Join-Path $rimErrorRoot 'src\RimError.Cli\bin\Release\net8.0\rimerror.exe'
 }
 if (-not [string]::IsNullOrWhiteSpace($RimErrorPath) -and $RimErrorPath -notmatch '^[A-Za-z]:[\\/]') {
@@ -177,8 +185,9 @@ $script:Report = [ordered]@{
             commit = $null
             dirty = $null
         }
+        # Stable devbridge-live-stack-smoke/v1 field retained for existing report consumers.
         rimTest = [ordered]@{
-            path = $RimTestPath
+            path = $RimLiaisonPath
             commit = $null
         }
     }
@@ -390,9 +399,9 @@ function Invoke-DevBridge {
     return Invoke-BoundedProcess $devBridgeCommand (@('--root', $DevBridgeRoot) + $Arguments) $TimeoutSeconds
 }
 
-function Invoke-RimTest {
+function Invoke-RimLiaison {
     param([Parameter(Mandatory = $true)][string[]]$Arguments)
-    return Invoke-BoundedProcess $RimTestPath $Arguments ([Math]::Min($TimeoutSeconds, 300))
+    return Invoke-BoundedProcess $RimLiaisonPath $Arguments ([Math]::Min($TimeoutSeconds, 300))
 }
 
 function Invoke-RimError {
@@ -569,7 +578,7 @@ function Initialize-Preflight {
         rimWorldExecutable = Test-Path -LiteralPath (Join-Path $RimWorldRoot 'RimWorldWin64.exe') -PathType Leaf
         rimWorldManaged = Test-Path -LiteralPath (Join-Path $RimWorldRoot 'RimWorldWin64_Data\Managed') -PathType Container
         rimWorldVersion = Test-Path -LiteralPath (Join-Path $RimWorldRoot 'Version.txt') -PathType Leaf
-        rimTest = Test-Path -LiteralPath $RimTestPath -PathType Leaf
+        rimTest = Test-Path -LiteralPath $RimLiaisonPath -PathType Leaf
         rimError = Test-Path -LiteralPath $RimErrorPath -PathType Leaf
         descriptor = Test-Path -LiteralPath $descriptorPath -PathType Leaf
         compatibilityMetadata = Test-Path -LiteralPath $CompatibilityPath -PathType Leaf
@@ -607,7 +616,7 @@ function Initialize-Preflight {
     $script:Report.runtime.rimBridgeServerVersion = [string]$rimBridgeInfo.version
     $script:Report.runtime.rimBridgeServerSdkVersion = Get-SdkVersion
     $script:Report.runtime.devBridge2.commit = Get-GitCommit $SourceRepositoryRoot
-    $script:Report.runtime.rimTest.commit = Get-GitCommit $RimTestRoot
+    $script:Report.runtime.rimTest.commit = Get-GitCommit $RimLiaisonRoot
     $aboutPath = Join-Path $DevBridgeRoot 'About\About.xml'
     if (Test-Path -LiteralPath $aboutPath -PathType Leaf) {
         try { $script:Report.runtime.devBridge2.productVersion = [string]([xml](Get-Content $aboutPath -Raw)).ModMetaData.modVersion } catch { }
@@ -668,7 +677,7 @@ function Ensure-ReadyGeneration {
         [string](Get-Value $initial 'errorCode') -eq 'PROCESS_EXITED') {
         # A stopped/process-exited generation cannot grant a test lease. Ask
         # DevBridge to own the replacement launch and wait for its READY proof;
-        # RimTest never launches or kills RimWorld itself.
+        # RimLiaison never launches or kills RimWorld itself.
         $script:Report.runtime.recovery.action = 'restart'
         $null = Invoke-OwnerRequired @('restart', '--projects', $Project, '--json') 'readiness' 'LIVE_RECOVERY_RESTART_FAILED'
     } else {
@@ -789,9 +798,9 @@ function Run-CapabilityProbe {
     # of 20 can omit the UI provider from a real installation.  Ask for the
     # CLI's bounded maximum so the smoke verifies the complete supported
     # surface without allowing an unbounded registry response.
-    $probe = Invoke-RimTest @('--devbridge', $devBridgeCommand, '--devbridge-root', $DevBridgeRoot, 'capabilities', '--limit', '100', '--json')
+    $probe = Invoke-RimLiaison @('--devbridge', $devBridgeCommand, '--devbridge-root', $DevBridgeRoot, 'capabilities', '--limit', '100', '--json')
     if ($null -eq $probe.Json -or [string](Get-Value $probe.Json 'status') -ne 'ok') {
-        Set-Failure ([string]((Get-Value $probe.Json 'code') ?? 'LIVE_CAPABILITY_DISCOVERY_FAILED')) ([string]((Get-Value $probe.Json 'error') ?? 'RimTest could not discover the live capability registry.')) 'capabilities'
+        Set-Failure ([string]((Get-Value $probe.Json 'code') ?? 'LIVE_CAPABILITY_DISCOVERY_FAILED')) ([string]((Get-Value $probe.Json 'error') ?? 'RimLiaison could not discover the live capability registry.')) 'capabilities'
     }
     $capabilities = @((Get-Value $probe.Json 'capabilities'))
     $ids = @($capabilities | ForEach-Object { [string]((Get-Value $_ 'id') ?? (Get-Value $_ 'name')) } | Where-Object { $_ } | Select-Object -First 100)
@@ -810,7 +819,7 @@ function Run-CapabilityProbe {
 function Complete-UiEvidence {
     param([Parameter(Mandatory = $true)]$Capture)
     if ($null -eq $capture.Json -or [string](Get-Value $capture.Json 'status') -ne 'ok') {
-        Set-Failure ([string]((Get-Value $capture.Json 'code') ?? 'LIVE_UI_SCREENSHOT_FAILED')) ([string]((Get-Value $capture.Json 'error') ?? 'RimTest could not capture bounded UI evidence.')) 'ui'
+        Set-Failure ([string]((Get-Value $capture.Json 'code') ?? 'LIVE_UI_SCREENSHOT_FAILED')) ([string]((Get-Value $capture.Json 'error') ?? 'RimLiaison could not capture bounded UI evidence.')) 'ui'
     }
     $script:Report.ui.status = 'ok'
     $script:Report.ui.screenshotPath = Limit-Text ([string](Get-Value $capture.Json 'path')) 512
@@ -818,7 +827,7 @@ function Complete-UiEvidence {
     $script:Report.ui.workflowId = [string](Get-Value $capture.Json 'workflowId')
     $script:Report.ui.evidenceId = [string](Get-Value $capture.Json 'evidenceId')
     if ([string]::IsNullOrWhiteSpace($script:Report.ui.screenshotPath) -or -not (Test-Path -LiteralPath $script:Report.ui.screenshotPath -PathType Leaf)) {
-        Set-Failure 'LIVE_UI_SCREENSHOT_EVIDENCE_MISSING' 'RimTest returned no existing screenshot evidence path.' 'ui'
+        Set-Failure 'LIVE_UI_SCREENSHOT_EVIDENCE_MISSING' 'RimLiaison returned no existing screenshot evidence path.' 'ui'
     }
     # Current RimBridgeServer legacy screenshot aliases expose the server
     # operation identity but do not expose a separate evidence ID.  Bind the
@@ -836,7 +845,7 @@ function Complete-UiEvidence {
 }
 
 function Run-UiEvidence {
-    $targets = Invoke-RimTest @('--devbridge', $devBridgeCommand, '--devbridge-root', $DevBridgeRoot, 'ui', 'targets', '--json')
+    $targets = Invoke-RimLiaison @('--devbridge', $devBridgeCommand, '--devbridge-root', $DevBridgeRoot, 'ui', 'targets', '--json')
     $targetCode = [string](Get-Value $targets.Json 'code')
     $targetStatus = [string](Get-Value $targets.Json 'status')
     if ($targetStatus -ne 'ok' -and $targetCode -ne 'RIMTEST_UI_TARGETS_SCHEMA_UNSUPPORTED') {
@@ -845,20 +854,20 @@ function Run-UiEvidence {
             $script:Report.ui.supported = $false
             return
         }
-        Set-Failure ([string]($targetCode ?? 'LIVE_UI_TARGETS_FAILED')) ([string]((Get-Value $targets.Json 'error') ?? 'RimTest could not enumerate live UI targets.')) 'ui'
+        Set-Failure ([string]($targetCode ?? 'LIVE_UI_TARGETS_FAILED')) ([string]((Get-Value $targets.Json 'error') ?? 'RimLiaison could not enumerate live UI targets.')) 'ui'
     }
 
     $targetList = @((Get-Value $targets.Json 'targets'))
     if ($targetStatus -eq 'ok' -and $targetList.Count -gt 0) {
         $targetId = [string](Get-Value $targetList[0] 'id')
         if ([string]::IsNullOrWhiteSpace($targetId)) {
-            Set-Failure 'LIVE_UI_TARGET_DESCRIPTOR_INVALID' 'RimTest returned a UI target without an identity.' 'ui'
+            Set-Failure 'LIVE_UI_TARGET_DESCRIPTOR_INVALID' 'RimLiaison returned a UI target without an identity.' 'ui'
         }
         $script:Report.ui.captureMode = 'target'
         $script:Report.ui.targetCount = $targetList.Count
         $script:Report.ui.targetId = $targetId
         $script:Report.ui.supported = $true
-        $capture = Invoke-RimTest @('--devbridge', $devBridgeCommand, '--devbridge-root', $DevBridgeRoot, 'ui', 'screenshot', '--target', $targetId, '--json')
+        $capture = Invoke-RimLiaison @('--devbridge', $devBridgeCommand, '--devbridge-root', $DevBridgeRoot, 'ui', 'screenshot', '--target', $targetId, '--json')
         Complete-UiEvidence $capture
         return
     }
@@ -877,7 +886,7 @@ function Run-UiEvidence {
     $script:Report.ui.cellRect = $cellRect
     $script:Report.ui.targetCount = 0
     $script:Report.ui.supported = $true
-    $capture = Invoke-RimTest @('--devbridge', $devBridgeCommand, '--devbridge-root', $DevBridgeRoot, 'ui', 'screenshot', '--cell-rect', $cellRect, '--json')
+    $capture = Invoke-RimLiaison @('--devbridge', $devBridgeCommand, '--devbridge-root', $DevBridgeRoot, 'ui', 'screenshot', '--cell-rect', $cellRect, '--json')
     Complete-UiEvidence $capture
 }
 
@@ -1122,7 +1131,7 @@ try {
     if ($outputJson.Length -gt $script:MaxOutputChars) {
         $script:Report.preflight.checks = [ordered]@{ status = [string]$script:Report.preflight.status }
         $script:Report.fixture.descriptor = [IO.Path]::GetFileName($descriptorPath)
-        $script:Report.runtime.rimTest.path = [IO.Path]::GetFileName($RimTestPath)
+        $script:Report.runtime.rimTest.path = [IO.Path]::GetFileName($RimLiaisonPath)
         $script:Report.capabilities.observed = @($script:Report.capabilities.observed | Select-Object -First 8)
         $script:Report.recipe.operations = @($script:Report.recipe.operations | Select-Object -First 2)
         $outputJson = ConvertTo-Json -InputObject $script:Report -Compress -Depth 24

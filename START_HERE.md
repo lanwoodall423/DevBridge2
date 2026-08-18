@@ -14,7 +14,7 @@ see `MAINTENANCE.md`.
 
 ## Complete live-stack smoke
 
-To verify the installed RimWorld, DevBridge2, RimBridgeServer, RimTest, and RimError stack as one
+To verify the installed RimWorld, DevBridge2, RimBridgeServer, RimLiaison, and RimError stack as one
 transaction, use the canonical script below on a Windows machine that has the game installed:
 
 ```powershell
@@ -27,13 +27,13 @@ gate. The live command uses `DevelopmentProjects\live-stack-fixture.json` to bui
 deterministic net472 fixture through `mod-test.ps1` into the active declared project mod's
 `1.6\Assemblies` path, and uses only
 DevBridge2 for lifecycle, checks RimBridge capabilities, runs a semantic ping recipe, captures a
-bounded screenshot through RimTest, performs a controlled expected diagnostic, and verifies its
+bounded screenshot through RimLiaison, performs a controlled expected diagnostic, and verifies its
 RimError correlation. It ends its lease and verifies cleanup before recording the exact verified
 runtime tuple in `RimBridgeProtocolCompatibility.json`. It never uses the upstream GABS smoke
 harness as a second lifecycle owner.
 
 Required self-hosted inputs are `RIMWORLD_ROOT`, an active `brrainz.rimbridgeserver` mod directly
-under that installation's `Mods` directory, built RimTest and RimError CLI binaries, and the
+under that installation's `Mods` directory, the built RimLiaison and RimError CLI binaries, and the
 DevBridge2 checkout. A quarantined or merely profile-resolved RimBridgeServer is not sufficient.
 The machine-readable report is `Runtime\live-stack-smoke-last.json`; do not treat a missing report,
 unknown freshness, missing evidence, or failed cleanup as compatibility proof.

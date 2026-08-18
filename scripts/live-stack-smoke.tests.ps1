@@ -23,8 +23,8 @@ function Invoke-Plan {
         '-Plan', '-Json',
         '-DevBridgeRoot', $DevRoot,
         '-RimWorldRoot', $GameRoot,
-        '-RimTestRoot', $TestRoot,
-        '-RimTestPath', (Join-Path $TestRoot 'rimtest.cmd'),
+        '-RimLiaisonRoot', $TestRoot,
+        '-RimLiaisonPath', (Join-Path $TestRoot 'rimliaison.cmd'),
         '-RimErrorPath', (Join-Path $ErrorRoot 'rimerror.cmd')
     )
     $output = & pwsh @arguments 2>&1
@@ -54,8 +54,8 @@ function Invoke-Live {
         '-Json', '-TimeoutSeconds', '180',
         '-DevBridgeRoot', $DevRoot,
         '-RimWorldRoot', $GameRoot,
-        '-RimTestRoot', $TestRoot,
-        '-RimTestPath', (Join-Path $TestRoot 'rimtest.cmd'),
+        '-RimLiaisonRoot', $TestRoot,
+        '-RimLiaisonPath', (Join-Path $TestRoot 'rimliaison.cmd'),
         '-RimErrorPath', (Join-Path $ErrorRoot 'rimerror.cmd'),
         '-RimErrorStorePath', $ErrorStorePath,
         '-ReportPath', $ReportPath
@@ -77,7 +77,7 @@ try {
     New-Item -ItemType Directory -Force -Path $testRoot | Out-Null
     $devRoot = Join-Path $testRoot 'DevBridge2'
     $gameRoot = Join-Path $testRoot 'RimWorld'
-    $testRootFake = Join-Path $testRoot 'RimTest'
+    $testRootFake = Join-Path $testRoot 'RimLiaison'
     $errorRoot = Join-Path $testRoot 'RimError'
     $fixtureRoot = Join-Path $devRoot 'fixture'
     New-Item -ItemType Directory -Force -Path @(
@@ -123,9 +123,9 @@ exit /b %ERRORLEVEL%
         rimBridgeServer = @{ testedVersions = @(); supportStatement = 'none' }
         bridgeTools = @{ sdkPackage = 'RimBridgeServer.Sdk'; sdkPackageVersion = '2.0.0' }
     } | ConvertTo-Json -Depth 8) -Encoding utf8
-    Set-Content -LiteralPath (Join-Path $testRootFake 'rimtest.cmd') -Value @'
+    Set-Content -LiteralPath (Join-Path $testRootFake 'rimliaison.cmd') -Value @'
 @echo off
-pwsh -NoProfile -ExecutionPolicy Bypass -File "%~dp0fake-rimtest.ps1" %*
+pwsh -NoProfile -ExecutionPolicy Bypass -File "%~dp0fake-rimliaison.ps1" %*
 exit /b %ERRORLEVEL%
 '@ -Encoding ascii
     Set-Content -LiteralPath (Join-Path $errorRoot 'rimerror.cmd') -Value @'
@@ -185,7 +185,7 @@ if ($values -contains 'ensure-ready' -or $values -contains 'renew' -or $values -
 }
 Emit @{ success = $true }
 '@ -Encoding utf8
-    Set-Content -LiteralPath (Join-Path $testRootFake 'fake-rimtest.ps1') -Value @'
+    Set-Content -LiteralPath (Join-Path $testRootFake 'fake-rimliaison.ps1') -Value @'
 param([Parameter(ValueFromRemainingArguments = $true)][string[]]$InputArgs)
 $values = @($InputArgs)
 function Emit([object]$Value) { $Value | ConvertTo-Json -Depth 20 -Compress }

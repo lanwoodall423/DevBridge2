@@ -25,16 +25,16 @@
         "rimBridgeServerVersion": "2.1.0",
         "rimBridgeServerSdkVersion": "2.0.0",
         "devBridge2Version": "1.2.4",
-        "devBridge2Commit": "3643c7159e918e9932ee306a9f337308f02cd6fe",
-        "rimTestCommit": "04847a70da889b5eb384a9a543a3995add7b3a11",
+        "devBridge2Commit": "a1d56b6395f90aa118673532e74dac031cad42c7",
+        "rimTestCommit": "3431b80281b2c6ce6ab97fe0c99dfb123e7d5b25",
         "fixtureProject": "frontier",
         "fixtureModPackageId": "lan.frontier",
         "fixtureDeploymentTarget": "1.6/Assemblies/DevBridge.ModFixture.dll",
-        "fixtureArtifactSha256": "79ff1ce6a1c69d97fdd321698cc14f06e739ec2f4b86ba8e94887a68faed21a2",
-        "verifiedAtUtc": "2026-08-18T18:46:14.6017744Z",
+        "fixtureArtifactSha256": "764bcfab2a8d182affa9a3bec0035a9b8aa8015bef070f935d3fbf88f9a70427",
+        "verifiedAtUtc": "2026-08-18T22:59:04.6964056Z",
         "result": "pass",
-        "workflowId": "live-stack-b6c93bc37aea4c31830cfbd49f1c5656",
-        "generation": 305,
+        "workflowId": "live-stack-bd73db4c16a14698996cebd5b76a0e4f",
+        "generation": 318,
         "capabilitiesExpected": [
           "rimbridge/ping",
           "rimworld/get_screen_targets",
@@ -143,8 +143,8 @@
           "rimworld/press_accept"
         ],
         "evidenceIds": [
-          "sha256:0e90484f7e72685b5db0211f1395cbe26f49850790928f21a4003db153bbc9d0",
-          "d-36599e2ef3a70a8d0653e237b6535567"
+          "sha256:96df498c05b770877d813b689e2ffd553718aa7b4bab3a077db6d30e85cbec8e",
+          "d-a3885fb96cf9a5f8bdafbc490fc25c31"
         ],
         "diagnosticCorrelation": true
       }

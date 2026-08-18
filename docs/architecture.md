@@ -238,7 +238,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\mod-test.ps1 `
 ```
 
 `-DevelopmentRoot` may be repeated as `-AdditionalDevelopmentRoot` when the descriptor and
-source project live in different authoritative roots. RimTest uses one target repository root plus
+source project live in different authoritative roots. RimLiaison uses one target repository root plus
 the DevBridge coordinator root; the owner still validates every resolved source path before build.
 
 The `devbridge-mod-development/v1` descriptor contains only the project alias, source `.csproj`,
@@ -252,8 +252,8 @@ and gives a stable stage/next action; it never kills, restarts, edits ModsConfig
 baseline. Lower-level `project`, `test`, `stop`, `ensure-ready`, `wait-ready`, and `status` commands
 remain the recovery and advanced-use interface.
 
-RimTest uses this transaction in owner mode with `-SourceFingerprint` and `-SkipRecipe`: DevBridge2
-performs the build/deploy/generation/readiness work once, then RimTest runs the selected affected
+RimLiaison uses this transaction in owner mode with `-SourceFingerprint` and `-SkipRecipe`: DevBridge2
+performs the build/deploy/generation/readiness work once, then RimLiaison runs the selected affected
 recipes through its normal catalog path. The bounded `-Json` projection includes
 `artifactFreshness` with the source fingerprint, staged/deployed hashes, deployment decision,
 generation-before/after, transaction/workflow/lease identities, and a boolean proof. DevBridge2

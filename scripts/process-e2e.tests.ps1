@@ -962,7 +962,7 @@ $results.Add((Invoke-Case 'bounded mod build deploy run test transaction' {
             [string]$owner.sourceFingerprint -ne $ownerFingerprint -or
             $null -ne $owner.recipe -or
             -not [bool]$owner.artifactFreshness.loadedArtifactFreshnessProven) {
-            throw "RimTest owner-mode transaction did not return bounded freshness evidence: $ownerOutput"
+            throw "RimLiaison owner-mode transaction did not return bounded freshness evidence: $ownerOutput"
         }
 
         $suppliedLeaseId = Begin-TestLease $fixture

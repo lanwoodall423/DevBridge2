@@ -1,6 +1,6 @@
 # Workflow correlation
 
-DevBridge2 accepts an optional --workflow-id <id> on test recipe run. RimTest owns generation
+DevBridge2 accepts an optional --workflow-id <id> on test recipe run. RimLiaison owns generation
 of this bounded caller context; DevBridge does not reinterpret it as a lease, runId, generation,
 launch, or authorization identity.
 
@@ -14,7 +14,7 @@ to an operation ID.
 The fields are omitted when unavailable. Existing clients and old responses remain valid. The
 coordinator bounds and validates supplied workflow values, and downstream consumers reject
 explicit workflow or generation mismatches rather than guessing.
-RimTest may retry once without the optional request argument when an older parser explicitly
+RimLiaison may retry once without the optional request argument when an older parser explicitly
 returns TEST_RECIPE_USAGE; that refusal occurs before coordinator mutation.
 
 The value is request-scoped and is not added to durable lifecycle state or a duplicate run store.

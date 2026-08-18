@@ -8,9 +8,9 @@ Do not blindly apply consumer-project orchestration rules to the tool being deve
 
 For the stack:
 
-RimTest -> RimContext -> DevBridge2
+RimLiaison -> RimContext -> DevBridge2
 
-When developing RimTest, use RimTest's declared bootstrap/self-test workflow rather than assuming an installed RimTest validates changed RimTest source.
+When developing RimLiaison, use RimLiaison's declared bootstrap/self-test workflow rather than assuming an installed RimLiaison validates changed RimLiaison source.
 When developing RimContext or DevBridge2, direct execution of that component is allowed when required by its repository test workflow.
 Respect each layer's ownership; do not move responsibilities between layers merely to work around a failure.
 Treat structured schemas, statuses, error codes, nextAction, identifiers, and freshness semantics as integration contracts.

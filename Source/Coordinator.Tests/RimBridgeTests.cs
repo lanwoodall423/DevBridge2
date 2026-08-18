@@ -344,6 +344,19 @@ internal static partial class OfflineTests
                !json.Contains("route-secret", StringComparison.Ordinal),
             "route JSON may include profile provenance but never credentials");
 
+        // RimBridgeServer's legacy aliases return a successful payload with
+        // the OperationEnvelope nested under `operation` and CLR casing.
+        client.CallResult = WireSuccess(
+            "{\"success\":true,\"message\":\"pong\",\"operation\":{\"OperationId\":\"op-envelope\"}}");
+        BridgeRequest envelopeCall = Request("bridge", "holder", 77, "call", "rimbridge/ping",
+            "{}", "--lease", "T001");
+        envelopeCall.WorkflowId = "rw-devbridge-route-envelope";
+        int envelopeExit = fixture.State.Execute(envelopeCall, _ => { }, () => true);
+        JsonCommandResponse envelopeResponse = fixture.State.CreateJsonResponse(envelopeCall,
+            envelopeExit, Array.Empty<string>());
+        Assert(envelopeExit == 0 && envelopeResponse.RimBridgeRoute?.OperationId == "op-envelope",
+            "legacy RimBridge operation envelopes must propagate their CLR-cased nested operation identity");
+
         BridgeRequest tools = Request("bridge", "holder", 77, "tools");
         int toolsExit = fixture.State.Execute(tools, _ => { }, () => true);
         Assert(toolsExit == 0 && client.ListCalls == 1,

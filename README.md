@@ -36,6 +36,36 @@ durable state. If an older build reports a legacy runtime slot, first run that b
 `coordinator shutdown`, then run `DevBridge.cmd coordinator migrate-legacy-slot --json` with the current
 build. The migration is guarded, creates an exact state backup, and atomically updates the namespace.
 
+## Real RimWorld compatibility gate
+
+The canonical unattended end-to-end gate is the DevBridge-owned smoke script:
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\live-stack-smoke.ps1 -Json
+```
+
+It is a self-hosted Windows operation. It first runs `-Plan -Json` checks, then uses the dedicated
+`DevelopmentProjects\live-stack-fixture.json` and existing `mod-test.ps1` transaction to build the
+deterministic, net472-loadable fixture into staging, hash and deploy it into the active declared
+project mod's RimWorld `1.6\Assemblies` path when needed, and establish a verified generation. It
+then runs the `live-stack-smoke` semantic recipe,
+RimTest capability discovery, a bounded RimTest UI target/screenshot capture, and the controlled
+`live-stack-diagnostic` recipe. The resulting operation is ingested through RimError and must retain
+the operation, workflow, and generation identities. Cleanup ends the owner lease and verifies that it
+is absent. No step launches GABS, edits `ModsConfig.xml`, or treats `_quarantine` as an installed mod.
+
+The command returns one compact JSON object and writes `Runtime\live-stack-smoke-last.json` by
+default. A successful run records only its exact RimWorld/RimBridgeServer/SDK/DevBridge2 tuple in
+`RimBridgeProtocolCompatibility.json`; an unavailable or failed run leaves compatibility claims
+unchanged. Use `-AllowUiSkip` only on a deliberately non-visual host; the default gate requires UI
+evidence. `-Plan -Json` is safe for prerequisite checks and is also what the self-hosted workflow
+uses before building or launching anything.
+
+The manual GitHub Actions entry point is `.github/workflows/live-stack-smoke.yml` and requires a
+self-hosted runner labeled `Windows` and `rimworld`, with `RIMWORLD_ROOT` set to the installed game
+root and the active `brrainz.rimbridgeserver` mod directly under `RimWorld\Mods`. Ordinary hosted CI
+uses only `scripts\validate.ps1` and never claims live compatibility.
+
 ## Build and release
 
 The standard offline gate is:
@@ -68,5 +98,17 @@ the optional companion DLL, wrapper, compatibility contract, and concise documen
 More operational guidance is in [`START_HERE.md`](START_HERE.md) and [`MAINTENANCE.md`](MAINTENANCE.md).
 The ownership and state model is summarized in [`docs/architecture.md`](docs/architecture.md).
 The optional cross-stack workflow correlation contract is summarized in [`docs/correlation.md`](docs/correlation.md).
+
+When working from a RimTest target repository, the normal loop is simply edit, run
+`rimtest affected --run --json`, inspect the result, and edit again. RimTest automatically invokes
+the owner transaction for build-relevant changes. Inspect `artifactFreshness` before treating a
+source-change PASS as valid; `loadedArtifactFreshnessProven: false` is a fail-closed result, not a
+successful Quicktest.
+
+DevBridge2's independent Windows validation includes the complete deterministic fake/process-host
+E2E suite. The no-RimWorld cross-stack contract gate is owned by RimTest and consumes pinned
+DevBridge2 revisions through the versioned recipe, generation, and artifact-freshness envelopes;
+it is a composition check, not a replacement for this repository's lifecycle tests or the
+self-hosted real-RimWorld smoke.
 
 There is currently no explicit root `LICENSE` file; licensing must be resolved before a public release.

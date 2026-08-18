@@ -70,6 +70,9 @@ Invoke-Required 'Run deterministic development-plan/publish matrix' 'pwsh' @(
 Invoke-Required 'Run development artifact hash/deployment matrix' 'pwsh' @(
     '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'scripts\dev-publish.tests.ps1'
 )
+Invoke-Required 'Run live-stack smoke offline orchestration/config tests' 'pwsh' @(
+    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'scripts\live-stack-smoke.tests.ps1'
+)
 Invoke-Required 'Run process-level FakeRimWorld E2E suite' 'pwsh' @(
     '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'scripts\process-e2e.tests.ps1'
 )

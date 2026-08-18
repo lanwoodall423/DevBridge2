@@ -938,6 +938,9 @@ $results.Add((Invoke-Case 'bounded mod build deploy run test transaction' {
         }
         if ([bool]$report.deployment.changed -ne $true -or
             [string]$report.deployment.stagedSha256 -ne [string]$report.deployment.deployedSha256After -or
+            [string]$report.artifactFreshness.deploymentDecision -ne 'deployed' -or
+            -not [bool]$report.artifactFreshness.loadedArtifactFreshnessProven -or
+            [int]$report.artifactFreshness.generation -ne [int]$report.runtime.generationAfter -or
             -not [bool]$report.cleanup.leaseReleased -or
             -not [bool]$report.cleanup.registrationReleased) {
             throw "mod-test did not report hash-verified deployment and owned cleanup: $output"
@@ -945,8 +948,21 @@ $results.Add((Invoke-Case 'bounded mod build deploy run test transaction' {
         $secondOutput = & pwsh @arguments 2>&1 | Out-String
         $secondExitCode = $LASTEXITCODE
         $second = Get-JsonResponse $secondOutput
-        if ($secondExitCode -ne 0 -or -not [bool]$second.success -or [bool]$second.deployment.changed) {
+        if ($secondExitCode -ne 0 -or -not [bool]$second.success -or [bool]$second.deployment.changed -or
+            [string]$second.artifactFreshness.deploymentDecision -ne 'unchanged' -or
+            -not [bool]$second.artifactFreshness.loadedArtifactFreshnessProven) {
             throw "identical mod-test transaction was not a no-op: $secondOutput"
+        }
+
+        $ownerFingerprint = 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc'
+        $ownerOutput = & pwsh @($arguments) -SourceFingerprint $ownerFingerprint -SkipRecipe 2>&1 | Out-String
+        $ownerExitCode = $LASTEXITCODE
+        $owner = Get-JsonResponse $ownerOutput
+        if ($ownerExitCode -ne 0 -or -not [bool]$owner.success -or
+            [string]$owner.sourceFingerprint -ne $ownerFingerprint -or
+            $null -ne $owner.recipe -or
+            -not [bool]$owner.artifactFreshness.loadedArtifactFreshnessProven) {
+            throw "RimTest owner-mode transaction did not return bounded freshness evidence: $ownerOutput"
         }
 
         $suppliedLeaseId = Begin-TestLease $fixture

@@ -48,6 +48,7 @@ internal sealed partial class CoordinatorState
         emit("  DevBridge.cmd evidence show <id> --json");
         emit("  DevBridge.cmd doctor");
         emit("  DevBridge.cmd agent capabilities|snapshot|delta|wait-event --json");
+        emit("  pwsh -NoProfile -ExecutionPolicy Bypass -File scripts\\live-stack-smoke.ps1 -Json  (self-hosted real RimWorld gate)");
         emit("Append --json to a non-session command for one machine-readable result.");
         emit("Plan first: project resolve <alias[,alias...]> --json; inspect the exact closure/fingerprint, then register and restart.");
         emit("Register project intent before testing: project register <alias[,alias...]>; renew it while active and release it when finished.");

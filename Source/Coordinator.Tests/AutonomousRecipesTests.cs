@@ -47,8 +47,10 @@ internal static partial class OfflineTests
         RecipeResponse correlated = ExecuteRecipe(fixture, "run", "quicktest-smoke",
             "--workflow-id", "rw-offline-correlation", "--max-rimworld-launches", "0");
         Assert(correlated is RecipeRunResponse correlatedRun &&
-               correlatedRun.WorkflowId == "rw-offline-correlation",
-            "recipe runs must preserve the optional workflow correlation id");
+               correlatedRun.WorkflowId == "rw-offline-correlation" &&
+               !string.IsNullOrWhiteSpace(correlatedRun.RunId) &&
+               correlatedRun.RunId.StartsWith("run-", StringComparison.Ordinal),
+            "recipe runs must preserve workflow correlation and expose a bounded run identity");
 
         WriteRecipe(fixture, "quicktest-smoke", SmokeRecipe.Replace(
             "\"schemaVersion\": \"devbridge-test-recipe/v1\"",
@@ -211,6 +213,7 @@ internal static partial class OfflineTests
     private static RecipeResponse ExecuteRecipe(Fixture fixture, params string[] arguments)
     {
         BridgeRequest request = Request("test", "recipe-agent", 991, new[] { "recipe" }.Concat(arguments).ToArray());
+        request.RequestId = CoordinatorIpcProtocol.NewRequestId();
         request.Json = true;
         int exitCode = fixture.State.Execute(request, _ => { }, () => true);
         return fixture.State.CreateRecipeJsonResponse(request, exitCode);

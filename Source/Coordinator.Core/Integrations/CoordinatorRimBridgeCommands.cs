@@ -556,19 +556,54 @@ internal sealed partial class CoordinatorState
         {
             if (candidate is not { ValueKind: JsonValueKind.Object } value)
                 continue;
-            if (value.TryGetProperty("operationId", out JsonElement operationId) &&
-                operationId.ValueKind == JsonValueKind.String &&
-                !string.IsNullOrWhiteSpace(operationId.GetString()))
-                return operationId.GetString();
-            if (value.TryGetProperty("metadata", out JsonElement metadata) &&
-                metadata.ValueKind == JsonValueKind.Object &&
-                metadata.TryGetProperty("operationId", out operationId) &&
-                operationId.ValueKind == JsonValueKind.String &&
-                !string.IsNullOrWhiteSpace(operationId.GetString()))
-                return operationId.GetString();
+            if (TryExtractOperationId(value, out string operationId))
+                return operationId;
         }
 
         return null;
+    }
+
+    private static bool TryExtractOperationId(JsonElement value, out string operationId)
+    {
+        operationId = null;
+        if (value.ValueKind != JsonValueKind.Object)
+            return false;
+
+        // RimBridgeServer's legacy tool aliases place the OperationEnvelope
+        // under `operation` and serialize its CLR property as `OperationId`.
+        // Newer/typed responses may expose the normalized lower-camel field
+        // directly or under metadata/result. Accept only these bounded,
+        // protocol-defined locations; do not recursively search arbitrary
+        // tool payloads for a value that merely happens to be named alike.
+        foreach (string propertyName in new[] { "operationId", "OperationId" })
+        {
+            if (value.TryGetProperty(propertyName, out JsonElement direct) &&
+                direct.ValueKind == JsonValueKind.String &&
+                !string.IsNullOrWhiteSpace(direct.GetString()))
+            {
+                operationId = direct.GetString();
+                return true;
+            }
+        }
+
+        foreach (string containerName in new[] { "metadata", "operation", "result" })
+        {
+            if (!value.TryGetProperty(containerName, out JsonElement container) ||
+                container.ValueKind != JsonValueKind.Object)
+                continue;
+            foreach (string propertyName in new[] { "operationId", "OperationId" })
+            {
+                if (container.TryGetProperty(propertyName, out JsonElement nested) &&
+                    nested.ValueKind == JsonValueKind.String &&
+                    !string.IsNullOrWhiteSpace(nested.GetString()))
+                {
+                    operationId = nested.GetString();
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     private static JsonElement? ExtractOpaqueEvidence(JsonElement? rawResponse,

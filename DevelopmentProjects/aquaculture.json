@@ -1,0 +1,9 @@
+{
+  "schemaVersion": "devbridge-mod-development/v1",
+  "project": "aquaculture",
+  "sourceProject": "Source/AquacultureFishing.csproj",
+  "configuration": "Release",
+  "expectedAssembly": "AquacultureFishing.dll",
+  "deploymentTarget": "1.6/Assemblies/AquacultureFishing.dll",
+  "testRecipe": "aquaculture-development-smoke"
+}

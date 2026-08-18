@@ -70,6 +70,7 @@ internal static class Program
     {
         Console.WriteLine("DevBridge commands: status | bridge status | bridge policy | bridge endpoint | bridge tools | bridge call <tool-name> [JSON arguments] [--lease <lease-id>] | project register <alias[,alias...]> | project status | project renew <registration-id> | project release <registration-id> | mods status | mods capture-baseline | mods restore-baseline | test begin | test session | test renew <lease-id> | test end <lease-id> | stop <lease-id> | coordinator shutdown | coordinator migrate-legacy-slot | ensure-ready <lease-id> | restart [--projects none|alias[,alias...]] [--legacy-production] | wait-ready | history [show <generation>|last-good] | doctor");
         Console.WriteLine("Append --json to a non-session command for machine-readable output.");
+        Console.WriteLine("Canonical live gate: pwsh -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\live-stack-smoke.ps1 -Json");
     }
 }
 internal sealed class ParsedArguments
@@ -974,7 +975,8 @@ internal static class CoordinatorResponsePolicy
     internal static bool IsFinite(string command, IReadOnlyList<string> arguments)
     {
         if (string.Equals(command, "wait-ready", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(command, "restart", StringComparison.OrdinalIgnoreCase))
+            string.Equals(command, "restart", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(command, "ensure-ready", StringComparison.OrdinalIgnoreCase))
             return false;
         if (string.Equals(command, "agent", StringComparison.OrdinalIgnoreCase) && arguments.Count > 0 &&
             string.Equals(arguments[0], "wait-event", StringComparison.OrdinalIgnoreCase))

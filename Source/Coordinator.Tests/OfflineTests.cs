@@ -227,6 +227,8 @@ internal static partial class OfflineTests
         Run("satisfied recipe execution avoids restart", TestRecipeAlreadySatisfiedAvoidsRestart);
         Run("recipe execution uses one launch and enforces caller budget", TestRecipeRunUsesOneLaunchAndEnforcesBudget);
         Run("recipe budgets cannot weaken coordinator safety limits", TestRecipeRunBudgetCannotWeakenCoordinatorLimit);
+        Run("supplied lease refusals do not poison the repeated-failure guard", TestSuppliedLeaseRefusalDoesNotPoisonRepeatedGuard);
+        Run("legacy supplied lease evidence does not trigger the repeated-failure guard", TestLegacySuppliedLeaseEvidenceDoesNotTriggerRepeatedGuard);
         Run("failure fingerprints normalize noise and preserve context changes", TestFailureFingerprintNormalization);
         Run("failure occurrences deduplicate with bounded evidence", TestFailureOccurrenceDeduplication);
         Run("repeated recipe failures short-circuit only equivalent inputs", TestRepeatedRecipeFailureEquivalence);

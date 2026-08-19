@@ -210,6 +210,82 @@ internal static partial class OfflineTests
             "budget exhaustion must not leave an owned test lease behind");
     }
 
+    private static void TestSuppliedLeaseRefusalDoesNotPoisonRepeatedGuard()
+    {
+        using ProfileSetup setup = ProfileSetup.Create();
+        Assert(setup.CaptureBaseline(), "supplied-lease setup must capture the baseline");
+        setup.Fixture.Adapter.ReadyOnLaunch = true;
+        Assert(setup.Fixture.State.Execute(Request("restart", "recipe-agent", 991,
+                       "--projects", "none", "--input", "quicktest=true"), _ => { }, () => true) == 0,
+            "supplied-lease setup must create the ready control generation");
+
+        string incompatibleRecipe = SmokeRecipe.Replace("\"projects\": []",
+            "\"projects\": [\"frontier\"]", StringComparison.Ordinal);
+        WriteRecipe(setup.Fixture, "quicktest-smoke", incompatibleRecipe);
+        BridgeRequest begin = Request("test", "recipe-agent", 991, "begin");
+        Assert(setup.Fixture.State.Execute(begin, _ => { }, () => true) == 0,
+            "the recipe agent must acquire the test lease");
+        string leaseId = ReadPersistedState(setup.Fixture.Root).Leases.Single().Id;
+
+        RecipeResponse first = ExecuteRecipe(setup.Fixture, "run", "quicktest-smoke", "--lease", leaseId);
+        RecipeResponse second = ExecuteRecipe(setup.Fixture, "run", "quicktest-smoke", "--lease", leaseId);
+        Assert(first is RecipeRunResponse firstRun && !firstRun.Success &&
+               firstRun.ErrorCode == "RECIPE_SUPPLIED_LEASE_REQUIRES_READY" &&
+               firstRun.LaunchesConsumed == 0 && firstRun.LeaseId == leaseId,
+            "an incompatible supplied lease must expose the exact precondition refusal");
+        Assert(second is RecipeRunResponse secondRun && !secondRun.Success &&
+               secondRun.ErrorCode == "RECIPE_SUPPLIED_LEASE_REQUIRES_READY" &&
+               secondRun.ErrorCode != "AUTONOMOUS_REPEATED_FAILURE" &&
+               secondRun.LaunchesConsumed == 0 && secondRun.LeaseId == leaseId,
+            "repeating a supplied-lease precondition refusal must not enter the repeated-failure guard");
+
+        PersistedState persisted = ReadPersistedState(setup.Fixture.Root);
+        FailureOccurrenceSummary occurrence = persisted.FailureOccurrences.FirstOrDefault(value =>
+            value?.RecipeId == "QUICKTEST-SMOKE" &&
+            value.ErrorCode == "RECIPE_SUPPLIED_LEASE_REQUIRES_READY");
+        Assert(occurrence != null && occurrence.OccurrenceCount >= 2 &&
+               !string.IsNullOrWhiteSpace(occurrence.EvidenceId),
+            "the refusal must remain bounded diagnostic evidence while staying guard-ineligible");
+    }
+
+    private static void TestLegacySuppliedLeaseEvidenceDoesNotTriggerRepeatedGuard()
+    {
+        using ProfileSetup setup = ProfileSetup.Create();
+        Assert(setup.CaptureBaseline(), "legacy evidence setup must capture the baseline");
+        setup.Fixture.Adapter.ReadyOnLaunch = true;
+        Assert(setup.Fixture.State.Execute(Request("restart", "recipe-agent", 991,
+                       "--projects", "none", "--input", "quicktest=true"), _ => { }, () => true) == 0,
+            "legacy evidence setup must create the ready control generation");
+        WriteRecipe(setup.Fixture, "quicktest-smoke", SmokeRecipe);
+
+        PersistedState current = ReadPersistedState(setup.Fixture.Root);
+        Assert(!string.IsNullOrWhiteSpace(current.ProfileFingerprint),
+            "legacy evidence setup must have a current profile fingerprint");
+        List<TestInputValue> inputs = new()
+        {
+            new TestInputValue { Name = "quicktest", Value = "true" }
+        };
+        string fingerprint = setup.Fixture.State.RecordRecipeFailure(
+            "quicktest-smoke", "RECIPE_SUPPLIED_LEASE_REQUIRES_READY",
+            "A supplied lease cannot authorize an autonomous restart.", current.Generation,
+            current.ProfileFingerprint, inputs);
+        PersistedState legacy = ReadPersistedState(setup.Fixture.Root);
+        FailureOccurrenceSummary occurrence = legacy.FailureOccurrences.Single(value =>
+            value.FailureFingerprint == fingerprint);
+        string evidenceId = occurrence.EvidenceId;
+        occurrence.ErrorCode = null;
+        setup.Fixture.WriteState(legacy);
+        setup.Fixture.State = setup.Fixture.Reload();
+
+        RecipeResponse response = ExecuteRecipe(setup.Fixture, "run", "quicktest-smoke");
+        Assert(response is RecipeRunResponse run && run.Success && run.ErrorCode == null &&
+               run.LaunchesConsumed == 0,
+            "a legacy supplied-lease refusal must be retired from guard eligibility using its evidence code");
+        Assert(!string.IsNullOrWhiteSpace(evidenceId) &&
+               File.Exists(Path.Combine(setup.Fixture.Root, "Runtime", "evidence", evidenceId + ".json")),
+            "retiring guard eligibility must preserve the historical evidence record");
+    }
+
     private static RecipeResponse ExecuteRecipe(Fixture fixture, params string[] arguments)
     {
         BridgeRequest request = Request("test", "recipe-agent", 991, new[] { "recipe" }.Concat(arguments).ToArray());

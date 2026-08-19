@@ -356,6 +356,7 @@ internal sealed partial class CoordinatorState
         occurrence.LastSeenUtc = now;
         occurrence.OccurrenceCount = Math.Min(int.MaxValue, occurrence.OccurrenceCount + 1);
         occurrence.Summary = normalized.Summary;
+        occurrence.ErrorCode = normalized.ErrorCode;
         occurrence.Phase = FailureFingerprinting.Bound(phase ?? normalized.Phase);
         occurrence.Component = normalized.Component;
         occurrence.RecipeId = normalized.RecipeId;
@@ -441,10 +442,32 @@ internal sealed partial class CoordinatorState
             return null;
         return (state.FailureOccurrences ?? new List<FailureOccurrenceSummary>())
             .Where(value => value != null && value.OccurrenceCount >= maxCount &&
-                string.Equals(value.RecipeId, FailureFingerprinting.NormalizeToken(recipeId), StringComparison.Ordinal))
+                string.Equals(value.RecipeId, FailureFingerprinting.NormalizeToken(recipeId), StringComparison.Ordinal) &&
+                IsRepeatableRecipeFailureOccurrenceLocked(value))
             .FirstOrDefault(value => FailureFingerprinting.EquivalentContext(value, recipeId,
                 projectFingerprint, inputs, RunningBuildIdentity?.InformationalVersion,
                 RunningBuildIdentity?.SourceRevision));
+    }
+
+    private bool IsRepeatableRecipeFailureOccurrenceLocked(FailureOccurrenceSummary occurrence)
+    {
+        if (occurrence == null)
+            return false;
+        if (!string.IsNullOrWhiteSpace(occurrence.ErrorCode))
+            return FailureFingerprinting.IsRepeatableRecipeFailureCode(occurrence.ErrorCode);
+
+        // Older state summaries did not persist ErrorCode, but their evidence
+        // records do.  Recover the classification without rewriting or
+        // deleting durable evidence.  If the evidence is unavailable or
+        // malformed, fail closed and retain the repeated-failure protection.
+        if (!string.IsNullOrWhiteSpace(occurrence.EvidenceId))
+        {
+            EvidenceLookupResult evidence = new FailureEvidenceStore(runtimeRoot,
+                () => clock.UtcNow).Read(occurrence.EvidenceId);
+            if (evidence.Found && !string.IsNullOrWhiteSpace(evidence.Record.ErrorCode))
+                return FailureFingerprinting.IsRepeatableRecipeFailureCode(evidence.Record.ErrorCode);
+        }
+        return true;
     }
 
     internal string RecordRecipeFailure(string recipeId, string code, string error,

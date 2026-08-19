@@ -185,6 +185,14 @@ internal static class FailureFingerprinting
     internal static string NormalizeToken(string value) =>
         NormalizeText(value).ToUpperInvariant();
 
+    // A supplied lease is a caller-owned capability.  Refusing to use it for
+    // an incompatible generation or autonomous restart means no recipe
+    // operation was attempted, so that precondition failure must not poison
+    // the repeated-execution guard.  Keep the evidence for diagnosis and
+    // classify every other recipe failure normally.
+    internal static bool IsRepeatableRecipeFailureCode(string code) =>
+        !NormalizeToken(code).StartsWith("RECIPE_SUPPLIED_LEASE_", StringComparison.Ordinal);
+
     internal static string Bound(string value) =>
         string.IsNullOrEmpty(value) || value.Length <= FailureEvidenceLimits.MaxText
             ? value : value[..FailureEvidenceLimits.MaxText];
@@ -219,6 +227,9 @@ internal sealed class FailureOccurrenceSummary
 
     [JsonPropertyName("summary")]
     public string Summary { get; set; }
+
+    [JsonPropertyName("errorCode")]
+    public string ErrorCode { get; set; }
 
     [JsonPropertyName("phase")]
     public string Phase { get; set; }

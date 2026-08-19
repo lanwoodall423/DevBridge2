@@ -115,6 +115,13 @@ next safe action. Lease and temporary registration cleanup is ownership-checked;
 restart is left durable for recovery when the caller budget expires. Recipe-run IPC is classified as
 long-running, while list/show/plan remain finite.
 
+Lease precondition refusals such as `RECIPE_SUPPLIED_LEASE_NOT_HELD`,
+`RECIPE_SUPPLIED_LEASE_GENERATION_MISMATCH`, and `RECIPE_SUPPLIED_LEASE_REQUIRES_READY` are retained as
+bounded evidence for diagnosis, but are not eligible to short-circuit a later recipe as an autonomous
+repeated failure: no recipe operation was attempted. Actual recipe, readiness, and lifecycle failures
+remain protected by the repeated-failure fingerprint guard. Legacy summaries recover this classification
+from their evidence record when the persisted summary predates the `errorCode` field.
+
 The RimBridge client has a separate typed GABP boundary. Its contract and tested surface are in
 [`RimBridgeProtocolCompatibility.json`](../RimBridgeProtocolCompatibility.json): `gabp/1`, typed
 `session/hello`, `tools/list`, `tools/call`, bounded Content-Length framing, exact response IDs, and

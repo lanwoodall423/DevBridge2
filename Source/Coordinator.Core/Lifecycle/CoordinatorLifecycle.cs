@@ -725,8 +725,20 @@ internal sealed partial class CoordinatorState
     {
         DateTime cutoff = clock.UtcNow - options.LeaseDuration;
         int before = state.Leases.Count;
-        state.Leases.RemoveAll(lease => lease == null || LeaseActivityUtc(lease) <= cutoff);
-        if (state.Leases.Count != before)
+        List<TestLease> stale = state.Leases
+            .Where(lease => lease == null || LeaseActivityUtc(lease) <= cutoff)
+            .ToList();
+        bool restorationBlocked = false;
+        List<TestLease> releasable = new();
+        foreach (TestLease lease in stale)
+        {
+            if (lease == null || TryRestoreViewportForLeaseLocked(lease.Id))
+                releasable.Add(lease);
+            else
+                restorationBlocked = true;
+        }
+        state.Leases.RemoveAll(lease => releasable.Contains(lease));
+        if (state.Leases.Count != before || restorationBlocked)
         {
             SaveStateLocked();
             Monitor.PulseAll(gate);

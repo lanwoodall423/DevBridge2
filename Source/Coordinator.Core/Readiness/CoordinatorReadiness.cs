@@ -169,6 +169,12 @@ internal sealed partial class CoordinatorState
                 string.Equals(value.Id, leaseId, StringComparison.OrdinalIgnoreCase));
             if (lease == null)
                 return;
+            if (!TryRestoreViewportForLeaseLocked(lease.Id))
+            {
+                SaveStateLocked();
+                Monitor.PulseAll(gate);
+                return;
+            }
             state.Leases.Remove(lease);
             SaveStateLocked();
             Monitor.PulseAll(gate);

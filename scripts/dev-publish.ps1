@@ -49,10 +49,15 @@ function Invoke-Required {
 function Get-FileSha256 {
     param([Parameter(Mandatory = $true)][string]$Path)
 
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
-        return $null
+    try {
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+            return $null
+        }
+        return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToUpperInvariant()
     }
-    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToUpperInvariant()
+    catch {
+        throw ('DEVBRIDGE_ARTIFACT_IDENTITY_UNAVAILABLE: ' + $Path + ': ' + $_.Exception.Message)
+    }
 }
 
 function Get-GitValue {
@@ -110,24 +115,199 @@ function Get-Plan {
     }
 }
 
+function Remove-StaleDeploymentTemps {
+    param([Parameter(Mandatory = $true)][string]$Destination)
+
+    $directory = Split-Path -Parent $Destination
+    if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
+        return
+    }
+    $leaf = Split-Path -Leaf $Destination
+    $prefix = '.' + $leaf + '.'
+    try {
+        $staleFiles = @(Get-ChildItem -LiteralPath $directory -File -Force -ErrorAction Stop |
+            Where-Object {
+                $_.Name.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -and
+                $_.Name.EndsWith('.tmp', [StringComparison]::OrdinalIgnoreCase)
+            })
+        foreach ($staleFile in $staleFiles) {
+            Remove-Item -LiteralPath $staleFile.FullName -Force -ErrorAction Stop
+        }
+    }
+    catch {
+        throw ('DEVBRIDGE_DEPLOYMENT_TEMP_CLEANUP_FAILED: ' + $Destination + ': ' + $_.Exception.Message)
+    }
+}
+
+function Wait-ArtifactWritable {
+    param([Parameter(Mandatory = $true)][string]$Destination)
+
+    if (-not [System.IO.File]::Exists($Destination)) {
+        return
+    }
+    $deadline = [DateTime]::UtcNow.AddSeconds(15)
+    while ($true) {
+        $stream = $null
+        try {
+            $stream = [System.IO.File]::Open(
+                $Destination,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+            return
+        }
+        catch [System.UnauthorizedAccessException] {
+            throw ('DEVBRIDGE_DEPLOYMENT_DESTINATION_UNAVAILABLE: ' + $Destination + ': ' + $_.Exception.Message)
+        }
+        catch [System.IO.IOException] {
+            if ([DateTime]::UtcNow -ge $deadline) {
+                throw ('DEVBRIDGE_DEPLOYMENT_DESTINATION_LOCKED: ' + $Destination + ': remained locked for 15 seconds')
+            }
+            Start-Sleep -Milliseconds 100
+        }
+        finally {
+            if ($null -ne $stream) {
+                $stream.Dispose()
+            }
+        }
+    }
+}
+
+function Get-DestinationSha256 {
+    param([Parameter(Mandatory = $true)][string]$Destination)
+
+    Wait-ArtifactWritable $Destination
+    return (Get-FileSha256 $Destination)
+}
+
 function Copy-Atomic {
     param(
         [Parameter(Mandatory = $true)][string]$Source,
-        [Parameter(Mandatory = $true)][string]$Destination
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [Parameter(Mandatory = $true)][string]$ExpectedHash
     )
 
     if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
-        throw "Required build artifact was not produced: $Source"
+        throw ('DEVBRIDGE_SOURCE_ARTIFACT_MISSING: ' + $Source)
     }
-    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Destination) | Out-Null
-    $temporary = Join-Path (Split-Path -Parent $Destination) (
-        '.' + (Split-Path -Leaf $Destination) + '.' + $PID + '.' + [guid]::NewGuid().ToString('N') + '.tmp')
+    $sourceHash = Get-FileSha256 $Source
+    if (-not [string]::Equals($sourceHash, $ExpectedHash, [StringComparison]::OrdinalIgnoreCase)) {
+        throw ('DEVBRIDGE_SOURCE_ARTIFACT_IDENTITY_MISMATCH: ' + $Source +
+            ' expected ' + $ExpectedHash + ' but found ' + $sourceHash)
+    }
+
+    $directory = Split-Path -Parent $Destination
     try {
-        Copy-Item -LiteralPath $Source -Destination $temporary -Force
-        Move-Item -LiteralPath $temporary -Destination $Destination -Force
-    } finally {
-        if (Test-Path -LiteralPath $temporary -PathType Leaf) {
-            Remove-Item -LiteralPath $temporary -Force
+        New-Item -ItemType Directory -Force -Path $directory -ErrorAction Stop | Out-Null
+    }
+    catch {
+        throw ('DEVBRIDGE_DEPLOYMENT_DESTINATION_UNAVAILABLE: ' + $Destination + ': ' + $_.Exception.Message)
+    }
+
+    Remove-StaleDeploymentTemps $Destination
+    $leaf = Split-Path -Leaf $Destination
+    $temporary = Join-Path $directory ('.' + $leaf + '.' + $PID + '.' + [guid]::NewGuid().ToString('N') + '.tmp')
+    $backup = Join-Path $directory ('.' + $leaf + '.' + $PID + '.' + [guid]::NewGuid().ToString('N') + '.bak')
+    $hadDestination = [System.IO.File]::Exists($Destination)
+    if ($hadDestination) {
+        Wait-ArtifactWritable $Destination
+    }
+    $previousHash = if ($hadDestination) { Get-FileSha256 $Destination } else { $null }
+    $replacementCommitted = $false
+    $action = if ($hadDestination) { 'replaced' } else { 'created' }
+    try {
+        try {
+            [System.IO.File]::Copy($Source, $temporary, $true)
+        }
+        catch {
+            throw ('DEVBRIDGE_DEPLOYMENT_STAGE_FAILED: ' + $Destination + ': ' + $_.Exception.Message)
+        }
+
+        $temporaryHash = Get-FileSha256 $temporary
+        if (-not [string]::Equals($temporaryHash, $ExpectedHash, [StringComparison]::OrdinalIgnoreCase)) {
+            throw ('DEVBRIDGE_DEPLOYMENT_STAGE_IDENTITY_MISMATCH: ' + $Destination +
+                ' expected ' + $ExpectedHash + ' but found ' + $temporaryHash)
+        }
+
+        if ($hadDestination) {
+            Wait-ArtifactWritable $Destination
+            try {
+                [System.IO.File]::Replace($temporary, $Destination, $backup, $true)
+                $replacementCommitted = $true
+            }
+            catch [System.UnauthorizedAccessException] {
+                throw ('DEVBRIDGE_DEPLOYMENT_DESTINATION_UNAVAILABLE: ' + $Destination + ': ' + $_.Exception.Message)
+            }
+            catch [System.IO.IOException] {
+                throw ('DEVBRIDGE_DEPLOYMENT_DESTINATION_LOCKED: ' + $Destination + ': ' + $_.Exception.Message)
+            }
+        }
+        else {
+            try {
+                [System.IO.File]::Move($temporary, $Destination)
+                $replacementCommitted = $true
+            }
+            catch [System.UnauthorizedAccessException] {
+                throw ('DEVBRIDGE_DEPLOYMENT_DESTINATION_UNAVAILABLE: ' + $Destination + ': ' + $_.Exception.Message)
+            }
+            catch [System.IO.IOException] {
+                throw ('DEVBRIDGE_DEPLOYMENT_DESTINATION_RACE: ' + $Destination + ': ' + $_.Exception.Message)
+            }
+        }
+
+        $deployedHash = Get-FileSha256 $Destination
+        if (-not [string]::Equals($deployedHash, $ExpectedHash, [StringComparison]::OrdinalIgnoreCase)) {
+            throw ('DEVBRIDGE_DEPLOYMENT_IDENTITY_MISMATCH: ' + $Destination +
+                ' expected ' + $ExpectedHash + ' but found ' + $deployedHash)
+        }
+
+        if ($hadDestination -and [System.IO.File]::Exists($backup)) {
+            try {
+                Remove-Item -LiteralPath $backup -Force -ErrorAction Stop
+            }
+            catch {
+                $action = 'replaced-backup-retained'
+            }
+        }
+        return [pscustomobject]@{
+            action = $action
+            sourceSha256 = $sourceHash
+            destinationSha256 = $deployedHash
+            previousDestinationSha256 = $previousHash
+            identityVerified = $true
+        }
+    }
+    catch {
+        $failureMessage = [string]$_.Exception.Message
+        try {
+            if ($replacementCommitted) {
+                if ($hadDestination) {
+                    if (-not [System.IO.File]::Exists($backup)) {
+                        throw 'the replacement backup is missing'
+                    }
+                    [System.IO.File]::Replace($backup, $Destination, $null, $true)
+                    $restoredHash = Get-FileSha256 $Destination
+                    if (-not [string]::Equals($restoredHash, $previousHash, [StringComparison]::OrdinalIgnoreCase)) {
+                        throw ('restored hash ' + $restoredHash + ' does not match ' + $previousHash)
+                    }
+                }
+                elseif ([System.IO.File]::Exists($Destination)) {
+                    Remove-Item -LiteralPath $Destination -Force -ErrorAction Stop
+                }
+            }
+        }
+        catch {
+            throw ('DEVBRIDGE_DEPLOYMENT_ROLLBACK_FAILED: ' + $Destination +
+                ': original=' + $failureMessage + '; rollback=' + $_.Exception.Message)
+        }
+        throw $failureMessage
+    }
+    finally {
+        if ([System.IO.File]::Exists($temporary)) {
+            Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+        }
+        if (-not $replacementCommitted -and [System.IO.File]::Exists($backup)) {
+            Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
         }
     }
 }
@@ -189,6 +369,9 @@ function Add-ArtifactRecord {
         [switch]$DidBuild,
         [string]$SourceHash,
         [string]$DestinationHash,
+        [string]$PreviousDestinationHash,
+        [string]$ReconciliationAction = 'not-attempted',
+        [bool]$IdentityVerified = $false,
         [bool]$DeployRequired = $false
     )
     [void]$Records.Add([ordered]@{
@@ -198,8 +381,11 @@ function Add-ArtifactRecord {
         built = [bool]$DidBuild
         sourceSha256 = $SourceHash
         deployedSha256 = $DestinationHash
+        previousDestinationSha256 = $PreviousDestinationHash
         deployRequired = $DeployRequired
         deployPerformed = [bool]$DidDeploy
+        reconciliationAction = $ReconciliationAction
+        identityVerified = $IdentityVerified
         loadedStatus = $LoadedStatus
     })
 }
@@ -215,6 +401,7 @@ $buildProperties = Get-BuildProperties
 $productVersion = Get-AuthoritativeProductVersion
 
 $report = $null
+$failure = $null
 try {
     New-Item -ItemType Directory -Force -Path $stagingRoot | Out-Null
     $coordinatorStaging = Join-Path $stagingRoot 'Coordinator'
@@ -280,7 +467,7 @@ try {
                 'restore', $bridgeToolsProject, '--locked-mode', '--nologo'
             ) 'Restore BridgeTools development build assets'
             $bridgeToolsDestination = Get-CanonicalBridgeToolsPath $DeploymentRoot
-            $bridgeToolsBefore = Get-FileSha256 $bridgeToolsDestination
+            $bridgeToolsBefore = Get-DestinationSha256 $bridgeToolsDestination
             $arguments = @(
                 '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $publishCompanionScript,
                 '-Configuration', $Configuration, '-CompanionOnly', '-DeployCompanion',
@@ -295,14 +482,19 @@ try {
                 throw 'Publish-DevBridge.ps1 failed while building/deploying BridgeTools.'
             }
             [void]$built.Add('bridgeTools')
-            $bridgeToolsAfter = Get-FileSha256 $bridgeToolsDestination
+            $bridgeToolsAfter = Get-DestinationSha256 $bridgeToolsDestination
             $bridgeToolsChanged = $null -eq $bridgeToolsBefore -or
                 -not [string]::Equals($bridgeToolsBefore, $bridgeToolsAfter, [StringComparison]::OrdinalIgnoreCase)
             if ($bridgeToolsChanged) { [void]$deployed.Add('bridgeTools') }
             $bridgeToolsSource = Join-Path $repoRoot ('Source\BridgeTools\bin\' + $Configuration + '\DevBridge2.BridgeTools.dll')
+            $bridgeToolsIdentityVerified = $null -ne $bridgeToolsAfter -and
+                [string]::Equals((Get-FileSha256 $bridgeToolsSource), $bridgeToolsAfter, [StringComparison]::OrdinalIgnoreCase)
             Add-ArtifactRecord -Records $records -Component 'bridgeTools' -Source $bridgeToolsSource `
                 -Destination $bridgeToolsDestination -LoadedStatus 'not-proven' -DidDeploy:$bridgeToolsChanged -DidBuild `
                 -SourceHash (Get-FileSha256 $bridgeToolsSource) -DestinationHash $bridgeToolsAfter `
+                -PreviousDestinationHash $bridgeToolsBefore `
+                -ReconciliationAction $(if ($bridgeToolsChanged) { 'replaced-by-companion' } else { 'unchanged' }) `
+                -IdentityVerified:$bridgeToolsIdentityVerified `
                 -DeployRequired:$bridgeToolsChanged
         }
 
@@ -315,6 +507,11 @@ try {
                 $source = Join-Path $coordinatorStaging $file
                 $destination = Join-Path $DeploymentRoot ('Coordinator\' + $file)
                 $sourceHash = Get-FileSha256 $source
+                if ($null -eq $sourceHash) {
+                    throw ('DEVBRIDGE_SOURCE_ARTIFACT_MISSING: ' + $source)
+                }
+                # Read the running coordinator's current bytes before asking it
+                # to shut down; replace/delete access is checked after shutdown.
                 $destinationHash = Get-FileSha256 $destination
                 $different = $null -eq $destinationHash -or
                     -not [string]::Equals($sourceHash, $destinationHash, [StringComparison]::OrdinalIgnoreCase)
@@ -331,31 +528,61 @@ try {
         }
         if ($coordinatorDeployRequired) {
             $coordinatorShutdown = Invoke-CoordinatorShutdown $DeploymentRoot
+            foreach ($artifact in $coordinatorArtifacts | Where-Object { $_.different }) {
+                Wait-ArtifactWritable $artifact.destination
+            }
         }
         foreach ($artifact in $coordinatorArtifacts) {
-                if ($artifact.different) {
-                    Copy-Atomic $artifact.source $artifact.destination
-                    [void]$deployed.Add('coordinator')
+            $reconciliation = $null
+            if ($artifact.different) {
+                $reconciliation = Copy-Atomic -Source $artifact.source -Destination $artifact.destination `
+                    -ExpectedHash $artifact.sourceHash
+                [void]$deployed.Add('coordinator')
+            }
+            else {
+                $reconciliation = [pscustomobject]@{
+                    action = 'unchanged'
+                    sourceSha256 = $artifact.sourceHash
+                    destinationSha256 = $artifact.destinationHash
+                    previousDestinationSha256 = $artifact.destinationHash
+                    identityVerified = $true
                 }
-                Add-ArtifactRecord -Records $records -Component 'coordinator' -Source $artifact.source -Destination $artifact.destination `
-                    -LoadedStatus 'not-proven' -DidDeploy:$artifact.different -DidBuild -SourceHash $artifact.sourceHash `
-                    -DestinationHash (Get-FileSha256 $artifact.destination) -DeployRequired:$artifact.different
+            }
+            Add-ArtifactRecord -Records $records -Component 'coordinator' -Source $artifact.source -Destination $artifact.destination `
+                -LoadedStatus 'not-proven' -DidDeploy:$artifact.different -DidBuild -SourceHash $reconciliation.sourceSha256 `
+                -DestinationHash $reconciliation.destinationSha256 `
+                -PreviousDestinationHash $reconciliation.previousDestinationSha256 `
+                -ReconciliationAction $reconciliation.action -IdentityVerified:$reconciliation.identityVerified `
+                -DeployRequired:$artifact.different
         }
 
         if ($plan.build -contains 'rimworld-mod') {
             $source = Join-Path $modStaging 'DevBridge2.dll'
             $destination = Join-Path $DeploymentRoot '1.6\Assemblies\DevBridge2.dll'
             $sourceHash = Get-FileSha256 $source
-            $destinationBefore = Get-FileSha256 $destination
+            $destinationBefore = Get-DestinationSha256 $destination
             $different = $null -eq $destinationBefore -or
                 -not [string]::Equals($sourceHash, $destinationBefore, [StringComparison]::OrdinalIgnoreCase)
+            $reconciliation = $null
             if ($different) {
-                Copy-Atomic $source $destination
+                $reconciliation = Copy-Atomic -Source $source -Destination $destination -ExpectedHash $sourceHash
                 [void]$deployed.Add('rimworld-mod')
             }
+            else {
+                $reconciliation = [pscustomobject]@{
+                    action = 'unchanged'
+                    sourceSha256 = $sourceHash
+                    destinationSha256 = $destinationBefore
+                    previousDestinationSha256 = $destinationBefore
+                    identityVerified = $true
+                }
+            }
             Add-ArtifactRecord -Records $records -Component 'rimworld-mod' -Source $source -Destination $destination `
-                -LoadedStatus 'not-proven' -DidDeploy:$different -DidBuild -SourceHash $sourceHash `
-                -DestinationHash (Get-FileSha256 $destination) -DeployRequired:$different
+                -LoadedStatus 'not-proven' -DidDeploy:$different -DidBuild -SourceHash $reconciliation.sourceSha256 `
+                -DestinationHash $reconciliation.destinationSha256 `
+                -PreviousDestinationHash $reconciliation.previousDestinationSha256 `
+                -ReconciliationAction $reconciliation.action -IdentityVerified:$reconciliation.identityVerified `
+                -DeployRequired:$different
         }
 
         if ($plan.deploy -contains 'rimworld-content') {
@@ -369,16 +596,29 @@ try {
                 }
                 $destination = Join-Path $DeploymentRoot ($file -replace '/', '\')
                 $sourceHash = Get-FileSha256 $source
-                $destinationBefore = Get-FileSha256 $destination
+                $destinationBefore = Get-DestinationSha256 $destination
                 $different = $null -eq $destinationBefore -or
                     -not [string]::Equals($sourceHash, $destinationBefore, [StringComparison]::OrdinalIgnoreCase)
+                $reconciliation = $null
                 if ($different) {
-                    Copy-Atomic $source $destination
+                    $reconciliation = Copy-Atomic -Source $source -Destination $destination -ExpectedHash $sourceHash
                     [void]$deployed.Add('rimworld-content')
                 }
+                else {
+                    $reconciliation = [pscustomobject]@{
+                        action = 'unchanged'
+                        sourceSha256 = $sourceHash
+                        destinationSha256 = $destinationBefore
+                        previousDestinationSha256 = $destinationBefore
+                        identityVerified = $true
+                    }
+                }
                 Add-ArtifactRecord -Records $records -Component 'rimworld-content' -Source $source -Destination $destination `
-                    -LoadedStatus 'not-proven' -DidDeploy:$different -SourceHash $sourceHash `
-                    -DestinationHash (Get-FileSha256 $destination) -DeployRequired:$different
+                    -LoadedStatus 'not-proven' -DidDeploy:$different -SourceHash $reconciliation.sourceSha256 `
+                    -DestinationHash $reconciliation.destinationSha256 `
+                    -PreviousDestinationHash $reconciliation.previousDestinationSha256 `
+                    -ReconciliationAction $reconciliation.action -IdentityVerified:$reconciliation.identityVerified `
+                    -DeployRequired:$different
             }
         }
 
@@ -393,16 +633,29 @@ try {
                 }
                 $destination = Join-Path $DeploymentRoot ($file -replace '/', '\')
                 $sourceHash = Get-FileSha256 $source
-                $destinationBefore = Get-FileSha256 $destination
+                $destinationBefore = Get-DestinationSha256 $destination
                 $different = $null -eq $destinationBefore -or
                     -not [string]::Equals($sourceHash, $destinationBefore, [StringComparison]::OrdinalIgnoreCase)
+                $reconciliation = $null
                 if ($different) {
-                    Copy-Atomic $source $destination
+                    $reconciliation = Copy-Atomic -Source $source -Destination $destination -ExpectedHash $sourceHash
                     [void]$deployed.Add('test-recipes')
                 }
+                else {
+                    $reconciliation = [pscustomobject]@{
+                        action = 'unchanged'
+                        sourceSha256 = $sourceHash
+                        destinationSha256 = $destinationBefore
+                        previousDestinationSha256 = $destinationBefore
+                        identityVerified = $true
+                    }
+                }
                 Add-ArtifactRecord -Records $records -Component 'test-recipes' -Source $source -Destination $destination `
-                    -LoadedStatus 'not-applicable' -DidDeploy:$different -SourceHash $sourceHash `
-                    -DestinationHash (Get-FileSha256 $destination) -DeployRequired:$different
+                    -LoadedStatus 'not-applicable' -DidDeploy:$different -SourceHash $reconciliation.sourceSha256 `
+                    -DestinationHash $reconciliation.destinationSha256 `
+                    -PreviousDestinationHash $reconciliation.previousDestinationSha256 `
+                    -ReconciliationAction $reconciliation.action -IdentityVerified:$reconciliation.identityVerified `
+                    -DeployRequired:$different
             }
         }
 
@@ -417,6 +670,8 @@ try {
             else { 'none' }
         $report = [ordered]@{
             schemaVersion = 'devbridge-dev-publish/v1'
+            status = 'pass'
+            success = $true
             dryRun = $false
             productVersion = $productVersion
             plan = $plan
@@ -443,10 +698,64 @@ try {
         }
     }
 }
+catch {
+    $message = [string]$_.Exception.Message
+    $codeMatch = [regex]::Match($message, '^(DEVBRIDGE_[A-Z0-9_]+):')
+    $errorCode = if ($codeMatch.Success) { $codeMatch.Groups[1].Value } else { 'DEVBRIDGE_PUBLISH_FAILED' }
+    $retrySafe = $errorCode -in @(
+        'DEVBRIDGE_DEPLOYMENT_DESTINATION_LOCKED',
+        'DEVBRIDGE_DEPLOYMENT_DESTINATION_UNAVAILABLE',
+        'DEVBRIDGE_DEPLOYMENT_TEMP_CLEANUP_FAILED')
+    $nextAction = switch ($errorCode) {
+        'DEVBRIDGE_DEPLOYMENT_DESTINATION_LOCKED' {
+            'Release the owning destination-file lock, then retry the supported publisher.'
+            break
+        }
+        'DEVBRIDGE_DEPLOYMENT_DESTINATION_UNAVAILABLE' {
+            'Restore destination write access, then retry the supported publisher.'
+            break
+        }
+        'DEVBRIDGE_DEPLOYMENT_ROLLBACK_FAILED' {
+            'Stop and inspect the deployment directory before retrying; rollback was not proven.'
+            break
+        }
+        default {
+            'Inspect the structured error and repair the reported source or deployment condition before retrying.'
+            break
+        }
+    }
+    $failure = [ordered]@{
+        schemaVersion = 'devbridge-dev-publish/v1'
+        status = 'failed'
+        success = $false
+        dryRun = [bool]$DryRun
+        errorCode = $errorCode
+        error = $message
+        coordinatorShutdown = $coordinatorShutdown
+        recoveryAttempted = $coordinatorShutdown
+        recoveryResult = if ($coordinatorShutdown) { 'shutdown-requested' } else { 'not-attempted' }
+        retrySafe = $retrySafe
+        manualInterventionRequired = $errorCode -eq 'DEVBRIDGE_DEPLOYMENT_ROLLBACK_FAILED'
+        artifacts = @($records)
+        nextAction = $nextAction
+    }
+}
 finally {
     if (Test-Path -LiteralPath $stagingRoot -PathType Container) {
-        Remove-Item -LiteralPath $stagingRoot -Recurse -Force
+        Remove-Item -LiteralPath $stagingRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
+}
+
+$ifFailure = $failure
+if ($null -ne $ifFailure) {
+    $failureJson = $ifFailure | ConvertTo-Json -Depth 16
+    if ($Json) {
+        Write-Output $failureJson
+    }
+    else {
+        Write-Error $failureJson
+    }
+    exit 4
 }
 
 $reportJson = $report | ConvertTo-Json -Depth 16

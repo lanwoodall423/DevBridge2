@@ -80,6 +80,7 @@ internal sealed partial class CoordinatorState
             "history" => History(arguments, request, emit),
             "logs" => Logs(arguments, request, emit),
             "evidence" => Evidence(arguments, request, emit),
+            "environment" => ViewportEnvironmentCommand(arguments, request, emit, connected),
             "wait-ready" => WaitReady(request, emit),
             "restart" => Restart(request, emit),
             "stop" => Stop(request, emit),

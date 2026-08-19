@@ -54,6 +54,10 @@ internal static partial class OfflineTests
         Run("orphaned leases expire without blocking a restart", TestOrphanLeaseExpiry);
         Run("shared leases block restart until the final lease ends", TestMultipleSharedLeases);
         Run("lease JSON reports exact expiration and retry timing", TestLeaseJsonTiming);
+        Run("viewport transaction captures and restores exact runtime state", TestViewportTransactionCycle);
+        Run("viewport transaction exposes effective dimensions and no persistent mutation", TestViewportEffectiveDimensions);
+        Run("viewport transaction fails closed for unsupported and unavailable runtimes", TestViewportFailureModes);
+        Run("viewport transaction serializes leases and restores stale owners", TestViewportConcurrencyAndExpiry);
         Run("missing process relaunches despite an active lease", TestMissingProcessRelaunchWithLease);
         Run("legacy lease-wait expiry recovers automatically", TestLegacyLeaseWaitRecovery);
         Run("recovery launch budget is finite", TestFiniteRecovery);
@@ -332,6 +336,7 @@ internal static partial class OfflineTests
         internal IRimBridgeGenerationVerifier RouteVerifier { get; set; }
         internal Action BeforeModsConfigWrite { get; set; }
         internal ICoordinatorFaultInjector FaultInjector { get; set; }
+        internal IViewportEnvironmentController ViewportEnvironmentController { get; set; }
 
         internal Fixture(PersistedState initial)
         {
@@ -525,6 +530,7 @@ internal static partial class OfflineTests
                 RimBridgeClient = RouteClient,
                 RimBridgeGenerationVerifier = RouteVerifier,
                 BeforeModsConfigWrite = BeforeModsConfigWrite,
+                ViewportEnvironmentController = ViewportEnvironmentController,
                 // The fixture applies fault plans after construction so the
                 // coordinator's process-scoped epoch initialization remains
                 // outside operation-boundary fault tests.

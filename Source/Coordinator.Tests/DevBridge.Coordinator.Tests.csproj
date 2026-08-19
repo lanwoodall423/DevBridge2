@@ -43,6 +43,7 @@
     <Compile Include="CoordinatorTraceTests.cs" />
     <Compile Include="CoordinatorFaultAndModelTests.cs" />
     <Compile Include="CoordinatorStateMachineTests.cs" />
+    <Compile Include="ViewportEnvironmentTests.cs" />
     <Compile Include="BridgeToolsDeploymentTests.cs" />
     <Compile Include="AgentSurfaceTests.cs" />
     <Compile Include="AutonomousRecipesTests.cs" />

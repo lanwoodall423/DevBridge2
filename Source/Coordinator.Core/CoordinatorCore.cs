@@ -195,6 +195,10 @@ internal sealed class BridgeRequest
     // evidence never falls through the broad operational status projection.
     internal LogsQueryResponse LogsQueryResponse { get; set; }
     internal EvidenceShowResponse EvidenceShowResponse { get; set; }
+    // Server-side only. Viewport transactions use a dedicated, bounded
+    // response so the effective client dimensions and cleanup evidence cannot
+    // be confused with ordinary lifecycle status.
+    internal ViewportEnvironmentResponse ViewportResponse { get; set; }
 }
 
 internal enum BridgePhase
@@ -307,6 +311,10 @@ internal sealed class PersistedState
     public int IsolationLaunchesRemaining { get; set; }
     public List<ScopeTicket> ScopeTickets { get; set; } = new();
     public List<TestLease> Leases { get; set; } = new();
+    // A viewport mutation is runtime-only, but its exact pre-mutation state is
+    // durable so a coordinator restart can attempt cleanup instead of losing
+    // the restoration capability.
+    public ViewportEnvironmentTransaction ViewportEnvironment { get; set; }
     public List<ProjectIntentRegistration> ProjectIntents { get; set; } = new();
     public bool AggregateFreezePending { get; set; }
     public DateTime? AggregateFreezeRequestedUtc { get; set; }
@@ -797,6 +805,10 @@ internal sealed class JsonCommandResponse
     [JsonPropertyName("nextAction")]
     public string NextAction { get; set; }
 
+    [JsonPropertyName("viewport")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public ViewportEnvironmentResponse Viewport { get; set; }
+
     // Doctor-only fields. Null omission keeps the established status and
     // command response shapes unchanged for callers that do not request doctor.
     [JsonPropertyName("schemaVersion")]
@@ -1047,6 +1059,8 @@ internal sealed class CoordinatorOptions
     internal IRimBridgeGenerationVerifier RimBridgeGenerationVerifier { get; init; }
     internal Action BeforeModsConfigWrite { get; init; }
     internal ICoordinatorFaultInjector FaultInjector { get; set; }
+    internal IViewportEnvironmentController ViewportEnvironmentController { get; init; } =
+        new WindowsViewportEnvironmentController();
 
     internal CoordinatorOptions ForScope(string coordinatorRoot, string runtimeSlotId)
     {
@@ -1076,7 +1090,8 @@ internal sealed class CoordinatorOptions
             RimBridgeClient = RimBridgeClient,
             RimBridgeGenerationVerifier = RimBridgeGenerationVerifier,
             BeforeModsConfigWrite = BeforeModsConfigWrite,
-            FaultInjector = FaultInjector
+            FaultInjector = FaultInjector,
+            ViewportEnvironmentController = ViewportEnvironmentController
         };
     }
 
@@ -2352,6 +2367,14 @@ internal sealed partial class CoordinatorState
             if (persistedStateLoadBlocked)
             {
                 TraceRecoveryActivity("blocked-persisted-state");
+                return;
+            }
+            // A viewport transaction is a runtime-only mutation, but its
+            // captured state is durable. Recover it before any launch or
+            // lifecycle recovery can change the process/window identity.
+            if (!RecoverViewportEnvironmentLocked())
+            {
+                TraceRecoveryActivity("viewport-restoration-blocked");
                 return;
             }
             if (ExternalMutationBlocksLaunchLocked(null, "Recovery"))

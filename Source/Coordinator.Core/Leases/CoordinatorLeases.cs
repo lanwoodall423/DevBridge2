@@ -372,6 +372,16 @@ internal sealed partial class CoordinatorState
                 return 4;
             }
 
+            if (!TryRestoreViewportForLeaseLocked(lease.Id))
+            {
+                SaveStateLocked();
+                emit("Test lease release denied: the viewport transaction could not be restored safely.");
+                emit("Error code: " + (state.ViewportEnvironment?.RestorationErrorCode ??
+                    "VIEWPORT_RESTORE_FAILED"));
+                emit("Next action: Restore the viewport transaction explicitly before releasing the lease.");
+                return 4;
+            }
+
             state.Leases.Remove(lease);
             SaveStateLocked();
             Monitor.PulseAll(gate);

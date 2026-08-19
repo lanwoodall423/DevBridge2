@@ -340,6 +340,21 @@ internal sealed partial class CoordinatorState
             response.NextActions = RecoveryGuidance.For(response.ErrorCode, response.Error);
         }
 
+        if (request.ViewportResponse != null)
+        {
+            response.Viewport = request.ViewportResponse;
+            response.Success = request.ViewportResponse.Success && effectiveExitCode == 0;
+            response.ExitCode = response.Success
+                ? 0
+                : effectiveExitCode == 0 ? 4 : effectiveExitCode;
+            response.ErrorCode = request.ViewportResponse.ErrorCode;
+            response.Error = DiagnosticRedactor.Text(request.ViewportResponse.Error);
+            response.NextAction = DiagnosticRedactor.Text(request.ViewportResponse.NextAction);
+            response.NextActions = response.Success || string.IsNullOrWhiteSpace(response.NextAction)
+                ? new List<DoctorNextAction>()
+                : RecoveryGuidance.For(response.ErrorCode, response.Error);
+        }
+
         if (doctorCommand || statusCommand || historyCommand || projectResolveCommand)
         {
             string serialized = JsonSerializer.Serialize(response, CoordinatorSerialization.JsonOptions);

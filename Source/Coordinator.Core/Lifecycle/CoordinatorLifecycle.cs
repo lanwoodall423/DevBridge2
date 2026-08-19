@@ -323,6 +323,26 @@ internal sealed partial class CoordinatorState
                 generationOverride: targetGeneration))
             return;
 
+        // RimWorld may truncate or recreate Player.log during startup. Capture the
+        // forensic boundary only after readiness has established that startup-side
+        // initialization is complete; the pre-launch snapshot is provisional.
+        RimBridgeLogBoundary authoritativeBoundary = CaptureLogBoundaryLocked(authoritative: true,
+            out bool boundaryIntegrityInvalid);
+        if (boundaryIntegrityInvalid)
+        {
+            state.Phase = BridgePhase.ERROR;
+            state.RestartPending = false;
+            state.RequiresNewProcess = true;
+            state.ErrorCode = RimBridgeIntegrationConstants.PlayerLogBoundaryInvalidCode;
+            state.Error = authoritativeBoundary.Error ??
+                "Player.log changed unexpectedly before the authoritative startup boundary.";
+            state.RimBridge.ErrorCode = state.ErrorCode;
+            state.RimBridge.Error = state.Error;
+            SaveStateLocked();
+            Monitor.PulseAll(gate);
+            return;
+        }
+
         // This path is the static install proof that was accepted together
         // with the READY generation. Restart may carry it through a transient
         // MainModule boundary, while fresh PID/start and absence checks remain

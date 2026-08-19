@@ -375,12 +375,10 @@ internal sealed partial class CoordinatorState
             RimBridgeLogBoundary rimBridgeBoundary;
             lock (gate)
             {
-                rimBridgeBoundary = RimBridgeLogDiscovery.CaptureBoundary(rimBridgeLogPath, clock.UtcNow);
-                state.RimBridge.LogBoundaryTimestampUtc = rimBridgeBoundary.CapturedUtc;
-                state.RimBridge.LogBoundaryPosition = rimBridgeBoundary.Length;
-                state.RimBridge.LogExistedAtBoundary = rimBridgeBoundary.Existed;
-                state.RimBridge.LogBoundaryCreationUtcTicks = rimBridgeBoundary.CreationUtcTicks;
-                state.RimBridge.LogBoundaryPrefixHash = rimBridgeBoundary.PrefixHash;
+                // This snapshot only establishes the pre-launch exclusion point. RimWorld
+                // may reset Player.log while it initializes; the authoritative forensic
+                // boundary is captured later, at the READY transition.
+                rimBridgeBoundary = CaptureLogBoundaryLocked(authoritative: false);
                 if (!rimBridgeBoundary.Available)
                 {
                     state.RimBridge.ErrorCode = RimBridgeIntegrationConstants.EndpointNotFoundCode;
@@ -553,6 +551,104 @@ internal sealed partial class CoordinatorState
             process?.Dispose();
             Interlocked.Decrement(ref launchInvocationInProgress);
         }
+    }
+
+    private RimBridgeLogBoundary CaptureLogBoundaryLocked(bool authoritative) =>
+        CaptureLogBoundaryLocked(authoritative, out _);
+
+    private RimBridgeLogBoundary CaptureLogBoundaryLocked(bool authoritative, out bool integrityInvalid)
+    {
+        integrityInvalid = false;
+        state.RimBridge ??= RimBridgeIntegrationState.Disabled(options.RimBridgeMode);
+        RimBridgeLogBoundary current = RimBridgeLogDiscovery.CaptureBoundary(rimBridgeLogPath, clock.UtcNow);
+        if (!authoritative)
+        {
+            StoreLogBoundaryLocked(current, authoritative: false);
+            return current;
+        }
+
+        bool provisionalExisted = state.RimBridge.LogExistedAtBoundary;
+        RimBridgeLogBoundary provisional = new()
+        {
+            Path = rimBridgeLogPath,
+            Available = true,
+            Existed = provisionalExisted,
+            Length = Math.Max(0, state.RimBridge.LogBoundaryPosition),
+            PrefixLength = state.RimBridge.LogBoundaryPrefixLength > 0
+                ? state.RimBridge.LogBoundaryPrefixLength
+                : Math.Min(Math.Max(0, state.RimBridge.LogBoundaryPosition), 64 * 1024),
+            CreationUtcTicks = state.RimBridge.LogBoundaryCreationUtcTicks,
+            PrefixHash = state.RimBridge.LogBoundaryPrefixHash,
+            CapturedUtc = state.RimBridge.LogBoundaryTimestampUtc ?? state.LaunchStartedUtc
+        };
+
+        bool expectedStartupReset = false;
+        if (provisionalExisted)
+        {
+            if (RimBridgeLogDiscovery.BoundaryChanged(provisional))
+            {
+                expectedStartupReset = current.Existed &&
+                    RimBridgeLogDiscovery.HasRimWorldStartupMarker(rimBridgeLogPath);
+                integrityInvalid = !expectedStartupReset;
+            }
+        }
+        else if (current.Existed)
+        {
+            bool createdDuringLaunch = state.LaunchStartedUtc == default ||
+                current.CreationUtcTicks <= 0 ||
+                current.CreationUtcTicks > state.LaunchStartedUtc.ToUniversalTime().Ticks;
+            expectedStartupReset = createdDuringLaunch ||
+                RimBridgeLogDiscovery.HasRimWorldStartupMarker(rimBridgeLogPath);
+            integrityInvalid = !expectedStartupReset;
+        }
+
+        RimBridgeLogBoundary effective = expectedStartupReset
+            ? new RimBridgeLogBoundary
+            {
+                Path = current.Path,
+                Available = current.Available,
+                Existed = current.Existed,
+                Length = 0,
+                PrefixLength = current.PrefixLength,
+                CreationUtcTicks = current.CreationUtcTicks,
+                PrefixHash = current.PrefixHash,
+                CapturedUtc = current.CapturedUtc,
+                Error = current.Error
+            }
+            : integrityInvalid || !provisionalExisted
+                ? current
+                : new RimBridgeLogBoundary
+                {
+                    Path = current.Path,
+                    Available = current.Available,
+                    Existed = provisional.Existed,
+                    Length = provisional.Length,
+                    PrefixLength = provisional.PrefixLength,
+                    CreationUtcTicks = provisional.CreationUtcTicks,
+                    PrefixHash = provisional.PrefixHash,
+                    CapturedUtc = current.CapturedUtc,
+                    Error = current.Error
+                };
+
+        StoreLogBoundaryLocked(effective,
+            authoritative: !integrityInvalid && effective.Available && effective.Existed);
+        if (integrityInvalid)
+        {
+            state.RimBridge.ErrorCode = RimBridgeIntegrationConstants.PlayerLogBoundaryInvalidCode;
+            state.RimBridge.Error = "Player.log changed unexpectedly before the authoritative startup boundary.";
+        }
+        return effective;
+    }
+
+    private void StoreLogBoundaryLocked(RimBridgeLogBoundary boundary, bool authoritative)
+    {
+        state.RimBridge.LogBoundaryTimestampUtc = boundary.CapturedUtc;
+        state.RimBridge.LogBoundaryPosition = boundary.Length;
+        state.RimBridge.LogExistedAtBoundary = boundary.Existed;
+        state.RimBridge.LogBoundaryAuthoritative = authoritative && boundary.Available;
+        state.RimBridge.LogBoundaryPrefixLength = boundary.PrefixLength;
+        state.RimBridge.LogBoundaryCreationUtcTicks = boundary.CreationUtcTicks;
+        state.RimBridge.LogBoundaryPrefixHash = boundary.PrefixHash;
     }
 
     private void MonitorLaunchWorker(int targetGeneration)
@@ -786,6 +882,7 @@ internal sealed partial class CoordinatorState
             Available = true,
             Existed = state.RimBridge.LogExistedAtBoundary,
             Length = state.RimBridge.LogBoundaryPosition,
+            PrefixLength = state.RimBridge.LogBoundaryPrefixLength,
             CreationUtcTicks = state.RimBridge.LogBoundaryCreationUtcTicks,
             PrefixHash = state.RimBridge.LogBoundaryPrefixHash,
             CapturedUtc = state.RimBridge.LogBoundaryTimestampUtc ?? state.LaunchStartedUtc

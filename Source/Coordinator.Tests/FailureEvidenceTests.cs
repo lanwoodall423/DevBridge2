@@ -191,7 +191,9 @@ internal static partial class OfflineTests
         PersistedState persisted = ReadState(fixture.Root);
         persisted.RimBridge ??= new RimBridgeIntegrationState();
         persisted.RimBridge.LogExistedAtBoundary = true;
+        persisted.RimBridge.LogBoundaryAuthoritative = true;
         persisted.RimBridge.LogBoundaryPosition = Encoding.UTF8.GetByteCount(prefix);
+        persisted.RimBridge.LogBoundaryCreationUtcTicks = new FileInfo(playerLog).CreationTimeUtc.Ticks;
         persisted.RimBridge.LogBoundaryPrefixHash = Convert.ToHexString(
             SHA256.HashData(Encoding.UTF8.GetBytes(prefix)));
         fixture.WriteState(persisted);
@@ -230,7 +232,107 @@ internal static partial class OfflineTests
             evidenceExit) as EvidenceShowResponse;
         Assert(evidenceExit == 0 && evidenceResponse?.Success == true &&
                evidenceResponse.Evidence.DiagnosisReference.Contains("incident-phase4", StringComparison.Ordinal),
-            "evidence show must lazily expose the bounded crash-isolation diagnosis reference");
+               "evidence show must lazily expose the bounded crash-isolation diagnosis reference");
+    }
+
+    private static void TestPlayerLogStartupResetRebasesBoundary()
+    {
+        using Fixture fixture = CreateReadyAfterPlayerLogStartupReset(out string playerLog, out _);
+        PersistedState persisted = ReadState(fixture.Root);
+        RimBridgeIntegrationState boundary = persisted.RimBridge;
+        string startup = File.ReadAllText(playerLog);
+        FileInfo info = new(playerLog);
+
+        Assert(persisted.Phase == BridgePhase.READY && boundary != null &&
+               boundary.LogBoundaryAuthoritative && boundary.LogExistedAtBoundary &&
+               boundary.LogBoundaryPosition == 0 &&
+               boundary.LogBoundaryPrefixLength == Encoding.UTF8.GetByteCount(startup) &&
+               boundary.LogBoundaryCreationUtcTicks == info.CreationTimeUtc.Ticks &&
+               boundary.LogBoundaryPrefixHash == Convert.ToHexString(
+                   SHA256.HashData(Encoding.UTF8.GetBytes(startup))),
+            "READY must persist a fresh authoritative boundary after startup recreated Player.log");
+    }
+
+    private static void TestPlayerLogPostBoundaryOutputIsCollected()
+    {
+        using Fixture fixture = CreateReadyAfterPlayerLogStartupReset(out string playerLog, out _);
+        File.AppendAllText(playerLog, "[RimBridge] ERROR post-boundary failure\n", new UTF8Encoding(false));
+
+        LogsQueryResponse response = QuerySinceLaunch(fixture);
+        Assert(response.Success && response.Available && response.Records.Any(value =>
+                   value.Message.Contains("post-boundary failure", StringComparison.Ordinal)),
+            "output appended after the authoritative boundary must be collected");
+    }
+
+    private static void TestPlayerLogPostBoundaryIntegrityFailure()
+    {
+        using (Fixture truncated = CreateReadyAfterPlayerLogStartupReset(out string truncatedPath, out _))
+        {
+            File.WriteAllText(truncatedPath, "short\n", new UTF8Encoding(false));
+            LogsQueryResponse response = QuerySinceLaunch(truncated);
+            Assert(!response.Available && response.ErrorCode == RimBridgeIntegrationConstants.PlayerLogBoundaryInvalidCode,
+                "unexpected post-boundary truncation must fail with PLAYER_LOG_BOUNDARY_INVALID");
+        }
+
+        using (Fixture replaced = CreateReadyAfterPlayerLogStartupReset(out string replacedPath, out _))
+        {
+            File.Delete(replacedPath);
+            File.WriteAllText(replacedPath, new string('r', 256) + "\n", new UTF8Encoding(false));
+            LogsQueryResponse response = QuerySinceLaunch(replaced);
+            Assert(!response.Available && response.ErrorCode == RimBridgeIntegrationConstants.PlayerLogBoundaryInvalidCode,
+                "unexpected post-boundary replacement must fail with PLAYER_LOG_BOUNDARY_INVALID");
+        }
+    }
+
+    private static void TestPlayerLogPreRunOutputIsExcluded()
+    {
+        using Fixture fixture = CreateReadyAfterPlayerLogStartupReset(out string playerLog, out string preRun);
+        File.AppendAllText(playerLog, "[RimBridge] ERROR current-run failure\n", new UTF8Encoding(false));
+
+        LogsQueryResponse response = QuerySinceLaunch(fixture);
+        Assert(response.Success && response.Available &&
+               response.Records.All(value => !value.Message.Contains(preRun, StringComparison.Ordinal)) &&
+               response.Records.Any(value => value.Message.Contains("current-run failure", StringComparison.Ordinal)),
+            "pre-run Player.log content must never be attributed to the new run");
+    }
+
+    private static Fixture CreateReadyAfterPlayerLogStartupReset(out string playerLog, out string preRun)
+    {
+        Fixture fixture = Fixture.LoadingWithLease();
+        playerLog = Path.Combine(fixture.Root, "Player.log");
+        fixture.PlayerLogPath = playerLog;
+        preRun = "pre-run output that must remain outside this generation\n";
+        File.WriteAllText(playerLog, preRun, new UTF8Encoding(false));
+        fixture.State = fixture.Reload();
+
+        PersistedState provisional = ReadState(fixture.Root);
+        provisional.RimBridge ??= new RimBridgeIntegrationState();
+        RimBridgeLogBoundary captured = RimBridgeLogDiscovery.CaptureBoundary(playerLog, ClockStart);
+        provisional.RimBridge.LogBoundaryTimestampUtc = captured.CapturedUtc;
+        provisional.RimBridge.LogBoundaryPosition = captured.Length;
+        provisional.RimBridge.LogExistedAtBoundary = captured.Existed;
+        provisional.RimBridge.LogBoundaryAuthoritative = false;
+        provisional.RimBridge.LogBoundaryCreationUtcTicks = captured.CreationUtcTicks;
+        provisional.RimBridge.LogBoundaryPrefixHash = captured.PrefixHash;
+        fixture.WriteState(provisional);
+        fixture.State = fixture.Reload();
+
+        // This models RimWorld's deterministic startup reset, before the readiness
+        // signal that permits the coordinator to establish the authoritative boundary.
+        File.Delete(playerLog);
+        File.WriteAllText(playerLog, "RimWorld 1.6.4871 rev591\nstartup output\n", new UTF8Encoding(false));
+        fixture.WriteReadiness("launch-1", 1, 101);
+        int exitCode = fixture.State.Execute(Request("wait-ready", "boundary-test", 88), _ => { }, () => true);
+        Assert(exitCode == 0, "startup reset fixture must reach READY");
+        return fixture;
+    }
+
+    private static LogsQueryResponse QuerySinceLaunch(Fixture fixture)
+    {
+        BridgeRequest logs = Request("logs", "boundary-test", 88, "query", "--since-launch", "--limit", "8", "--json");
+        logs.Json = true;
+        int exitCode = fixture.State.Execute(logs, _ => { }, () => true);
+        return fixture.State.CreateForensicJsonResponse(logs, exitCode) as LogsQueryResponse;
     }
 
     private static PersistedState ReadState(string root)

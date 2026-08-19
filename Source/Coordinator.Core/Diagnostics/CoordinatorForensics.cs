@@ -229,15 +229,53 @@ internal sealed partial class CoordinatorState
         {
             FileInfo info = new(path);
             long offset = Math.Max(0, bridge.LogBoundaryPosition);
-            if (bridge.LogExistedAtBoundary && info.Length < offset)
-                return new LogSegment { ErrorCode = "PLAYER_LOG_BOUNDARY_INVALID", Error = "Player.log was shortened after the launch boundary." };
-            if (bridge.LogExistedAtBoundary && offset > 0 && !string.IsNullOrWhiteSpace(bridge.LogBoundaryPrefixHash) &&
-                !string.Equals(ReadPrefixHash(path, offset), bridge.LogBoundaryPrefixHash, StringComparison.Ordinal))
-            {
-                if (!File.ReadLines(path).Take(16).Any(value => value.IndexOf("RimWorld", StringComparison.OrdinalIgnoreCase) >= 0))
-                    return new LogSegment { ErrorCode = "PLAYER_LOG_BOUNDARY_INVALID", Error = "Player.log changed after the launch boundary; stale output was excluded." };
-                offset = 0;
-            }
+            if (!bridge.LogBoundaryAuthoritative)
+                return new LogSegment
+                {
+                    ErrorCode = RimBridgeIntegrationConstants.PlayerLogBoundaryInvalidCode,
+                    Error = "Player.log has no authoritative post-startup boundary; stale output was excluded."
+                };
+            if (!bridge.LogExistedAtBoundary)
+                return new LogSegment
+                {
+                    ErrorCode = RimBridgeIntegrationConstants.PlayerLogBoundaryInvalidCode,
+                    Error = "Player.log was not present when the authoritative boundary was captured."
+                };
+            if (info.Length < offset)
+                return new LogSegment
+                {
+                    ErrorCode = RimBridgeIntegrationConstants.PlayerLogBoundaryInvalidCode,
+                    Error = "Player.log was shortened after the launch boundary."
+                };
+            if (bridge.LogBoundaryCreationUtcTicks > 0 && info.CreationTimeUtc.Ticks > 0 &&
+                info.CreationTimeUtc.Ticks != bridge.LogBoundaryCreationUtcTicks)
+                return new LogSegment
+                {
+                    ErrorCode = RimBridgeIntegrationConstants.PlayerLogBoundaryInvalidCode,
+                    Error = "Player.log was replaced after the launch boundary; stale output was excluded."
+                };
+            long prefixLength = bridge.LogBoundaryPrefixLength > 0
+                ? bridge.LogBoundaryPrefixLength
+                : offset;
+            if (prefixLength > info.Length)
+                return new LogSegment
+                {
+                    ErrorCode = RimBridgeIntegrationConstants.PlayerLogBoundaryInvalidCode,
+                    Error = "Player.log was shortened after the launch boundary."
+                };
+            if (prefixLength > 0 && string.IsNullOrWhiteSpace(bridge.LogBoundaryPrefixHash))
+                return new LogSegment
+                {
+                    ErrorCode = RimBridgeIntegrationConstants.PlayerLogBoundaryInvalidCode,
+                    Error = "Player.log boundary integrity metadata is incomplete."
+                };
+            if (prefixLength > 0 && !string.Equals(ReadPrefixHash(path, prefixLength), bridge.LogBoundaryPrefixHash,
+                    StringComparison.Ordinal))
+                return new LogSegment
+                {
+                    ErrorCode = RimBridgeIntegrationConstants.PlayerLogBoundaryInvalidCode,
+                    Error = "Player.log changed after the launch boundary; stale output was excluded."
+                };
             if (offset > info.Length)
                 offset = info.Length;
             int count = (int)Math.Min(FailureEvidenceLimits.MaxRawLogBytes, info.Length - offset);

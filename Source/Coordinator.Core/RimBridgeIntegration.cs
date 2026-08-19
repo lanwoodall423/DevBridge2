@@ -45,6 +45,7 @@ internal static class RimBridgeIntegrationConstants
     internal const string PackageId = "brrainz.rimbridgeserver";
     internal const string LoopbackHost = "127.0.0.1";
     internal const string EndpointNotFoundCode = "RIMBRIDGE_ENDPOINT_NOT_FOUND";
+    internal const string PlayerLogBoundaryInvalidCode = "PLAYER_LOG_BOUNDARY_INVALID";
     internal const string StartupTimeoutCode = "RIMBRIDGE_STARTUP_TIMEOUT";
     internal const string StartupFailedCode = "RIMBRIDGE_STARTUP_FAILED";
     internal const string AuthFailedCode = "RIMBRIDGE_AUTH_FAILED";
@@ -165,6 +166,8 @@ internal sealed class RimBridgeIntegrationState
     public DateTime? LogBoundaryTimestampUtc { get; set; }
     public long LogBoundaryPosition { get; set; }
     public bool LogExistedAtBoundary { get; set; }
+    public bool LogBoundaryAuthoritative { get; set; }
+    public long LogBoundaryPrefixLength { get; set; }
     public long LogBoundaryCreationUtcTicks { get; set; }
     public string LogBoundaryPrefixHash { get; set; }
     public string ErrorCode { get; set; }
@@ -199,6 +202,8 @@ internal sealed class RimBridgeIntegrationState
         LogBoundaryTimestampUtc = LogBoundaryTimestampUtc,
         LogBoundaryPosition = LogBoundaryPosition,
         LogExistedAtBoundary = LogExistedAtBoundary,
+        LogBoundaryAuthoritative = LogBoundaryAuthoritative,
+        LogBoundaryPrefixLength = LogBoundaryPrefixLength,
         LogBoundaryCreationUtcTicks = LogBoundaryCreationUtcTicks,
         LogBoundaryPrefixHash = LogBoundaryPrefixHash,
         ErrorCode = ErrorCode,
@@ -284,6 +289,7 @@ internal sealed class RimBridgeLogBoundary
     internal bool Available { get; init; }
     internal bool Existed { get; init; }
     internal long Length { get; init; }
+    internal long PrefixLength { get; init; }
     internal long CreationUtcTicks { get; init; }
     internal string PrefixHash { get; init; }
     internal DateTime CapturedUtc { get; init; }
@@ -344,6 +350,7 @@ internal static class RimBridgeLogDiscovery
                     Available = true,
                     Existed = false,
                     Length = 0,
+                    PrefixLength = 0,
                     CapturedUtc = capturedUtc
                 };
             }
@@ -355,6 +362,7 @@ internal static class RimBridgeLogDiscovery
                 Available = true,
                 Existed = true,
                 Length = info.Length,
+                PrefixLength = Math.Min(info.Length, 64 * 1024),
                 CreationUtcTicks = info.CreationTimeUtc.Ticks,
                 PrefixHash = ReadPrefixHash(path, info.Length),
                 CapturedUtc = capturedUtc
@@ -391,13 +399,7 @@ internal static class RimBridgeLogDiscovery
 
             FileInfo info = new(boundary.Path);
             bool scanFromBeginning = !boundary.Existed;
-            if (boundary.Existed &&
-                (info.Length < boundary.Length ||
-                 (boundary.CreationUtcTicks > 0 && info.CreationTimeUtc.Ticks > 0 &&
-                  info.CreationTimeUtc.Ticks != boundary.CreationUtcTicks) ||
-                 string.IsNullOrWhiteSpace(boundary.PrefixHash) ||
-                 !string.Equals(ReadPrefixHash(boundary.Path, boundary.Length),
-                     boundary.PrefixHash, StringComparison.Ordinal)))
+            if (boundary.Existed && BoundaryChanged(boundary))
             {
                 // RimWorld truncates Player.log during a normal launch. A genuinely
                 // shortened log that contains the fresh process startup marker can be
@@ -523,7 +525,33 @@ internal static class RimBridgeLogDiscovery
         return Convert.ToHexString(SHA256.HashData(buffer.AsSpan(0, read)));
     }
 
-    private static bool HasRimWorldStartupMarker(string path)
+    internal static bool BoundaryChanged(RimBridgeLogBoundary boundary)
+    {
+        if (boundary == null || !boundary.Existed)
+            return false;
+        try
+        {
+            if (!File.Exists(boundary.Path))
+                return true;
+            FileInfo info = new(boundary.Path);
+            return info.Length < boundary.Length ||
+                (boundary.CreationUtcTicks > 0 && info.CreationTimeUtc.Ticks > 0 &&
+                 info.CreationTimeUtc.Ticks != boundary.CreationUtcTicks) ||
+                string.IsNullOrWhiteSpace(boundary.PrefixHash) ||
+                !string.Equals(ReadPrefixHash(boundary.Path, boundary.Length),
+                    boundary.PrefixHash, StringComparison.Ordinal);
+        }
+        catch (IOException)
+        {
+            return true;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return true;
+        }
+    }
+
+    internal static bool HasRimWorldStartupMarker(string path)
     {
         using FileStream stream = new(path, FileMode.Open, FileAccess.Read,
             FileShare.ReadWrite | FileShare.Delete);

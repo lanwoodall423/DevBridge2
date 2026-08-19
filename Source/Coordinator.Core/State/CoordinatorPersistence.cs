@@ -556,6 +556,8 @@ internal sealed partial class CoordinatorState
         state.RimBridge.LogBoundaryTimestampUtc = null;
         state.RimBridge.LogBoundaryPosition = 0;
         state.RimBridge.LogExistedAtBoundary = false;
+        state.RimBridge.LogBoundaryAuthoritative = false;
+        state.RimBridge.LogBoundaryPrefixLength = 0;
         state.RimBridge.LogBoundaryCreationUtcTicks = 0;
         state.RimBridge.LogBoundaryPrefixHash = null;
         state.RimBridge.CompanionAvailable = false;

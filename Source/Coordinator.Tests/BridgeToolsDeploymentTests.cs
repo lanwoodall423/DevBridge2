@@ -7,6 +7,9 @@ internal static partial class OfflineTests
 {
     private static void TestBridgeToolsPublishContract()
     {
+        if (SkipUnselectedBridgeToolsCoverage())
+            return;
+
         string root = FindWorkspaceRoot();
         string companionProject = File.ReadAllText(Path.Combine(root, "Source", "BridgeTools",
             "DevBridge2.BridgeTools.csproj"));
@@ -49,6 +52,9 @@ internal static partial class OfflineTests
 
     private static void TestBridgeToolsPublishRefreshesStaleDll()
     {
+        if (SkipUnselectedBridgeToolsCoverage())
+            return;
+
         string root = FindWorkspaceRoot();
         string script = Path.Combine(root, "Publish-DevBridge.ps1");
         string target = Path.Combine(Path.GetTempPath(), "DevBridge2-companion-publish-" +
@@ -116,6 +122,16 @@ internal static partial class OfflineTests
         Assert(RimBridgeCompanionDiagnostics.Code(state) ==
                    RimBridgeIntegrationConstants.CompanionToolNotRegisteredDiagnostic,
             "legacy unavailable state must expose the nonfatal tool-not-registered category");
+    }
+
+    private static bool SkipUnselectedBridgeToolsCoverage()
+    {
+        string scope = Environment.GetEnvironmentVariable("DEVBRIDGE_OFFLINE_TEST_SCOPE") ?? string.Empty;
+        if (!scope.Equals("coordinator", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        Console.WriteLine("SKIP BridgeTools deployment coverage: BridgeTools is outside this coordinator-only impact plan.");
+        return true;
     }
 
     private static void RunPowerShell(string script, params string[] arguments)

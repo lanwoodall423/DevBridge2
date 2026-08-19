@@ -37,8 +37,18 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'RimLiaison Release build failed.' }
           Push-Location .\DevBridge2
           try {
-              pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\validate.ps1
-              if ($LASTEXITCODE -ne 0) { throw 'DevBridge2 offline validation failed.' }
+              $invariantOutput = & pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\validate.ps1 -InvariantsOnly -Json
+              $invariantExit = $LASTEXITCODE
+              Write-Output ($invariantOutput -join [Environment]::NewLine)
+              if ($invariantExit -ne 0) { throw 'DevBridge2 static invariant safety check failed.' }
+              try {
+                  $invariantReport = ($invariantOutput -join [Environment]::NewLine) | ConvertFrom-Json
+                  if ($invariantReport.status -ne 'pass' -or -not [bool]$invariantReport.invariantsOnly) {
+                      throw 'The invariant-only validator did not return a passing safety report.'
+                  }
+              } catch {
+                  throw "DevBridge2 invariant safety report was not valid: $($_.Exception.Message)"
+              }
               $sourceRoot = (Resolve-Path .).Path
               $runtimeRoot = Join-Path $env:RIMWORLD_ROOT 'Mods\DevBridge2'
               if (-not (Test-Path -LiteralPath $runtimeRoot -PathType Container)) {

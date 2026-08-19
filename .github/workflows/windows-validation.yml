@@ -7,6 +7,13 @@ on:
   pull_request:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      full:
+        description: 'Run the complete safe offline validation set'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -28,30 +35,33 @@ jobs:
         with:
           dotnet-version: 8.0.424
 
-      - name: Run standard offline validation
-        shell: pwsh
-        run: pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\validate.ps1
-
-      - name: Check committed diff whitespace
+      - name: Run impact-aware offline validation
         shell: pwsh
         env:
           EVENT_NAME: ${{ github.event_name }}
           BEFORE_SHA: ${{ github.event.before }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_HEAD_SHA: ${{ github.sha }}
+          MANUAL_FULL: ${{ inputs.full }}
         run: |
           $ErrorActionPreference = 'Stop'
-          if ($env:EVENT_NAME -eq 'pull_request') {
-              $base = $env:BASE_SHA
+          $base = if ($env:EVENT_NAME -eq 'pull_request') { $env:BASE_SHA } else { $env:BEFORE_SHA }
+          $head = if ($env:EVENT_NAME -eq 'pull_request') { $env:PR_HEAD_SHA } else { $env:PUSH_HEAD_SHA }
+          $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', '.\scripts\validate.ps1')
+
+          $missingRange = [string]::IsNullOrWhiteSpace($base) -or
+              [string]::IsNullOrWhiteSpace($head) -or
+              $base -match '^0+$' -or $head -match '^0+$'
+          if ($missingRange) {
+              Write-Host 'Base/head context is missing; requesting conservative validation.'
+              $arguments += '-Conservative'
           } else {
-              $base = $env:BEFORE_SHA
+              $arguments += @('-BaseRevision', $base, '-HeadRevision', $head)
           }
+          if ($env:MANUAL_FULL -eq 'true') { $arguments += '-Full' }
 
-          if ([string]::IsNullOrWhiteSpace($base) -or $base -match '^0+$') {
-              $base = "$($env:HEAD_SHA)^"
-          }
+          & pwsh @arguments
+          if ($LASTEXITCODE -ne 0) { throw "Impact-aware validation failed (exit $LASTEXITCODE)." }
 
-          & git diff --check $base $env:HEAD_SHA
-          if ($LASTEXITCODE -ne 0) {
-              throw "git diff --check failed for $base..$($env:HEAD_SHA)."
-          }
+          Write-Host "Validated range: $base..$head"

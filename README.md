@@ -68,16 +68,18 @@ uses only `scripts\validate.ps1` and never claims live compatibility.
 
 ## Build and release
 
-The standard offline gate is:
+The canonical impact-aware offline gate is:
 
 ```powershell
 pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\validate.ps1
 ```
 
-It performs locked restore, Release builds, the complete offline suite, artifact checks, and the
-BridgeTools SDK exclusion check. To intentionally update the NuGet lock file, run
-`scripts\validate.ps1 -UpdatePackages`, review `Source\BridgeTools\packages.lock.json`, and rerun the
-normal gate.
+It inspects the Git change set, always performs cheap repository invariants, and selects the minimum
+safe affected restore/build/test stages. Coordinator.Tests transitively covers Coordinator and
+Coordinator.Core; unrelated BridgeTools, FakeRimWorld, publish, live-stack, and process matrices are
+skipped. Use `scripts\validate.ps1 -Full` for an explicit complete safe offline run. To intentionally
+update the NuGet lock file, run `scripts\validate.ps1 -UpdatePackages`, review
+`Source\BridgeTools\packages.lock.json`, and rerun the normal gate.
 
 The deterministic package entrypoint is:
 

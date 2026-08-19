@@ -233,6 +233,10 @@ internal static partial class OfflineTests
         Run("semantic logs are launch-bounded, deduplicated, and smaller", TestSemanticLogsAreBoundedAndCompact);
         Run("evidence lookup is lazy, bounded, and expires deterministically", TestEvidenceLookupBoundsAndExpiry);
         Run("forensic commands expose diagnosis references without loaded-code claims", TestForensicCommandsAndDiagnosisReference);
+        Run("Player.log startup reset rebases the authoritative boundary at READY", TestPlayerLogStartupResetRebasesBoundary);
+        Run("post-boundary Player.log output is collected", TestPlayerLogPostBoundaryOutputIsCollected);
+        Run("post-boundary Player.log truncation or replacement fails closed", TestPlayerLogPostBoundaryIntegrityFailure);
+        Run("pre-run Player.log output is excluded from the new run", TestPlayerLogPreRunOutputIsExcluded);
 
         Console.WriteLine(failures == 0 ? "OFFLINE TESTS PASS" : "OFFLINE TESTS FAIL: " + failures);
         return failures == 0 ? 0 : 1;

@@ -2,17 +2,32 @@
 
 ## Engineering gate
 
-Run the repository-owned offline validation command before submitting a change:
+Run the repository-owned impact-aware validation command once after an edit:
 
 ```powershell
 pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\validate.ps1
 ```
 
-It restores and builds the Release Coordinator, Coordinator.Tests, and BridgeTools projects, runs the
-complete offline coordinator suite (including version/schema consistency and coordinator lifecycle
-regressions), checks diff whitespace, verifies that coordinator build products are not tracked, and
-verifies that BridgeTools does not emit `RimBridgeServer.Sdk.dll`. GitHub Actions runs the same gate on
-pull requests and pushes to `main`.
+The validator reads the current Git change set (or the supplied CI base/head range), runs the cheap
+repository invariants and whitespace checks, and selects the minimum safe affected stages. A
+`Coordinator.Tests` restore/build/run transitively covers Coordinator and Coordinator.Core; BridgeTools,
+FakeRimWorld, process E2E, development-plan, publishing, and live-stack matrices run only when their
+inputs are affected. The output lists selected and skipped stages and ends with one PASS/FAIL result.
+
+Do not manually choose a quick/standard/full suite for an ordinary edit. Use `-Full` for an explicit
+complete safe offline run, or `-Conservative` when reviewing an uncertain change. The planner treats
+unknown paths, renames, deletions, invalid CI ranges, package/SDK/build configuration, and runtime
+inputs conservatively. `-InvariantsOnly` is reserved for workflows that are about to establish their
+own live prerequisites; it is not a substitute for normal source validation. Run the deterministic
+planner matrix directly when changing the planner itself:
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\validation-plan.tests.ps1
+```
+
+GitHub Actions supplies the PR base/head or push before/head revisions. A missing range escalates rather
+than selecting too little validation. The live-stack workflow runs only this validator's cheap
+invariant mode before building/staging the concrete live-smoke prerequisites.
 
 The standard gate deliberately does not build `Source\Mod\DevBridge2.csproj`: that project requires the
 proprietary `Assembly-CSharp.dll` and `UnityEngine.CoreModule.dll` from a local RimWorld installation.

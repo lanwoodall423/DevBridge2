@@ -41,6 +41,7 @@ public static class DevBridgeSchemaVersions
     public const string FailureFingerprintContract = "devbridge-failure-fingerprint/v1";
     public const string EvidenceContract = "devbridge-evidence/v1";
     public const string LogsQueryContract = "devbridge-logs-query/v1";
+    public const string GamePrimitivesContract = "devbridge-game-primitives/v1";
 
     public const string AgentCapabilities = AgentCapabilitiesContract;
     public const string AgentSnapshot = AgentSnapshotContract;
@@ -56,4 +57,5 @@ public static class DevBridgeSchemaVersions
     public const string FailureFingerprint = FailureFingerprintContract;
     public const string Evidence = EvidenceContract;
     public const string LogsQuery = LogsQueryContract;
+    public const string GamePrimitives = GamePrimitivesContract;
 }

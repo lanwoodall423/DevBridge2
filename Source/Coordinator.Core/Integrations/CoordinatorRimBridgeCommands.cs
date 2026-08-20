@@ -106,42 +106,9 @@ internal sealed partial class CoordinatorState
             return 2;
         }
 
-        string leaseId = FindRouteLeaseId(request, routeRequest.LeaseId);
-        long routeStarted = Stopwatch.GetTimestamp();
-        string routeCategory = RimBridgeOperationPolicy.CategoryFor(routeRequest.ToolName);
-        TraceEvent("rimbridge.route.started", request, category: routeCategory);
-        RimBridgeRoutePreparation preparation;
-        lock (gate)
-        {
-            if (!TryPrepareStaleRimBridgeProcessRouteLocked(request, routeRequest.ToolName,
-                    leaseId, out preparation))
-            {
-                SynchronizeLocked();
-                preparation = PrepareRimBridgeRouteLocked(request, routeRequest.ToolName, leaseId);
-            }
-        }
-
-        if (preparation.Failure != null)
-        {
-            TraceEvent("rimbridge.route.failed", request,
-                durationMs: ElapsedMilliseconds(routeStarted), success: false,
-                errorCode: preparation.Failure.ErrorCode, category: routeCategory);
-            request.RimBridgeRouteResult = preparation.Failure;
-            EmitRimBridgeRoute(preparation.Failure, request, emit);
-            return 4;
-        }
-
-        RimBridgeWireResult wire = rimBridgeClient.CallTool(preparation.Context.Endpoint,
-            preparation.Context.LaunchId, routeRequest.ToolName, routeRequest.Arguments,
-            options.RimBridgeCallTimeout);
-        RimBridgeRouteResult result = BuildRimBridgeRouteResult("call", routeRequest.ToolName,
-            preparation.Context, wire);
-        HandleRimBridgeRouteCredentialFailure(preparation.Context.Endpoint, wire);
-        request.RimBridgeRouteResult = result;
+        RimBridgeRouteResult result = RouteRimBridgeTool(request, routeRequest.ToolName,
+            routeRequest.Arguments, routeRequest.LeaseId);
         EmitRimBridgeRoute(result, request, emit);
-        TraceEvent(result.Success ? "rimbridge.route.completed" : "rimbridge.route.failed", request,
-            durationMs: ElapsedMilliseconds(routeStarted), success: result.Success,
-            errorCode: result.Success ? null : result.ErrorCode, category: routeCategory);
         return result.Success ? 0 : 4;
     }
 

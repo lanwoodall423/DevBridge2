@@ -23,6 +23,7 @@ internal sealed partial class CoordinatorState
         emit("  DevBridge.cmd bridge endpoint  (explicit credential-bearing command; ordinary status never shows the token)");
         emit("  DevBridge.cmd bridge tools  (lease-bound read-only RimBridge discovery)");
         emit("  DevBridge.cmd bridge call <tool-name> [JSON arguments] [--lease <lease-id>]  (lease-bound routed call)");
+        emit("  DevBridge.cmd game inspect|action|wait|advance|save|load|errors  (lease-safe semantic game primitives)");
         emit("  DevBridge.cmd project resolve <alias[,alias...]> [--explain]  (pure no-mutation planning)");
         emit("  DevBridge.cmd project register <alias[,alias...]> [--id <stable-registration-id>]");
         emit("  DevBridge.cmd project status");
@@ -62,7 +63,7 @@ internal sealed partial class CoordinatorState
     private static int Unknown(string command, Action<string> emit)
     {
         emit("Unknown DevBridge command: " + command);
-        emit("Use: status, bridge status/policy/endpoint/tools/call, project resolve/register/status/renew/release, mods status/capture-baseline/restore-baseline, test begin/session/renew/end, stop <lease-id>, ensure-ready <lease-id>, restart [--projects ...|--legacy-production], wait-ready, history [show <generation>|last-good], logs query, evidence show, doctor, agent capabilities|snapshot|delta|wait-event");
+        emit("Use: status, bridge status/policy/endpoint/tools/call, game inspect/action/wait/advance/save/load/errors, project resolve/register/status/renew/release, mods status/capture-baseline/restore-baseline, test begin/session/renew/end, stop <lease-id>, ensure-ready <lease-id>, restart [--projects ...|--legacy-production], wait-ready, history [show <generation>|last-good], logs query, evidence show, doctor, agent capabilities|snapshot|delta|wait-event");
         EmitNextCommand(emit, "DevBridge.cmd help");
         return 2;
     }

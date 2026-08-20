@@ -1,9 +1,9 @@
 {
   "schemaVersion": "devbridge-mod-development/v1",
-  "project": "frontier",
-  "sourceProject": "src/RimLiaison.Cli/RimLiaison.Cli.csproj",
+  "project": "FrontierLive",
+  "sourceProject": "Source/Frontier.csproj",
   "configuration": "Release",
-  "expectedAssembly": "rimliaison.dll",
+  "expectedAssembly": "Frontier.dll",
   "deploymentTarget": "1.6/Assemblies/Frontier.dll",
   "testRecipe": "mod-development-smoke"
 }

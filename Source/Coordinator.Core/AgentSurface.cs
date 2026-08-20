@@ -32,6 +32,12 @@ internal sealed class AgentCapabilitiesResponse : AgentResponse
 
     [JsonPropertyName("features")]
     public AgentFeatureFlags Features { get; init; } = new();
+
+    // Game primitives are part of the existing agent capability contract. They
+    // are discovery metadata only; callers still use the lease-bound `game`
+    // command for live operations.
+    [JsonPropertyName("gamePrimitives")]
+    public AgentGamePrimitiveSet GamePrimitives { get; init; } = AgentGamePrimitiveSet.Create();
 }
 
 internal sealed class AgentFeatureFlags
@@ -56,6 +62,133 @@ internal sealed class AgentFeatureFlags
 
     [JsonPropertyName("semanticLogs")]
     public bool SemanticLogs { get; init; } = true;
+
+    [JsonPropertyName("gamePrimitives")]
+    public bool GamePrimitives { get; init; } = true;
+
+    [JsonPropertyName("runtimeErrorDelta")]
+    public bool RuntimeErrorDelta { get; init; } = true;
+}
+
+internal sealed class AgentGamePrimitiveSet
+{
+    [JsonPropertyName("schemaVersion")]
+    public string SchemaVersion { get; init; } = DevBridgeSchemaVersions.GamePrimitives;
+
+    [JsonPropertyName("contract")]
+    public string Contract { get; init; } = DevBridgeSchemaVersions.GamePrimitives;
+
+    [JsonPropertyName("leaseRequired")]
+    public bool LeaseRequired { get; init; } = true;
+
+    [JsonPropertyName("command")]
+    public string Command { get; init; } = "game";
+
+    [JsonPropertyName("dynamicToolForwarding")]
+    public bool DynamicToolForwarding { get; init; } = true;
+
+    [JsonPropertyName("operations")]
+    public List<AgentGamePrimitiveOperation> Operations { get; init; } = new();
+
+    internal static AgentGamePrimitiveSet Create() => new()
+    {
+        Operations = new List<AgentGamePrimitiveOperation>
+        {
+            new()
+            {
+                Id = "inspect",
+                Command = "game inspect <tool-name> [JSON object] [--lease <lease-id>] --json",
+                Kind = "state-query",
+                Tool = "caller-selected semantic tool",
+                Bounded = true,
+                Description = "Forward one caller-selected semantic state query through the normal RimBridge route."
+            },
+            new()
+            {
+                Id = "action",
+                Command = "game action <tool-name> [JSON object] [--lease <lease-id>] --json",
+                Kind = "action",
+                Tool = "caller-selected semantic tool",
+                Bounded = true,
+                Description = "Invoke one caller-selected semantic game/mod action; DevBridge does not encode a scenario."
+            },
+            new()
+            {
+                Id = "wait",
+                Command = "game wait <tool-name> [JSON object] --path <JSON pointer> --equals <JSON value> --timeout-ms <n> [--poll-ms <n>] [--lease <lease-id>] --json",
+                Kind = "condition-wait",
+                Tool = "caller-selected semantic query tool",
+                Bounded = true,
+                Description = "Poll an observable structured result until one JSON-pointer value equals the requested value."
+            },
+            new()
+            {
+                Id = "advance",
+                Command = "game advance --ticks <n> [--timeout-ms <n>] [--poll-ms <n>] [--lease <lease-id>] --json",
+                Kind = "simulation",
+                Tool = "rimworld/step_game_ticks",
+                Bounded = true,
+                Description = "Advance a bounded number of RimWorld ticks and return the terminal tool result."
+            },
+            new()
+            {
+                Id = "save",
+                Command = "game save --name <save-name> [--timeout-ms <n>] [--lease <lease-id>] --json",
+                Kind = "save",
+                Tool = "rimworld/save_game + rimbridge/wait_for_long_event_idle",
+                Bounded = true,
+                Description = "Request a save and confirm the save operation reaches long-event idle."
+            },
+            new()
+            {
+                Id = "load",
+                Command = "game load --name <save-name> [--readiness <level>] [--timeout-ms <n>] [--poll-ms <n>] [--ignore-mod-compatibility] [--lease <lease-id>] --json",
+                Kind = "load",
+                Tool = "rimworld/load_game_ready",
+                Bounded = true,
+                Description = "Load a named save and return only after the requested game readiness level is reached."
+            },
+            new()
+            {
+                Id = "errors-checkpoint",
+                Command = "game errors checkpoint [--lease <lease-id>] --json",
+                Kind = "runtime-error-checkpoint",
+                Tool = "rimbridge/list_logs",
+                Bounded = true,
+                Description = "Capture the current generation-bound RimBridge log sequence before a scenario."
+            },
+            new()
+            {
+                Id = "errors-delta",
+                Command = "game errors delta --checkpoint <token> [--lease <lease-id>] --json",
+                Kind = "runtime-error-delta",
+                Tool = "rimbridge/list_logs",
+                Bounded = true,
+                Description = "Return only error log entries with a sequence newer than a prior checkpoint."
+            }
+        }
+    };
+}
+
+internal sealed class AgentGamePrimitiveOperation
+{
+    [JsonPropertyName("id")]
+    public string Id { get; init; }
+
+    [JsonPropertyName("command")]
+    public string Command { get; init; }
+
+    [JsonPropertyName("kind")]
+    public string Kind { get; init; }
+
+    [JsonPropertyName("tool")]
+    public string Tool { get; init; }
+
+    [JsonPropertyName("bounded")]
+    public bool Bounded { get; init; }
+
+    [JsonPropertyName("description")]
+    public string Description { get; init; }
 }
 
 internal sealed class AgentBuildIdentity

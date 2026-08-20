@@ -68,7 +68,7 @@ internal static class Program
 
     private static void PrintUsage()
     {
-        Console.WriteLine("DevBridge commands: status | bridge status | bridge policy | bridge endpoint | bridge tools | bridge call <tool-name> [JSON arguments] [--lease <lease-id>] | environment viewport begin|restore|status | project register <alias[,alias...]> | project status | project renew <registration-id> | project release <registration-id> | mods status | mods capture-baseline | mods restore-baseline | test begin | test session | test renew <lease-id> | test end <lease-id> | stop <lease-id> | coordinator shutdown | coordinator migrate-legacy-slot | ensure-ready <lease-id> | restart [--projects none|alias[,alias...]] [--legacy-production] | wait-ready | history [show <generation>|last-good] | doctor");
+        Console.WriteLine("DevBridge commands: status | bridge status | bridge policy | bridge endpoint | bridge tools | bridge call <tool-name> [JSON arguments] [--lease <lease-id>] | game inspect|action|wait|advance|save|load|errors | environment viewport begin|restore|status | project register <alias[,alias...]> | project status | project renew <registration-id> | project release <registration-id> | mods status | mods capture-baseline | mods restore-baseline | test begin | test session | test renew <lease-id> | test end <lease-id> | stop <lease-id> | coordinator shutdown | coordinator migrate-legacy-slot | ensure-ready <lease-id> | restart [--projects none|alias[,alias...]] [--legacy-production] | wait-ready | history [show <generation>|last-good] | doctor");
         Console.WriteLine("Append --json to a non-session command for machine-readable output.");
         Console.WriteLine("Canonical live gate: pwsh -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\live-stack-smoke.ps1 -Json");
     }
@@ -853,7 +853,9 @@ internal static class CoordinatorServer
                     object response = null;
                     if (request.Json)
                     {
-                        response = string.Equals(request.Command, "agent", StringComparison.OrdinalIgnoreCase)
+                        response = string.Equals(request.Command, "game", StringComparison.OrdinalIgnoreCase)
+                            ? state.CreateGameJsonResponse(request, exitCode)
+                            : string.Equals(request.Command, "agent", StringComparison.OrdinalIgnoreCase)
                             ? state.CreateAgentJsonResponse(request, exitCode)
                             : Program.IsRecipeCommand(request)
                                 ? state.CreateRecipeJsonResponse(request, exitCode)
@@ -866,6 +868,7 @@ internal static class CoordinatorServer
                                 : state.CreateJsonResponse(request, exitCode, buffered);
                         exitCode = response switch
                         {
+                            GamePrimitiveResponse gameResponse => gameResponse.ExitCode,
                             AgentResponse agentResponse => agentResponse.ExitCode,
                             RecipeResponse recipeResponse => recipeResponse.ExitCode,
                             ForensicResponse forensicResponse => forensicResponse.ExitCode,
@@ -980,6 +983,9 @@ internal static class CoordinatorResponsePolicy
             return false;
         if (string.Equals(command, "agent", StringComparison.OrdinalIgnoreCase) && arguments.Count > 0 &&
             string.Equals(arguments[0], "wait-event", StringComparison.OrdinalIgnoreCase))
+            return false;
+        if (string.Equals(command, "game", StringComparison.OrdinalIgnoreCase) && arguments.Count > 0 &&
+            string.Equals(arguments[0], "wait", StringComparison.OrdinalIgnoreCase))
             return false;
         if (string.Equals(command, "test", StringComparison.OrdinalIgnoreCase) && arguments.Count > 0 &&
             (string.Equals(arguments[0], "begin", StringComparison.OrdinalIgnoreCase) ||

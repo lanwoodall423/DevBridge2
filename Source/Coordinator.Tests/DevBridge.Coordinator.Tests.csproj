@@ -29,6 +29,7 @@
     <Compile Include="QuicktestTests.cs" />
     <Compile Include="ProfilesTests.cs" />
     <Compile Include="RimBridgeTests.cs" />
+    <Compile Include="GamePrimitiveTests.cs" />
     <Compile Include="RimBridgeProtocolContractTests.cs" />
     <Compile Include="GenerationAndModsConfigTests.cs" />
     <Compile Include="RecoveryTests.cs" />

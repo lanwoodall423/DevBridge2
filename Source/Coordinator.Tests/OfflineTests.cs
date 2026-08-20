@@ -114,6 +114,10 @@ internal static partial class OfflineTests
         Run("RimBridge route blocks persistent and lifecycle mutations", TestRimBridgeRoutePolicyBlocks);
         Run("RimBridge route rejects stale generation and process identity", TestRimBridgeRouteIdentitySafety);
         Run("RimBridge route enforces valid shared leases", TestRimBridgeRouteLeaseSafety);
+        Run("game primitive discovery is versioned and scenario-neutral", TestGamePrimitiveDiscovery);
+        Run("game primitives reuse the lease-safe semantic route", TestGamePrimitiveRouting);
+        Run("game condition waits are bounded and diagnostic", TestGamePrimitiveWait);
+        Run("game save/load and runtime error cursors are composable", TestGamePrimitiveLifecyclePrimitives);
         Run("RimBridge route auth failure invalidates credentials and redacts secrets", TestRimBridgeRouteAuthRedaction);
         Run("RimBridge route is disabled or unavailable fail closed", TestRimBridgeRouteUnavailableModes);
         Run("RimBridge hello sends structured client information", TestRimBridgeWireClientInfo);
@@ -555,6 +559,7 @@ internal static partial class OfflineTests
     {
         internal RimBridgeWireResult ListResult { get; set; } = WireSuccess("{\"tools\":[]}");
         internal RimBridgeWireResult CallResult { get; set; } = WireSuccess("{\"success\":true}");
+        internal Func<string, JsonElement, RimBridgeWireResult> CallHandler { get; set; }
         internal int ListCalls { get; private set; }
         internal int CallCalls { get; private set; }
         internal string LastToolName { get; private set; }
@@ -573,7 +578,7 @@ internal static partial class OfflineTests
             CallCalls++;
             LastToolName = toolName;
             LastArguments = arguments.Clone();
-            return CallResult;
+            return CallHandler?.Invoke(toolName, arguments) ?? CallResult;
         }
     }
 

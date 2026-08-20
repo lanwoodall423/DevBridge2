@@ -199,15 +199,17 @@ function Resolve-SourceProject {
     if (-not $safe.EndsWith('.csproj', [StringComparison]::OrdinalIgnoreCase)) {
         throw 'sourceProject must name a .csproj file'
     }
+    $attempted = [System.Collections.Generic.List[string]]::new()
     foreach ($root in $developmentRoots) {
         Assert-Directory $root 'development root'
         $candidate = [IO.Path]::GetFullPath((Join-Path $root $safe))
+        [void]$attempted.Add($candidate)
         if ((Test-PathWithin $candidate $root) -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
             Assert-NoReparsePath $candidate
             return $candidate
         }
     }
-    throw "sourceProject is not a file below a configured development root: $RelativePath"
+    throw "sourceProject '$RelativePath' was not found below the configured development roots. Expected one of: $($attempted -join '; '). Pass -DevelopmentRoot <root> or -AdditionalDevelopmentRoot <root> for the repository that owns the .csproj."
 }
 
 function Resolve-DeploymentTarget {

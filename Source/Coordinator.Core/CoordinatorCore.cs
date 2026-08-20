@@ -195,6 +195,10 @@ internal sealed class BridgeRequest
     // evidence never falls through the broad operational status projection.
     internal LogsQueryResponse LogsQueryResponse { get; set; }
     internal EvidenceShowResponse EvidenceShowResponse { get; set; }
+    // Server-side only. Game primitives use a dedicated compact response so
+    // semantic results, condition diagnostics, and error cursors do not fall
+    // through the broad lifecycle status projection.
+    internal GamePrimitiveResponse GameResponse { get; set; }
     // Server-side only. Viewport transactions use a dedicated, bounded
     // response so the effective client dimensions and cleanup evidence cannot
     // be confused with ordinary lifecycle status.

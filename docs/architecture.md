@@ -70,6 +70,50 @@ request and one terminal response, regardless of how long it remains pending; th
 written until a matching change, condition, timeout, shutdown, or disconnect occurs. Both use the existing
 IPC v2 frame limits; the agent projection is deliberately much smaller than the legacy response.
 
+## Lease-safe game primitives
+
+`agent capabilities --json` is the single discovery surface for the low-level game primitive set. Its
+`gamePrimitives` object uses `devbridge-game-primitives/v1`, declares `leaseRequired: true`, and lists
+the supported `game` operations. There is no second discovery registry and no Frontier scenario encoded
+in DevBridge2.
+
+The command shapes are:
+
+```text
+DevBridge.cmd game inspect <tool-name> [JSON object] [--lease <lease-id>] --json
+DevBridge.cmd game action <tool-name> [JSON object] [--lease <lease-id>] --json
+DevBridge.cmd game wait <tool-name> [JSON object] --path <JSON pointer> --equals <JSON value> --timeout-ms <n> [--poll-ms <n>] [--lease <lease-id>] --json
+DevBridge.cmd game advance --ticks <n> [--timeout-ms <n>] [--poll-ms <n>] [--lease <lease-id>] --json
+DevBridge.cmd game save --name <save-name> [--timeout-ms <n>] [--lease <lease-id>] --json
+DevBridge.cmd game load --name <save-name> [--readiness <gameData|mapData|currentMap|playable|visual>] [--timeout-ms <n>] [--poll-ms <n>] [--ignore-mod-compatibility] [--lease <lease-id>] --json
+DevBridge.cmd game errors checkpoint [--lease <lease-id>] --json
+DevBridge.cmd game errors delta --checkpoint <token> [--lease <lease-id>] --json
+```
+
+`inspect` and `action` forward caller-selected semantic RimBridge tools. `wait` polls a JSON-pointer
+condition with a required timeout capped at five minutes and returns `GAME_WAIT_TIMEOUT`, attempts,
+elapsed time, and the last result when it expires. `advance` uses `rimworld/step_game_ticks`; `save`
+uses `rimworld/save_game` followed by `rimbridge/wait_for_long_event_idle`; and `load` uses
+`rimworld/load_game_ready`, so completion is represented by a terminal semantic result rather than a
+fixed sleep. Every result has explicit `success`, `exitCode`, `errorCode`/`error` on failure, and the
+redacted generation/launch/PID route evidence.
+
+The error checkpoint is a generation- and launch-bound sequence token returned by
+`game errors checkpoint`. `errors delta` passes its sequence to `rimbridge/list_logs` and returns only
+new sequence-numbered error entries, with a `nextCheckpoint` for continued collection. A stale token
+fails with `GAME_ERROR_CHECKPOINT_STALE`; old errors are not treated as scenario errors.
+
+All live calls still pass the existing generation, process-identity, endpoint, policy, and lease checks.
+Without a valid lease the result is `RIMBRIDGE_LEASE_REQUIRED`; no testing bypass or implicit ownership
+is added. A caller may use `--args <JSON object>` when shell quoting makes a JSON argument inconvenient.
+
+These primitives prove the DevBridge side of a lifecycle, but they do not create Frontier semantics.
+For the Frontier proving flow, Frontier must register stable RimBridge capabilities for a structured
+Frontier state query and a caller-parameterized progression/action invocation (including an expedition or
+equivalent transition), with responses that expose the state fields a caller can observe before and after
+the action and after reload. The current Frontier build registers no such capability, so DevBridge2 does
+not use coordinate clicks, screenshots, or Frontier-specific action IDs to fake that contract.
+
 Autonomous test recipes are repository-owned files under `TestRecipes/`. `devbridge-test-recipe/v1`
 retains its strict read-only contract: project aliases, typed generation inputs, readiness/Quicktest
 and companion evidence requirements, bounded budgets, and policy-approved read-only RimBridge calls.

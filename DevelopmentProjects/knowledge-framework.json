@@ -1,0 +1,9 @@
+{
+  "schemaVersion": "devbridge-mod-development/v1",
+  "project": "knowledge-framework",
+  "sourceProject": "Source/KnowledgeFramework.csproj",
+  "configuration": "Release",
+  "expectedAssembly": "KnowledgeFramework.dll",
+  "deploymentTarget": "1.6/Assemblies/KnowledgeFramework.dll",
+  "testRecipe": "knowledge-framework-development-smoke"
+}

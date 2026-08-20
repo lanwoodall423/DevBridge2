@@ -580,7 +580,7 @@ try {
     $script:Report.stage = 'build'
     $buildArguments = @('build', $descriptor.ResolvedSource, '--configuration', [string]$descriptor.configuration,
         '--output', $stagingRoot, '--nologo',
-        ('-p:BaseIntermediateOutputPath=' + (Join-Path $transactionRoot 'obj\')),
+        ('-p:IntermediateOutputPath=' + (Join-Path $transactionRoot 'obj\')),
         ('-p:MSBuildProjectExtensionsPath=' + (Join-Path $transactionRoot 'obj\')))
     $buildResult = Invoke-BoundedBuild $buildArguments $BuildTimeoutSeconds
     Write-TransactionTrace 'build' ("exitCode=$($buildResult.ExitCode) timedOut=$($buildResult.TimedOut)") (Format-Command (@('dotnet') + $buildArguments))

@@ -1,0 +1,21 @@
+{
+  "schemaVersion": "devbridge-test-recipe/v1",
+  "id": "knowledge-framework-development-smoke",
+  "description": "Build and load the Knowledge Framework developer assembly in a fresh DevBridge2 generation.",
+  "projects": ["knowledge-framework"],
+  "inputs": {
+    "quicktest": true
+  },
+  "requiresReady": true,
+  "success": {
+    "quicktestReady": true
+  },
+  "budget": {
+    "timeoutSeconds": 300,
+    "maxRimWorldLaunches": 1,
+    "maxRecipeAttempts": 1,
+    "maxCoordinatorRefreshes": 4,
+    "stopOnRepeatedFailureFingerprint": true,
+    "maxRepeatedFailureCount": 1
+  }
+}

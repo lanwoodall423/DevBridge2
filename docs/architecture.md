@@ -303,6 +303,19 @@ and gives a stable stage/next action; it never kills, restarts, edits ModsConfig
 baseline. Lower-level `project`, `test`, `stop`, `ensure-ready`, `wait-ready`, and `status` commands
 remain the recovery and advanced-use interface.
 
+DevBridge2 also owns the raw build diagnostic boundary. `scripts/mod-test.ps1` captures stdout and
+stderr per stream with a 16,384-character cap, combines them under the same cap, and records an
+explicit `outputTruncated` flag plus a bounded marker when evidence is cut. The failed-build
+`devbridge-mod-development/v1` response carries `stage`, the exact bounded build command, source
+project, working directory, staging path, configuration, exit code, timeout state, compiler/MSBuild
+output, failure code/message, and transaction/workflow IDs. The compact `failure` projection repeats
+the primary build fields so callers that do not retain the full internal report can still diagnose
+the failure. The bounded capture helper is deliberately implemented below the PowerShell event
+boundary so a noisy compiler cannot accumulate unbounded output or require a PowerShell runspace on
+a worker thread. `scripts/process-e2e.tests.ps1 -OnlyBuildFailure` proves this owner-side
+serialization with an intentionally invalid C# project; consumers persist and assemble the
+user-facing export rather than rerunning the build or reading an unbounded log.
+
 RimLiaison uses this transaction in owner mode with `-SourceFingerprint` and `-SkipRecipe`: DevBridge2
 performs the build/deploy/generation/readiness work once, then RimLiaison runs the selected affected
 recipes through its normal catalog path. The bounded `-Json` projection includes

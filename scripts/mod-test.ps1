@@ -107,6 +107,7 @@ $script:RegistrationCreated = $false
 $script:MaintenanceEstablished = $false
 $script:KeepOwnership = $false
 $script:TracePath = $tracePath
+$script:BuildDiagnosticOutputLimit = 16384
 $script:OldAgent = [Environment]::GetEnvironmentVariable('DEVBRIDGE_AGENT', 'Process')
 $script:OldSession = [Environment]::GetEnvironmentVariable('DEVBRIDGE_SESSION', 'Process')
 if ([string]::IsNullOrWhiteSpace($LeaseId)) {
@@ -120,6 +121,29 @@ function Limit-Text {
     $value = $Text.Trim()
     if ($value.Length -le $Limit) { return $value }
     return $value.Substring(0, $Limit) + "`n...[truncated]"
+}
+
+function Limit-BuildDiagnosticText {
+    param(
+        [AllowNull()][string]$Text,
+        [int]$Limit = $script:BuildDiagnosticOutputLimit,
+        [switch]$AlreadyTruncated)
+    if ([string]::IsNullOrEmpty($Text)) {
+        return [pscustomobject]@{ Text = $null; Truncated = [bool]$AlreadyTruncated }
+    }
+
+    $value = $Text.Trim()
+    $marker = "`n...[truncated to $Limit characters]"
+    if (-not $AlreadyTruncated -and $value.Length -le $Limit) {
+        return [pscustomobject]@{ Text = $value; Truncated = $false }
+    }
+
+    $prefixLength = [Math]::Max(0, $Limit - $marker.Length)
+    $prefix = if ($prefixLength -eq 0) { '' } else { $value.Substring(0, [Math]::Min($prefixLength, $value.Length)) }
+    return [pscustomobject]@{
+        Text = $prefix + $marker
+        Truncated = $true
+    }
 }
 
 function Format-Command {
@@ -330,18 +354,27 @@ function Set-Failure {
     param([Parameter(Mandatory = $true)][string]$Stage,
         [Parameter(Mandatory = $true)][string]$NextAction,
         [string]$ErrorCode, [string]$Message, [string]$Command,
-        [int]$ExitCode = 1, $Output, [bool]$KeepOwnership = $false)
+        [int]$ExitCode = 1, $Output, [bool]$KeepOwnership = $false,
+        [bool]$OutputTruncated = $false)
     $script:Report.stage = $Stage
     $script:Report.nextAction = $NextAction
     $script:Report.exitCode = $ExitCode
     $script:Report.success = $false
+    $failureOutput = if ($Stage -eq 'build') {
+        Limit-BuildDiagnosticText ([string]$Output) -AlreadyTruncated:$OutputTruncated
+    } else {
+        [pscustomobject]@{ Text = Limit-Text ([string]$Output); Truncated = [bool]$OutputTruncated }
+    }
     $script:Report.failure = [ordered]@{
         stage = $Stage
         command = $Command
         exitCode = $ExitCode
         errorCode = $ErrorCode
         message = Limit-Text $Message
-        output = Limit-Text ([string]$Output)
+        output = $failureOutput.Text
+        outputTruncated = [bool]$failureOutput.Truncated
+        transactionId = $script:Report.transactionId
+        workflowId = $script:Report.workflowId
     }
     if ($null -ne $script:Report.artifactFreshness) {
         $script:Report.artifactFreshness.errorCode = $ErrorCode
@@ -462,38 +495,142 @@ function Require-BridgeSuccess {
     return $response
 }
 
+if ($null -eq ('DevBridge.BoundedProcessRunner' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Diagnostics;
+using System.Text;
+
+namespace DevBridge
+{
+    public sealed class BoundedProcessResult
+    {
+        public int ExitCode { get; set; }
+        public bool TimedOut { get; set; }
+        public string StandardOutput { get; set; }
+        public string StandardError { get; set; }
+        public bool StandardOutputTruncated { get; set; }
+        public bool StandardErrorTruncated { get; set; }
+    }
+
+    internal sealed class BoundedProcessText
+    {
+        private readonly object gate = new();
+        private readonly int limit;
+        private readonly StringBuilder value = new();
+        private bool hasLine;
+
+        internal BoundedProcessText(int limit) => this.limit = Math.Max(1, limit);
+
+        internal bool Truncated { get; private set; }
+
+        internal void AppendLine(string line)
+        {
+            if (line == null)
+                return;
+
+            lock (gate)
+            {
+                if (Truncated)
+                    return;
+
+                string addition = hasLine ? "\n" + line : line;
+                int remaining = limit - value.Length;
+                if (addition.Length <= remaining)
+                {
+                    value.Append(addition);
+                }
+                else
+                {
+                    if (remaining > 0)
+                        value.Append(addition.Substring(0, remaining));
+                    Truncated = true;
+                }
+                hasLine = true;
+            }
+        }
+
+        internal string GetText()
+        {
+            lock (gate)
+                return value.Length == 0 ? null : value.ToString();
+        }
+    }
+
+    public static class BoundedProcessRunner
+    {
+        public static BoundedProcessResult Run(string executable, string[] arguments,
+            string workingDirectory, int timeoutMilliseconds, int outputLimit)
+        {
+            ProcessStartInfo startInfo = new()
+            {
+                FileName = executable,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                WorkingDirectory = workingDirectory
+            };
+            foreach (string argument in arguments ?? Array.Empty<string>())
+                startInfo.ArgumentList.Add(argument ?? string.Empty);
+
+            BoundedProcessText standardOutput = new(outputLimit);
+            BoundedProcessText standardError = new(outputLimit);
+            using Process process = new() { StartInfo = startInfo };
+            process.OutputDataReceived += (_, eventArgs) => standardOutput.AppendLine(eventArgs.Data);
+            process.ErrorDataReceived += (_, eventArgs) => standardError.AppendLine(eventArgs.Data);
+            if (!process.Start())
+                throw new InvalidOperationException("the build process could not be started");
+
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+            bool completed = process.WaitForExit(Math.Max(1, timeoutMilliseconds));
+            bool timedOut = !completed;
+            if (timedOut)
+            {
+                try { process.Kill(true); } catch { }
+                try { process.WaitForExit(5000); } catch { }
+            }
+            else
+            {
+                // Drain the asynchronous reader callbacks, including a final unterminated line.
+                process.WaitForExit();
+            }
+
+            return new BoundedProcessResult
+            {
+                ExitCode = timedOut ? 124 : process.ExitCode,
+                TimedOut = timedOut,
+                StandardOutput = standardOutput.GetText(),
+                StandardError = standardError.GetText(),
+                StandardOutputTruncated = standardOutput.Truncated,
+                StandardErrorTruncated = standardError.Truncated
+            };
+        }
+    }
+}
+'@
+}
+
 function Invoke-BoundedBuild {
     param([Parameter(Mandatory = $true)][string[]]$Arguments,
-        [Parameter(Mandatory = $true)][int]$TimeoutSeconds)
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory)
     $dotnetCommand = @(Get-Command dotnet -CommandType Application -ErrorAction Stop | Select-Object -First 1)
     if ($dotnetCommand.Count -eq 0) { throw 'dotnet executable could not be located' }
     $dotnet = [string]$dotnetCommand[0].Source
-    $startInfo = [Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = $dotnet
-    $startInfo.UseShellExecute = $false
-    $startInfo.CreateNoWindow = $true
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
-    foreach ($argument in $Arguments) { [void]$startInfo.ArgumentList.Add([string]$argument) }
-    $process = [Diagnostics.Process]::new()
-    $process.StartInfo = $startInfo
-    if (-not $process.Start()) { throw 'dotnet build process could not be started' }
-    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-    $stderrTask = $process.StandardError.ReadToEndAsync()
-    $completed = $process.WaitForExit($TimeoutSeconds * 1000)
-    $timedOut = -not $completed
-    if ($timedOut) {
-        try { $process.Kill($true) } catch { }
-        $process.WaitForExit()
-    }
-    $stdout = $stdoutTask.GetAwaiter().GetResult()
-    $stderr = $stderrTask.GetAwaiter().GetResult()
-    $exitCode = if ($timedOut) { 124 } else { $process.ExitCode }
-    $process.Dispose()
+    $captured = [DevBridge.BoundedProcessRunner]::Run($dotnet, $Arguments,
+        [IO.Path]::GetFullPath($WorkingDirectory), $TimeoutSeconds * 1000,
+        [int]$script:BuildDiagnosticOutputLimit)
+    $combined = (@($captured.StandardOutput, $captured.StandardError) |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join "`n"
+    $bounded = Limit-BuildDiagnosticText $combined $script:BuildDiagnosticOutputLimit `
+        -AlreadyTruncated:($captured.StandardOutputTruncated -or $captured.StandardErrorTruncated)
     return [pscustomobject]@{
-        ExitCode = $exitCode
-        TimedOut = $timedOut
-        Output = Limit-Text ((@($stdout, $stderr) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join "`n")
+        ExitCode = $captured.ExitCode
+        TimedOut = $captured.TimedOut
+        Output = $bounded.Text
+        OutputTruncated = $bounded.Truncated
     }
 }
 
@@ -582,21 +719,39 @@ try {
         '--output', $stagingRoot, '--nologo',
         ('-p:IntermediateOutputPath=' + (Join-Path $transactionRoot 'obj\')),
         ('-p:MSBuildProjectExtensionsPath=' + (Join-Path $transactionRoot 'obj\')))
-    $buildResult = Invoke-BoundedBuild $buildArguments $BuildTimeoutSeconds
+    $buildWorkingDirectory = [IO.Path]::GetDirectoryName($descriptor.ResolvedSource)
+    if ([string]::IsNullOrWhiteSpace($buildWorkingDirectory)) {
+        Set-Failure 'build' 'fix-build' 'DEVELOPMENT_BUILD_WORKING_DIRECTORY_INVALID' `
+            'the declared project path has no working directory' `
+            (Limit-BuildDiagnosticText (Format-Command (@('dotnet') + $buildArguments)) 4096).Text 1 $null $false
+    }
+    $buildResult = Invoke-BoundedBuild $buildArguments $BuildTimeoutSeconds $buildWorkingDirectory
     Write-TransactionTrace 'build' ("exitCode=$($buildResult.ExitCode) timedOut=$($buildResult.TimedOut)") (Format-Command (@('dotnet') + $buildArguments))
     $buildExit = [int]$buildResult.ExitCode
+    $buildCommand = (Limit-BuildDiagnosticText (Format-Command (@('dotnet') + $buildArguments)) 4096).Text
     $script:Report.build = [ordered]@{
-        command = Format-Command (@('dotnet') + $buildArguments)
+        stage = 'build'
+        command = $buildCommand
         exitCode = $buildExit
         output = $buildResult.Output
+        outputTruncated = [bool]$buildResult.OutputTruncated
         stagingPath = $stagingRoot
         sourceProject = $descriptor.ResolvedSource
         timedOut = [bool]$buildResult.TimedOut
+        workingDirectory = $buildWorkingDirectory
+        configuration = [string]$descriptor.configuration
+        transactionId = $transactionId
+        workflowId = $WorkflowId
+        errorCode = $null
+        failureMessage = $null
     }
     if ($buildExit -ne 0) {
         $buildCode = if ($buildResult.TimedOut) { 'DEVELOPMENT_BUILD_TIMEOUT' } else { 'DEVELOPMENT_BUILD_FAILED' }
         $buildMessage = if ($buildResult.TimedOut) { 'the declared project build exceeded its bounded timeout' } else { 'the declared project build failed' }
-        Set-Failure 'build' 'fix-build' $buildCode $buildMessage $script:Report.build.command $buildExit $script:Report.build.output $false
+        $script:Report.build.errorCode = $buildCode
+        $script:Report.build.failureMessage = $buildMessage
+        Set-Failure 'build' 'fix-build' $buildCode $buildMessage $script:Report.build.command $buildExit `
+            $script:Report.build.output $false $buildResult.OutputTruncated
     }
     if (-not (Test-Path -LiteralPath $expectedArtifact -PathType Leaf)) {
         Set-Failure 'build' 'fix-build-artifact' 'DEVELOPMENT_ARTIFACT_MISSING' "expected build artifact was not produced: $($descriptor.SafeExpectedAssembly)" $script:Report.build.command 1 $script:Report.build.output $false
@@ -805,9 +960,21 @@ function Get-CompactJsonReport {
         $null
     } else {
         [ordered]@{
+            stage = [string]$script:Report.build.stage
+            command = (Limit-BuildDiagnosticText ([string]$script:Report.build.command) 4096).Text
             exitCode = [int]$script:Report.build.exitCode
+            output = [string]$script:Report.build.output
+            outputTruncated = [bool]$script:Report.build.outputTruncated
+            sourceProject = [string]$script:Report.build.sourceProject
+            stagingPath = [string]$script:Report.build.stagingPath
             timedOut = [bool]$script:Report.build.timedOut
+            workingDirectory = [string]$script:Report.build.workingDirectory
+            configuration = [string]$script:Report.build.configuration
+            transactionId = [string]$script:Report.build.transactionId
+            workflowId = [string]$script:Report.build.workflowId
             builtSha256 = [string]$script:Report.build.builtSha256
+            errorCode = [string]$script:Report.build.errorCode
+            failureMessage = [string]$script:Report.build.failureMessage
         }
     }
     $deployment = if ($null -eq $script:Report.deployment) {
@@ -849,8 +1016,14 @@ function Get-CompactJsonReport {
     } else {
         [ordered]@{
             stage = [string]$script:Report.failure.stage
+            command = (Limit-BuildDiagnosticText ([string]$script:Report.failure.command) 4096).Text
+            exitCode = [int]$script:Report.failure.exitCode
             errorCode = [string]$script:Report.failure.errorCode
             message = Limit-Text ([string]$script:Report.failure.message) 1024
+            output = [string]$script:Report.failure.output
+            outputTruncated = [bool]$script:Report.failure.outputTruncated
+            transactionId = [string]$script:Report.transactionId
+            workflowId = [string]$script:Report.workflowId
         }
     }
     return [ordered]@{

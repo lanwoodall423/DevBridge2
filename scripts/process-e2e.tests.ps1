@@ -1,6 +1,8 @@
 [CmdletBinding()]
 param(
-    [switch]$KeepRoots
+    [switch]$KeepRoots,
+    [switch]$OnlyBuildFailure,
+    [string]$DiagnosticFixturePath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -30,6 +32,7 @@ $alwaysOnPackages = @(
     'brrainz.rimbridgeserver'
 )
 $diagnosticTextLimit = 4000
+$buildDiagnosticTextLimit = 16384
 $script:CurrentFixture = $null
 $script:LastBridgeResponse = $null
 
@@ -544,6 +547,134 @@ function Invoke-Case {
     }
 }
 
+function Invoke-BuildFailureContract {
+    param([pscustomobject]$Fixture)
+    $ownsFixture = $null -eq $Fixture
+    $fixture = if ($ownsFixture) {
+        New-Fixture 'mod-test-build-failure' -RimBridgeMode off
+    } else {
+        $Fixture
+    }
+    $transactionRoot = Join-Path $fixture.Root 'ManagedMod'
+    $badProjectRoot = Join-Path $fixture.Root 'FailingBuild'
+    try {
+        # Project resolution still traverses the real DevBridge profile boundary. Keep the
+        # synthetic fixture independent of a workstation's installed Mods by supplying the
+        # declared project package explicitly; the build itself remains the intentional failure.
+        Write-InstalledMetadata -Root (Join-Path $fixture.Root 'InstalledMods') -PackageId 'lan.frontier'
+        New-Item -ItemType Directory -Force -Path $badProjectRoot, (Join-Path $transactionRoot '1.6\Assemblies') | Out-Null
+        $badProject = Join-Path $badProjectRoot 'FailingBuild.csproj'
+        Write-Utf8File $badProject @'
+        <Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="FailingBuild.cs" />
+    <Compile Include="Broken*.cs" />
+  </ItemGroup>
+</Project>
+'@
+        Write-Utf8File (Join-Path $badProjectRoot 'FailingBuild.cs') 'public static class FailingBuild {'
+        foreach ($index in 1..320) {
+            Write-Utf8File (Join-Path $badProjectRoot ("Broken$index.cs")) "public static class Broken$index"
+        }
+        $badDescriptor = Join-Path $fixture.Root 'bad-mod-development.json'
+        $badSourceProject = [System.IO.Path]::GetRelativePath($repoRoot, $badProject).Replace('\', '/')
+        $badDescriptorData = [ordered]@{
+            schemaVersion = 'devbridge-mod-development/v1'
+            project = 'frontier'
+            sourceProject = $badSourceProject
+            configuration = 'Release'
+            expectedAssembly = 'FailingBuild.dll'
+            deploymentTarget = '1.6/Assemblies/FailingBuild.dll'
+            testRecipe = 'mod-development-smoke'
+        }
+        Write-Utf8File $badDescriptor ($badDescriptorData | ConvertTo-Json -Depth 4)
+        $transactionScript = Join-Path $repoRoot 'scripts\mod-test.ps1'
+        $workflowId = 'workflow-devbridge-diagnostic-contract-v1'
+        $sourceFingerprint = 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'
+        $badOutput = & pwsh @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $transactionScript,
+            '-Project', 'frontier', '-DescriptorPath', $badDescriptor,
+            '-DevelopmentRoot', $repoRoot, '-DeploymentRoot', $transactionRoot,
+            '-CoordinatorRoot', $fixture.Root, '-RuntimeSlot', $fixture.Slot,
+            '-WorkflowId', $workflowId, '-SourceFingerprint', $sourceFingerprint, '-Json') 2>&1 | Out-String
+        if ($LASTEXITCODE -eq 0) { throw "invalid build unexpectedly succeeded: $badOutput" }
+        $bad = Get-JsonResponse $badOutput
+        $requiredBuildFields = @(
+            'stage', 'command', 'exitCode', 'output', 'outputTruncated', 'sourceProject',
+            'stagingPath', 'timedOut', 'transactionId', 'workflowId', 'errorCode', 'failureMessage')
+        foreach ($field in $requiredBuildFields) {
+            if ($bad.build.PSObject.Properties.Name -notcontains $field) {
+                throw "build diagnostic field is missing from the compact response: $field"
+            }
+        }
+        foreach ($field in @('stage', 'command', 'exitCode', 'errorCode', 'message', 'output',
+                'outputTruncated', 'transactionId', 'workflowId')) {
+            if ($bad.failure.PSObject.Properties.Name -notcontains $field) {
+                throw "failure diagnostic field is missing from the compact response: $field"
+            }
+        }
+        if ([string]$bad.stage -ne 'build' -or
+            [string]$bad.failure.stage -ne 'build' -or
+            [string]$bad.failure.errorCode -ne 'DEVELOPMENT_BUILD_FAILED' -or
+            [string]$bad.build.errorCode -ne 'DEVELOPMENT_BUILD_FAILED') {
+            throw "failed build did not preserve the primary build failure shape: $badOutput"
+        }
+        if ([string]$bad.build.sourceProject -ne [IO.Path]::GetFullPath($badProject) -or
+            [string]$bad.build.command -notmatch 'dotnet.*build' -or
+            [int]$bad.build.exitCode -eq 0 -or
+            [bool]$bad.build.timedOut -or
+            [string]$bad.build.transactionId -ne [string]$bad.transactionId -or
+            [string]$bad.build.workflowId -ne $workflowId -or
+            [string]$bad.failure.transactionId -ne [string]$bad.transactionId -or
+            [string]$bad.failure.workflowId -ne $workflowId) {
+            throw "failed build identity or command fields were not preserved: $badOutput"
+        }
+        if ([string]::IsNullOrWhiteSpace([string]$bad.build.output) -or
+            [string]$bad.build.output -notmatch '(?i)(error\s+(CS|MSB)|CS\d{4}|MSB\d{4})' -or
+            [string]$bad.failure.output -notmatch '(?i)(error\s+(CS|MSB)|CS\d{4}|MSB\d{4})') {
+            throw "compiler output was not retained in both build and failure diagnostics: $badOutput"
+        }
+        if ([string]$bad.build.output.Length -gt $buildDiagnosticTextLimit -or
+            [string]$bad.failure.output.Length -gt $buildDiagnosticTextLimit) {
+            throw 'DevBridge build diagnostics exceeded the bounded 16 KiB contract.'
+        }
+        if ([bool]$bad.build.outputTruncated -and
+            [string]$bad.build.output -notmatch '\[truncated to') {
+            throw 'DevBridge marked build output truncated without an explicit marker.'
+        }
+        if ([string]$bad.build.command -ne [string]$bad.failure.command) {
+            throw 'build and failure diagnostics did not preserve the same exact command.'
+        }
+        if (-not [string]::IsNullOrWhiteSpace($DiagnosticFixturePath)) {
+            $fixturePath = [IO.Path]::GetFullPath($DiagnosticFixturePath)
+            $fixtureParent = Split-Path -Parent $fixturePath
+            New-Item -ItemType Directory -Force -Path $fixtureParent | Out-Null
+            Write-Utf8File $fixturePath ($bad | ConvertTo-Json -Depth 30 -Compress)
+        }
+    } finally {
+        if ($ownsFixture) {
+            Remove-Fixture $fixture
+        }
+    }
+}
+
+if ($OnlyBuildFailure) {
+    $result = Invoke-Case 'bounded mod compiler failure contract' {
+        Invoke-BuildFailureContract
+    }
+    if (-not $result.Passed) {
+        throw "Focused DevBridge build diagnostic contract failed: $($result.Error)"
+    }
+    Write-Host 'PROCESS E2E BUILD DIAGNOSTIC CONTRACT PASS'
+    if (-not $KeepRoots) {
+        Remove-Item -LiteralPath (Join-Path $repoRoot '.process-e2e-temp') -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    exit 0
+}
+
 $results = [System.Collections.Generic.List[object]]::new()
 
 $results.Add((Invoke-Case 'cold start through CLI and named pipe' {
@@ -1017,40 +1148,7 @@ $results.Add((Invoke-Case 'bounded mod build deploy run test transaction' {
             $env:DEVBRIDGE_SESSION = $cleanupSession
         }
 
-        $badProjectRoot = Join-Path $fixture.Root 'FailingBuild'
-        New-Item -ItemType Directory -Force -Path $badProjectRoot | Out-Null
-        $badProject = Join-Path $badProjectRoot 'FailingBuild.csproj'
-        Write-Utf8File $badProject @'
-<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
-    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
-  </PropertyGroup>
-  <ItemGroup><Compile Include="FailingBuild.cs" /></ItemGroup>
-</Project>
-'@
-        Write-Utf8File (Join-Path $badProjectRoot 'FailingBuild.cs') 'public static class FailingBuild {'
-        $badDescriptor = Join-Path $fixture.Root 'bad-mod-development.json'
-        $badSourceProject = [System.IO.Path]::GetRelativePath($repoRoot, $badProject).Replace('\', '/')
-        $badDescriptorData = [ordered]@{
-            schemaVersion = 'devbridge-mod-development/v1'
-            project = 'frontier'
-            sourceProject = $badSourceProject
-            configuration = 'Release'
-            expectedAssembly = 'FailingBuild.dll'
-            deploymentTarget = '1.6/Assemblies/FailingBuild.dll'
-            testRecipe = 'mod-development-smoke'
-        }
-        Write-Utf8File $badDescriptor ($badDescriptorData | ConvertTo-Json -Depth 4)
-        $badOutput = & pwsh @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $transactionScript,
-            '-Project', 'frontier', '-DescriptorPath', $badDescriptor,
-            '-DevelopmentRoot', $repoRoot, '-DeploymentRoot', $transactionRoot,
-            '-CoordinatorRoot', $fixture.Root, '-RuntimeSlot', $fixture.Slot, '-Json') 2>&1 | Out-String
-        if ($LASTEXITCODE -eq 0) { throw "invalid build unexpectedly succeeded: $badOutput" }
-        $bad = Get-JsonResponse $badOutput
-        if ([string]$bad.stage -ne 'build' -or [string]$bad.failure.errorCode -ne 'DEVELOPMENT_BUILD_FAILED') {
-            throw "failed build did not fail before lifecycle work: $badOutput"
-        }
+        Invoke-BuildFailureContract
     } finally { Remove-Fixture $fixture }
 }))
 

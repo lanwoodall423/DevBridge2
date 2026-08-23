@@ -1476,7 +1476,7 @@ internal sealed partial class CoordinatorState
         return "run-" + request.RequestId;
     }
 
-    private static RecipeOperationResult EvaluateRecipeOperation(RecipeOperationDefinition operation,
+    internal static RecipeOperationResult EvaluateRecipeOperation(RecipeOperationDefinition operation,
         int operationExit, RimBridgeRouteResult route)
     {
         bool isV2 = operation.Expectation != null;
@@ -1502,7 +1502,7 @@ internal sealed partial class CoordinatorState
                     ? route?.ErrorCode ?? "RECIPE_OPERATION_FAILED"
                     : "RECIPE_EXPECTED_FAILURE_NOT_RETURNED";
                 error = expectation.ExpectedSuccess
-                    ? isV2 ? "The RimBridge operation did not succeed as expected."
+                    ? isV2 ? route?.Error ?? "The RimBridge operation did not succeed as expected."
                         : "A policy-approved read-only recipe operation failed."
                     : "The RimBridge operation succeeded when failure was expected.";
             }

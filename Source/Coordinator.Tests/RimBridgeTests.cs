@@ -433,6 +433,33 @@ internal static partial class OfflineTests
                    client.CallCalls == 0 && !File.Exists(RimBridgeEndpointStore.PathFor(runtime)),
                 "a changed RimWorld PID/start identity must reject and invalidate the endpoint");
         }
+
+        using (Fixture inFlightFixture = Fixture.ReadyWithLease())
+        {
+            FakeRimBridgeClient client = new()
+            {
+                CallHandler = (_, _) =>
+                {
+                    inFlightFixture.Adapter.Replace(101, 1002);
+                    return new RimBridgeWireResult
+                    {
+                        ErrorCode = "RIMBRIDGE_PROTOCOL_ERROR",
+                        Error = "RimBridge closed the routed connection before completing the request."
+                    };
+                }
+            };
+            ConfigureRoutedFixture(inFlightFixture, client);
+            BridgeRequest request = Request("bridge", "holder", 77, "call",
+                "rimworld/get_game_state", "{}", "--lease", "T001");
+            int exitCode = inFlightFixture.State.Execute(request, _ => { }, () => true);
+            JsonCommandResponse response = inFlightFixture.State.CreateJsonResponse(request,
+                exitCode, Array.Empty<string>());
+            Assert(exitCode != 0 && client.CallCalls == 1 &&
+                   response.ErrorCode == "RIMBRIDGE_PROCESS_IDENTITY_MISMATCH" &&
+                   response.RimBridgeRoute?.Provenance.Generation == 1,
+                "an in-flight route interrupted by process replacement must discard the wire result " +
+                "and report the bound process identity failure");
+        }
     }
 
     private static void TestRimBridgeRouteLeaseSafety()

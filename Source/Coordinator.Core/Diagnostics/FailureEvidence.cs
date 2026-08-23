@@ -32,6 +32,10 @@ internal sealed class FailureFingerprintInput
     internal string Component { get; init; }
     internal string ComponentIdentity { get; init; }
     internal string SourceRevision { get; init; }
+    // A caller may bind a recipe reproduction to the source artifact that it
+    // just built.  This is intentionally separate from the coordinator's own
+    // source revision: the two components can be rebuilt independently.
+    internal string SourceFingerprint { get; init; }
     internal string ProjectFingerprint { get; init; }
     internal string RecipeId { get; init; }
     internal IReadOnlyList<TestInputValue> GenerationInputs { get; init; } = Array.Empty<TestInputValue>();
@@ -86,6 +90,7 @@ internal static class FailureFingerprinting
         string component = NormalizeToken(input.Component);
         string componentIdentity = NormalizeText(input.ComponentIdentity);
         string sourceRevision = NormalizeText(input.SourceRevision);
+        string sourceFingerprint = NormalizeText(input.SourceFingerprint);
         string projectFingerprint = NormalizeText(input.ProjectFingerprint);
         string recipeId = NormalizeToken(input.RecipeId);
         string message = NormalizeText(string.IsNullOrWhiteSpace(input.Message)
@@ -102,15 +107,22 @@ internal static class FailureFingerprinting
             .OrderBy(value => value.Name, StringComparer.OrdinalIgnoreCase)
             .ThenBy(value => value.Value, StringComparer.Ordinal)
             .Select(value => NormalizeToken(value.Name) + "=" + NormalizeText(value.Value)));
-        string context = string.Join("\n", new[]
+        List<string> contextParts = new()
         {
             "component=" + component,
             "componentIdentity=" + componentIdentity,
-            "sourceRevision=" + sourceRevision,
-            "projectFingerprint=" + projectFingerprint,
-            "recipeId=" + recipeId,
-            "inputs=" + canonicalInputs
-        });
+            "sourceRevision=" + sourceRevision
+        };
+        // Keep the pre-source-fingerprint context byte-for-byte compatible for
+        // callers that do not provide this optional binding.  That preserves
+        // the existing repeated-failure guard while allowing a new artifact to
+        // be distinguished from an older one.
+        if (!string.IsNullOrWhiteSpace(sourceFingerprint))
+            contextParts.Add("sourceFingerprint=" + sourceFingerprint);
+        contextParts.Add("projectFingerprint=" + projectFingerprint);
+        contextParts.Add("recipeId=" + recipeId);
+        contextParts.Add("inputs=" + canonicalInputs);
+        string context = string.Join("\n", contextParts);
         string failure = string.Join("\n", new[]
         {
             "schema=" + DevBridgeSchemaVersions.FailureFingerprint,
@@ -146,7 +158,7 @@ internal static class FailureFingerprinting
 
     internal static bool EquivalentContext(FailureOccurrenceSummary occurrence,
         string recipeId, string projectFingerprint, IReadOnlyList<TestInputValue> inputs,
-        string componentIdentity, string sourceRevision)
+        string componentIdentity, string sourceRevision, string sourceFingerprint = null)
     {
         if (occurrence == null)
             return false;
@@ -157,7 +169,8 @@ internal static class FailureFingerprinting
             GenerationInputs = inputs,
             Component = occurrence.Component,
             ComponentIdentity = componentIdentity,
-            SourceRevision = sourceRevision
+            SourceRevision = sourceRevision,
+            SourceFingerprint = sourceFingerprint
         });
         return string.Equals(occurrence.ReproductionContextFingerprint,
             context.ReproductionContextFingerprint, StringComparison.Ordinal);

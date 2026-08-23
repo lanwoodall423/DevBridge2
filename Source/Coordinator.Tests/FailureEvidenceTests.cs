@@ -105,10 +105,12 @@ internal static partial class OfflineTests
         {
             new TestInputValue { Name = "quicktest", Value = "true" }
         };
+        const string sourceFingerprint =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         string fingerprint = fixture.State.RecordRecipeFailure("recipe-a", "LOAD_FAILED",
-            "same recipe failure", 1, "profile-a", inputs);
+            "same recipe failure", 1, "profile-a", inputs, sourceFingerprint);
         FailureOccurrenceSummary equivalent = fixture.State.FindEquivalentRecipeFailureLocked(
-            "recipe-a", "profile-a", inputs, 1);
+            "recipe-a", "profile-a", inputs, 1, sourceFingerprint);
         FailureOccurrenceSummary changedProfile = fixture.State.FindEquivalentRecipeFailureLocked(
             "recipe-a", "profile-b", inputs, 1);
         FailureOccurrenceSummary changedInputs = fixture.State.FindEquivalentRecipeFailureLocked(
@@ -116,9 +118,12 @@ internal static partial class OfflineTests
             {
                 new TestInputValue { Name = "quicktest", Value = "false" }
             }, 1);
+        FailureOccurrenceSummary changedSource = fixture.State.FindEquivalentRecipeFailureLocked(
+            "recipe-a", "profile-a", inputs, 1,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
         Assert(equivalent?.FailureFingerprint == fingerprint && changedProfile == null &&
-               changedInputs == null,
-            "repeated-failure short-circuiting must require the same recipe, profile, and typed inputs");
+               changedInputs == null && changedSource == null,
+            "repeated-failure short-circuiting must require the same recipe, profile, typed inputs, and source artifact");
     }
 
     private static void TestSemanticLogsAreBoundedAndCompact()

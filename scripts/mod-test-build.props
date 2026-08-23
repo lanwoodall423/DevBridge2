@@ -1,0 +1,6 @@
+<Project>
+  <PropertyGroup Condition="'$(DevBridgeModTestIntermediateRoot)' != ''">
+    <MSBuildProjectExtensionsPath>$(DevBridgeModTestIntermediateRoot)\$(MSBuildProjectName)\</MSBuildProjectExtensionsPath>
+    <IntermediateOutputPath>$(DevBridgeModTestIntermediateRoot)\$(MSBuildProjectName)\$(Configuration)\</IntermediateOutputPath>
+  </PropertyGroup>
+</Project>

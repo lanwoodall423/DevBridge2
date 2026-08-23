@@ -464,7 +464,8 @@ function Require-BridgeSuccess {
 
 function Invoke-BoundedBuild {
     param([Parameter(Mandatory = $true)][string[]]$Arguments,
-        [Parameter(Mandatory = $true)][int]$TimeoutSeconds)
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory)
     $dotnetCommand = @(Get-Command dotnet -CommandType Application -ErrorAction Stop | Select-Object -First 1)
     if ($dotnetCommand.Count -eq 0) { throw 'dotnet executable could not be located' }
     $dotnet = [string]$dotnetCommand[0].Source
@@ -474,6 +475,7 @@ function Invoke-BoundedBuild {
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
+    $startInfo.WorkingDirectory = [IO.Path]::GetFullPath($WorkingDirectory)
     foreach ($argument in $Arguments) { [void]$startInfo.ArgumentList.Add([string]$argument) }
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
@@ -578,11 +580,20 @@ try {
     $expectedArtifact = [IO.Path]::GetFullPath((Join-Path $stagingRoot $descriptor.SafeExpectedAssembly))
     if (-not (Test-PathWithin $expectedArtifact $stagingRoot)) { throw 'expectedAssembly escapes staging root' }
     $script:Report.stage = 'build'
+    $buildIntermediateRoot = Join-Path $transactionRoot 'obj'
+    $buildPropsPath = Join-Path $scriptRoot 'mod-test-build.props'
+    if (-not (Test-Path -LiteralPath $buildPropsPath -PathType Leaf)) {
+        Set-Failure 'build' 'repair-owner-build-tooling' 'DEVELOPMENT_BUILD_CONFIGURATION_MISSING' "the owner build properties file is missing: $buildPropsPath" 'mod-test build setup' 1 $null $false
+    }
     $buildArguments = @('build', $descriptor.ResolvedSource, '--configuration', [string]$descriptor.configuration,
         '--output', $stagingRoot, '--nologo',
-        ('-p:IntermediateOutputPath=' + (Join-Path $transactionRoot 'obj\')),
-        ('-p:MSBuildProjectExtensionsPath=' + (Join-Path $transactionRoot 'obj\')))
-    $buildResult = Invoke-BoundedBuild $buildArguments $BuildTimeoutSeconds
+        ('-p:CustomBeforeDirectoryBuildProps=' + $buildPropsPath),
+        ('-p:DevBridgeModTestIntermediateRoot=' + $buildIntermediateRoot))
+    $buildWorkingDirectory = [IO.Path]::GetDirectoryName($descriptor.ResolvedSource)
+    if ([string]::IsNullOrWhiteSpace($buildWorkingDirectory)) {
+        Set-Failure 'build' 'fix-build' 'DEVELOPMENT_BUILD_WORKING_DIRECTORY_INVALID' 'the declared project path has no working directory' (Format-Command (@('dotnet') + $buildArguments)) 1 $null $false
+    }
+    $buildResult = Invoke-BoundedBuild $buildArguments $BuildTimeoutSeconds $buildWorkingDirectory
     Write-TransactionTrace 'build' ("exitCode=$($buildResult.ExitCode) timedOut=$($buildResult.TimedOut)") (Format-Command (@('dotnet') + $buildArguments))
     $buildExit = [int]$buildResult.ExitCode
     $script:Report.build = [ordered]@{

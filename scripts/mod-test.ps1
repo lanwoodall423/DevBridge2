@@ -715,10 +715,15 @@ try {
     $expectedArtifact = [IO.Path]::GetFullPath((Join-Path $stagingRoot $descriptor.SafeExpectedAssembly))
     if (-not (Test-PathWithin $expectedArtifact $stagingRoot)) { throw 'expectedAssembly escapes staging root' }
     $script:Report.stage = 'build'
+    $buildIntermediateRoot = Join-Path $transactionRoot 'obj'
+    $buildPropsPath = Join-Path $scriptRoot 'mod-test-build.props'
+    if (-not (Test-Path -LiteralPath $buildPropsPath -PathType Leaf)) {
+        Set-Failure 'build' 'repair-owner-build-tooling' 'DEVELOPMENT_BUILD_CONFIGURATION_MISSING' "the owner build properties file is missing: $buildPropsPath" 'mod-test build setup' 1 $null $false
+    }
     $buildArguments = @('build', $descriptor.ResolvedSource, '--configuration', [string]$descriptor.configuration,
         '--output', $stagingRoot, '--nologo',
-        ('-p:IntermediateOutputPath=' + (Join-Path $transactionRoot 'obj\')),
-        ('-p:MSBuildProjectExtensionsPath=' + (Join-Path $transactionRoot 'obj\')))
+        ('-p:CustomBeforeDirectoryBuildProps=' + $buildPropsPath),
+        ('-p:DevBridgeModTestIntermediateRoot=' + $buildIntermediateRoot))
     $buildWorkingDirectory = [IO.Path]::GetDirectoryName($descriptor.ResolvedSource)
     if ([string]::IsNullOrWhiteSpace($buildWorkingDirectory)) {
         Set-Failure 'build' 'fix-build' 'DEVELOPMENT_BUILD_WORKING_DIRECTORY_INVALID' `

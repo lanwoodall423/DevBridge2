@@ -111,6 +111,7 @@ internal static partial class OfflineTests
         Run("RimBridge companion identity mismatches fail closed", TestRimBridgeCompanionIdentityValidation);
         Run("RimBridge companion absence is endpoint-only and nonfatal", TestRimBridgeCompanionUnavailable);
         Run("RimBridge routes read-only calls with identity and provenance", TestRimBridgeRouteForwarding);
+        Run("recipe route failures preserve bounded diagnostics", TestRecipeRouteFailurePreservesDiagnostic);
         Run("RimBridge route blocks persistent and lifecycle mutations", TestRimBridgeRoutePolicyBlocks);
         Run("RimBridge route rejects stale generation and process identity", TestRimBridgeRouteIdentitySafety);
         Run("RimBridge route enforces valid shared leases", TestRimBridgeRouteLeaseSafety);

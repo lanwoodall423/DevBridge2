@@ -383,7 +383,7 @@ internal sealed partial class CoordinatorState
 
         RimBridgeWireResult wire = rimBridgeClient.CallTool(preparation.Context.Endpoint,
             preparation.Context.LaunchId, toolName, arguments, options.RimBridgeCallTimeout);
-        RimBridgeRouteResult result = BuildRimBridgeRouteResult("call", toolName,
+        RimBridgeRouteResult result = CompleteRimBridgeRoute("call", toolName,
             preparation.Context, wire);
         HandleRimBridgeRouteCredentialFailure(preparation.Context.Endpoint, wire);
         request.RimBridgeRouteResult = result;

@@ -851,23 +851,19 @@ internal sealed class RecipeRunResponse : RecipeResponse
 {
     [JsonPropertyName("schemaVersion")] public string SchemaVersion { get; init; } = DevBridgeSchemaVersions.TestRecipeRun;
     [JsonPropertyName("recipe")] public string Recipe { get; init; }
-    [JsonPropertyName("runId")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public string RunId { get; init; }
-    [JsonPropertyName("workflowId")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public string WorkflowId { get; init; }
+    [JsonPropertyName("runId")] public string RunId { get; init; }
+    [JsonPropertyName("workflowId")] public string WorkflowId { get; init; }
     [JsonPropertyName("success")] public bool Success { get; init; }
     [JsonPropertyName("generation")] public int Generation { get; init; }
     [JsonPropertyName("restartRequired")] public bool RestartRequired { get; init; }
     [JsonPropertyName("launchesConsumed")] public int LaunchesConsumed { get; init; }
-    [JsonPropertyName("leaseId")][JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string LeaseId { get; init; }
+    [JsonPropertyName("leaseId")] public string LeaseId { get; init; }
     [JsonPropertyName("evidence")][JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string Evidence { get; init; }
     [JsonPropertyName("evidenceId")][JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string EvidenceId { get; init; }
     [JsonPropertyName("failureFingerprint")][JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string FailureFingerprint { get; init; }
     [JsonPropertyName("finalNextAction")] public string FinalNextAction { get; init; }
     [JsonPropertyName("budget")] public RecipeBudgetResult Budget { get; init; }
-    [JsonPropertyName("operations")][JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public List<RecipeOperationResult> Operations { get; init; }
+    [JsonPropertyName("operations")] public List<RecipeOperationResult> Operations { get; init; } = new();
     [JsonPropertyName("errorCode")][JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string ErrorCode { get; init; }
     [JsonPropertyName("error")][JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string Error { get; init; }
 }
@@ -1118,7 +1114,7 @@ internal sealed partial class CoordinatorState
             lock (gate)
             {
                 repeated = FindEquivalentRecipeFailureLocked(id, plan.ProfileFingerprint,
-                    plan.TestInputs, budget.MaxRepeatedFailureCount);
+                    plan.TestInputs, budget.MaxRepeatedFailureCount, callerBudget.SourceFingerprint);
             }
             if (repeated != null)
             {
@@ -1174,7 +1170,8 @@ internal sealed partial class CoordinatorState
                         return SetRecipeFailure(request, id, "RECIPE_SUPPLIED_LEASE_NOT_HELD",
                             "The supplied lease is not held by this stable agent identity.",
                             state.Generation, restartRequired, launchesConsumed,
-                            callerBudget.SuppliedLeaseId, budgetResult, "acquire-lease", null, plan);
+                            callerBudget.SuppliedLeaseId, budgetResult, "acquire-lease", null, plan,
+                            callerBudget.SourceFingerprint);
                     }
 
                     if (state.Phase != BridgePhase.READY || state.RestartPending ||
@@ -1185,7 +1182,7 @@ internal sealed partial class CoordinatorState
                             "The supplied lease is not valid for the current READY generation; " +
                             "no lifecycle operation was attempted.", state.Generation,
                             restartRequired, launchesConsumed, suppliedLease.Id, budgetResult,
-                            "inspect-evidence", null, plan);
+                            "inspect-evidence", null, plan, callerBudget.SourceFingerprint);
                     }
                 }
 
@@ -1196,7 +1193,7 @@ internal sealed partial class CoordinatorState
                         "A supplied lease cannot authorize an autonomous restart; plan and accept " +
                         "the intended generation before running the recipe.", initialGeneration,
                         restartRequired, launchesConsumed, leaseId, budgetResult,
-                        "ensure-ready", null, plan);
+                        "ensure-ready", null, plan, callerBudget.SourceFingerprint);
                 }
             }
 
@@ -1224,7 +1221,8 @@ internal sealed partial class CoordinatorState
                         !BudgetAvailable() ? "The recipe budget expired. The accepted lifecycle operation was left to recover safely." :
                             "The recipe restart did not reach READY.",
                         CurrentGenerationForRecipe(), restartRequired, launchesConsumed, null, budgetResult,
-                        leavePendingForRecovery ? "wait-event" : "inspect-evidence", null, plan);
+                        leavePendingForRecovery ? "wait-event" : "inspect-evidence", null, plan,
+                        callerBudget.SourceFingerprint);
                 }
             }
 
@@ -1232,7 +1230,8 @@ internal sealed partial class CoordinatorState
                 return SetRecipeFailure(request, id, "AUTONOMOUS_BUDGET_EXHAUSTED",
                     "The recipe budget expired before lease acquisition; no unsafe cleanup or restart was attempted.",
                     CurrentGenerationForRecipe(), restartRequired, launchesConsumed, null,
-                    WithConsumed(budgetResult, launchesConsumed, 0), "wait-event", null, plan);
+                    WithConsumed(budgetResult, launchesConsumed, 0), "wait-event", null, plan,
+                    callerBudget.SourceFingerprint);
 
             if (string.IsNullOrWhiteSpace(leaseId) &&
                 (recipe.RequiresReady || recipe.Operations.Count > 0))
@@ -1250,7 +1249,8 @@ internal sealed partial class CoordinatorState
                             "The required DevBridge test lease could not be acquired.",
                         CurrentGenerationForRecipe(), restartRequired, launchesConsumed, null,
                         WithConsumed(budgetResult, launchesConsumed, 0),
-                        leavePendingForRecovery ? "wait-event" : "acquire-lease", null, plan);
+                        leavePendingForRecovery ? "wait-event" : "acquire-lease", null, plan,
+                        callerBudget.SourceFingerprint);
                 }
                 leaseId = lease.Id;
                 ownsLease = true;
@@ -1265,7 +1265,7 @@ internal sealed partial class CoordinatorState
                             : "The recipe budget expired before the next RimBridge operation.",
                         CurrentGenerationForRecipe(), restartRequired, launchesConsumed, leaseId,
                         WithConsumed(budgetResult, launchesConsumed, 0),
-                        "wait-event", operationResults, plan);
+                        "wait-event", operationResults, plan, callerBudget.SourceFingerprint);
                 List<string> callArguments = new() { operation.ToolName,
                     JsonSerializer.Serialize(operation.Arguments, CoordinatorSerialization.JsonOptions) };
                 if (!string.IsNullOrWhiteSpace(leaseId))
@@ -1282,11 +1282,12 @@ internal sealed partial class CoordinatorState
                         operationResult.Error ?? "The recipe operation did not satisfy its bounded expectation.",
                         CurrentGenerationForRecipe(), restartRequired, launchesConsumed, leaseId,
                         WithConsumed(budgetResult, launchesConsumed, 0),
-                        "inspect-evidence", operationResults, plan);
+                        "inspect-evidence", operationResults, plan, callerBudget.SourceFingerprint);
             }
 
             RecipeRunResponse result = BuildRecipeSuccess(id, recipe, request, restartRequired,
-                launchesConsumed, leaseId, budgetResult, operationResults, plan);
+                launchesConsumed, leaseId, budgetResult, operationResults, plan,
+                callerBudget.SourceFingerprint);
             request.RecipeResponse = result;
             return result.Success ? 0 : 4;
         }
@@ -1303,7 +1304,8 @@ internal sealed partial class CoordinatorState
 
     private RecipeRunResponse BuildRecipeSuccess(string id, TestRecipeDefinition recipe,
         BridgeRequest request, bool restartRequired, int launchesConsumed, string leaseId,
-        RecipeBudgetResult budget, List<RecipeOperationResult> operations, RecipePlanData plan)
+        RecipeBudgetResult budget, List<RecipeOperationResult> operations, RecipePlanData plan,
+        string sourceFingerprint)
     {
         bool success;
         int generation;
@@ -1325,7 +1327,7 @@ internal sealed partial class CoordinatorState
         }
         string failureFingerprint = success ? null : RecordRecipeFailure(id, failure,
             "The recipe did not produce all expected structured evidence.", generation,
-            plan?.ProfileFingerprint, plan?.TestInputs);
+            plan?.ProfileFingerprint, plan?.TestInputs, sourceFingerprint);
         string evidenceId = null;
         if (!success)
         {
@@ -1347,7 +1349,7 @@ internal sealed partial class CoordinatorState
             FailureFingerprint = success ? null : failureFingerprint ?? failure,
             FinalNextAction = nextAction,
             Budget = WithConsumed(budget, launchesConsumed, 0),
-            Operations = operations.Count == 0 ? null : operations,
+            Operations = operations ?? new List<RecipeOperationResult>(),
             ErrorCode = success ? null : failure,
             Error = success ? null : "The recipe did not produce all expected structured evidence."
         };
@@ -1356,13 +1358,13 @@ internal sealed partial class CoordinatorState
     private int SetRecipeFailure(BridgeRequest request, string id, string code, string error,
         int generation, bool restartRequired, int launchesConsumed, string leaseId,
         RecipeBudgetResult budget, string nextAction, List<RecipeOperationResult> operations,
-        RecipePlanData plan = null)
+        RecipePlanData plan = null, string sourceFingerprint = null)
     {
         string failureFingerprint = null;
         if (plan != null && !string.Equals(code, "AUTONOMOUS_BUDGET_EXHAUSTED",
                 StringComparison.Ordinal))
             failureFingerprint = RecordRecipeFailure(id, code, error, generation,
-                plan.ProfileFingerprint, plan.TestInputs);
+                plan.ProfileFingerprint, plan.TestInputs, sourceFingerprint);
         string evidenceId = null;
         if (failureFingerprint != null)
         {
@@ -1384,7 +1386,7 @@ internal sealed partial class CoordinatorState
             FailureFingerprint = failureFingerprint ?? code,
             FinalNextAction = nextAction,
             Budget = budget,
-            Operations = operations,
+            Operations = operations ?? new List<RecipeOperationResult>(),
             ErrorCode = code,
             Error = error
         };
@@ -1474,7 +1476,7 @@ internal sealed partial class CoordinatorState
         return "run-" + request.RequestId;
     }
 
-    private static RecipeOperationResult EvaluateRecipeOperation(RecipeOperationDefinition operation,
+    internal static RecipeOperationResult EvaluateRecipeOperation(RecipeOperationDefinition operation,
         int operationExit, RimBridgeRouteResult route)
     {
         bool isV2 = operation.Expectation != null;
@@ -1500,7 +1502,7 @@ internal sealed partial class CoordinatorState
                     ? route?.ErrorCode ?? "RECIPE_OPERATION_FAILED"
                     : "RECIPE_EXPECTED_FAILURE_NOT_RETURNED";
                 error = expectation.ExpectedSuccess
-                    ? isV2 ? "The RimBridge operation did not succeed as expected."
+                    ? isV2 ? route?.Error ?? "The RimBridge operation did not succeed as expected."
                         : "A policy-approved read-only recipe operation failed."
                     : "The RimBridge operation succeeded when failure was expected.";
             }
@@ -1758,6 +1760,7 @@ internal sealed partial class CoordinatorState
     {
         internal string WorkflowId { get; init; }
         internal string SuppliedLeaseId { get; init; }
+        internal string SourceFingerprint { get; init; }
         internal int? TimeoutSeconds { get; init; }
         internal int? MaxRimWorldLaunches { get; init; }
         internal int? MaxRecipeAttempts { get; init; }
@@ -1812,6 +1815,7 @@ internal sealed partial class CoordinatorState
                 out errorCode, out error);
         string suppliedLeaseId = null;
         string workflowId = null;
+        string sourceFingerprint = null;
         int? timeout = null, launches = null, attempts = null, refreshes = null, repeated = null;
         bool? stop = null;
         HashSet<string> seenOptions = new(StringComparer.OrdinalIgnoreCase);
@@ -1832,6 +1836,21 @@ internal sealed partial class CoordinatorState
                 if (!IsWorkflowId(workflowId))
                     return RecipeParseFailure("TEST_RECIPE_WORKFLOW_ID_INVALID",
                         "--workflow-id requires a bounded non-empty identifier.",
+                        out errorCode, out error);
+                continue;
+            }
+            if (string.Equals(option, "--source-fingerprint", StringComparison.OrdinalIgnoreCase) ||
+                option.StartsWith("--source-fingerprint=", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!string.IsNullOrWhiteSpace(sourceFingerprint))
+                    return RecipeParseFailure("TEST_RECIPE_SOURCE_FINGERPRINT_INVALID",
+                        "a source fingerprint may be declared only once.", out errorCode, out error);
+                sourceFingerprint = option.StartsWith("--source-fingerprint=", StringComparison.OrdinalIgnoreCase)
+                    ? option.Substring("--source-fingerprint=".Length).Trim()
+                    : (++index < arguments.Count ? arguments[index]?.Trim() : null);
+                if (!IsSourceFingerprint(sourceFingerprint))
+                    return RecipeParseFailure("TEST_RECIPE_SOURCE_FINGERPRINT_INVALID",
+                        "--source-fingerprint requires a 64-character hexadecimal fingerprint.",
                         out errorCode, out error);
                 continue;
             }
@@ -1900,6 +1919,7 @@ internal sealed partial class CoordinatorState
         {
             WorkflowId = workflowId,
             SuppliedLeaseId = suppliedLeaseId,
+            SourceFingerprint = sourceFingerprint,
             TimeoutSeconds = timeout,
             MaxRimWorldLaunches = launches,
             MaxRecipeAttempts = attempts,
@@ -1927,6 +1947,11 @@ internal sealed partial class CoordinatorState
         value.Length <= 128 &&
         value.All(character => !char.IsWhiteSpace(character) &&
             !char.IsControl(character));
+
+    private static bool IsSourceFingerprint(string value) =>
+        !string.IsNullOrWhiteSpace(value) && value.Length == 64 &&
+        value.All(character => character is >= '0' and <= '9' or
+            >= 'A' and <= 'F' or >= 'a' and <= 'f');
 
     private static bool RecipeParseFailure(string code, string message, out string errorCode, out string error)
     {

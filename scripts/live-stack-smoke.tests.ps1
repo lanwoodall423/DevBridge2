@@ -100,6 +100,7 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File "%~dp0fake-owner.ps1" %*
 exit /b %ERRORLEVEL%
 '@ -Encoding ascii
     Copy-Item -LiteralPath (Join-Path $repoRoot 'scripts\mod-test.ps1') -Destination (Join-Path $devRoot 'scripts\mod-test.ps1')
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'scripts\mod-test-build.props') -Destination (Join-Path $devRoot 'scripts\mod-test-build.props')
     Copy-Item -LiteralPath (Join-Path $repoRoot 'global.json') -Destination (Join-Path $devRoot 'global.json')
     Set-Content -LiteralPath (Join-Path $gameRoot 'RimWorldWin64.exe') -Value 'fixture' -Encoding ascii
     Set-Content -LiteralPath (Join-Path $gameRoot 'Version.txt') -Value '1.6.test rev0' -Encoding ascii

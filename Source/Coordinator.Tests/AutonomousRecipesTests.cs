@@ -46,11 +46,36 @@ internal static partial class OfflineTests
 
         RecipeResponse correlated = ExecuteRecipe(fixture, "run", "quicktest-smoke",
             "--workflow-id", "rw-offline-correlation", "--max-rimworld-launches", "0");
-        Assert(correlated is RecipeRunResponse correlatedRun &&
+        RecipeRunResponse correlatedRun = correlated as RecipeRunResponse;
+        Assert(correlatedRun != null &&
                correlatedRun.WorkflowId == "rw-offline-correlation" &&
                !string.IsNullOrWhiteSpace(correlatedRun.RunId) &&
                correlatedRun.RunId.StartsWith("run-", StringComparison.Ordinal),
             "recipe runs must preserve workflow correlation and expose a bounded run identity");
+
+        string correlatedJson = JsonSerializer.Serialize(correlatedRun, Program.JsonOptions);
+        using JsonDocument correlatedDocument = JsonDocument.Parse(correlatedJson);
+        JsonElement correlatedRoot = correlatedDocument.RootElement;
+        string[] requiredFields = { "success", "recipe", "runId", "workflowId", "generation", "leaseId", "operations" };
+        Assert(requiredFields.All(field => correlatedRoot.TryGetProperty(field, out _)) &&
+               correlatedRoot.GetProperty("operations").ValueKind == JsonValueKind.Array,
+            "recipe run JSON must retain the cross-stack required fields");
+
+        RecipeRunResponse emptyResponse = new()
+        {
+            Recipe = "quicktest-smoke",
+            FinalNextAction = "inspect-evidence",
+            Budget = new RecipeBudgetResult()
+        };
+        using JsonDocument emptyDocument = JsonDocument.Parse(
+            JsonSerializer.Serialize(emptyResponse, Program.JsonOptions));
+        JsonElement emptyRoot = emptyDocument.RootElement;
+        Assert(requiredFields.All(field => emptyRoot.TryGetProperty(field, out _)) &&
+               emptyRoot.GetProperty("runId").ValueKind == JsonValueKind.Null &&
+               emptyRoot.GetProperty("workflowId").ValueKind == JsonValueKind.Null &&
+               emptyRoot.GetProperty("leaseId").ValueKind == JsonValueKind.Null &&
+               emptyRoot.GetProperty("operations").ValueKind == JsonValueKind.Array,
+            "recipe run JSON must retain required fields when values are empty");
 
         WriteRecipe(fixture, "quicktest-smoke", SmokeRecipe.Replace(
             "\"schemaVersion\": \"devbridge-test-recipe/v1\"",

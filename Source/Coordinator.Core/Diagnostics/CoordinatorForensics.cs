@@ -407,7 +407,7 @@ internal sealed partial class CoordinatorState
     internal FailureFingerprintInput BuildFailureInputLocked(string errorCode, string phase,
         string detail, QuicktestFailureRecord failure = null, string recipeId = null,
         string component = null, IReadOnlyList<TestInputValue> inputs = null,
-        string projectFingerprint = null)
+        string projectFingerprint = null, string sourceFingerprint = null)
     {
         return new FailureFingerprintInput
         {
@@ -419,6 +419,7 @@ internal sealed partial class CoordinatorState
             Component = component ?? "coordinator",
             ComponentIdentity = RunningBuildIdentity?.InformationalVersion,
             SourceRevision = RunningBuildIdentity?.SourceRevision,
+            SourceFingerprint = sourceFingerprint,
             ProjectFingerprint = projectFingerprint ?? state.LaunchProfileFingerprint ??
                 state.ProfileFingerprint ?? state.FrozenProfileFingerprint,
             RecipeId = recipeId,
@@ -436,7 +437,8 @@ internal sealed partial class CoordinatorState
     }
 
     internal FailureOccurrenceSummary FindEquivalentRecipeFailureLocked(string recipeId,
-        string projectFingerprint, IReadOnlyList<TestInputValue> inputs, int maxCount)
+        string projectFingerprint, IReadOnlyList<TestInputValue> inputs, int maxCount,
+        string sourceFingerprint = null)
     {
         if (maxCount <= 0)
             return null;
@@ -446,7 +448,7 @@ internal sealed partial class CoordinatorState
                 IsRepeatableRecipeFailureOccurrenceLocked(value))
             .FirstOrDefault(value => FailureFingerprinting.EquivalentContext(value, recipeId,
                 projectFingerprint, inputs, RunningBuildIdentity?.InformationalVersion,
-                RunningBuildIdentity?.SourceRevision));
+                RunningBuildIdentity?.SourceRevision, sourceFingerprint));
     }
 
     private bool IsRepeatableRecipeFailureOccurrenceLocked(FailureOccurrenceSummary occurrence)
@@ -471,13 +473,15 @@ internal sealed partial class CoordinatorState
     }
 
     internal string RecordRecipeFailure(string recipeId, string code, string error,
-        int generation, string projectFingerprint, IReadOnlyList<TestInputValue> inputs)
+        int generation, string projectFingerprint, IReadOnlyList<TestInputValue> inputs,
+        string sourceFingerprint = null)
     {
         lock (gate)
         {
             FailureOccurrenceSummary occurrence = RecordFailureOccurrenceLocked(
                 BuildFailureInputLocked(code, "RECIPE", error, recipeId: recipeId,
-                    component: "recipe", inputs: inputs, projectFingerprint: projectFingerprint),
+                    component: "recipe", inputs: inputs, projectFingerprint: projectFingerprint,
+                    sourceFingerprint: sourceFingerprint),
                 generation, "RECIPE", error);
             SaveStateLocked();
             return occurrence?.FailureFingerprint ?? code;

@@ -85,7 +85,7 @@ internal sealed partial class CoordinatorState
 
         RimBridgeWireResult wire = rimBridgeClient.ListTools(preparation.Context.Endpoint,
             preparation.Context.LaunchId, options.RimBridgeCallTimeout);
-        RimBridgeRouteResult result = BuildRimBridgeRouteResult("tools", null,
+        RimBridgeRouteResult result = CompleteRimBridgeRoute("tools", null,
             preparation.Context, wire);
         HandleRimBridgeRouteCredentialFailure(preparation.Context.Endpoint, wire);
         request.RimBridgeRouteResult = result;
@@ -515,6 +515,74 @@ internal sealed partial class CoordinatorState
             Payload = payload,
             OpaqueEvidence = opaqueEvidence
         };
+    }
+
+    private RimBridgeRouteResult CompleteRimBridgeRoute(string operation, string toolName,
+        RimBridgeRouteContext context, RimBridgeWireResult wire)
+    {
+        RimBridgeWireResult completionFailure = null;
+        lock (gate)
+        {
+            SynchronizeLocked();
+            completionFailure = ValidateRimBridgeRouteCompletionLocked(context);
+        }
+
+        return BuildRimBridgeRouteResult(operation, toolName, context,
+            completionFailure ?? wire);
+    }
+
+    private RimBridgeWireResult ValidateRimBridgeRouteCompletionLocked(
+        RimBridgeRouteContext context)
+    {
+        if (context?.Endpoint == null)
+            return new RimBridgeWireResult
+            {
+                ErrorCode = "RIMBRIDGE_ENDPOINT_STALE",
+                Error = "The routed RimBridge endpoint context was unavailable at completion; " +
+                        "the result was discarded."
+            };
+
+        bool launchOrGenerationChanged =
+            !string.Equals(state.LaunchId, context.LaunchId, StringComparison.Ordinal) ||
+            state.Generation != context.Generation;
+        if (launchOrGenerationChanged)
+            return new RimBridgeWireResult
+            {
+                ErrorCode = "RIMBRIDGE_ENDPOINT_STALE",
+                Error = "The active DevBridge launch or generation changed while the RimBridge " +
+                        "operation was in flight; the result was discarded."
+            };
+
+        bool processChanged = state.ProcessId != context.ProcessId ||
+            state.ProcessStartUtcTicks != context.Endpoint.ProcessStartUtcTicks;
+        string endpointFailure = ValidateRimBridgeEndpointLocked(context.Endpoint);
+        if (processChanged || (endpointFailure != null &&
+            endpointFailure.Contains("process identity", StringComparison.OrdinalIgnoreCase)))
+            return new RimBridgeWireResult
+            {
+                ErrorCode = "RIMBRIDGE_PROCESS_IDENTITY_MISMATCH",
+                Error = "The RimWorld process identity changed while the RimBridge operation was " +
+                        "in flight; the result was discarded."
+            };
+
+        RimBridgeEndpoint current = RimBridgeEndpointStore.Load(runtimeRoot);
+        bool endpointChanged = current == null || !current.IsValid ||
+            state.Phase != BridgePhase.READY ||
+            !string.Equals(current.Host, context.Endpoint.Host, StringComparison.OrdinalIgnoreCase) ||
+            current.Port != context.Endpoint.Port ||
+            !string.Equals(current.Token, context.Endpoint.Token, StringComparison.Ordinal) ||
+            !string.Equals(current.LaunchId, context.LaunchId, StringComparison.Ordinal) ||
+            current.Generation != context.Generation || current.ProcessId != context.ProcessId ||
+            current.ProcessStartUtcTicks != context.Endpoint.ProcessStartUtcTicks;
+        if (endpointChanged || endpointFailure != null)
+            return new RimBridgeWireResult
+            {
+                ErrorCode = "RIMBRIDGE_ENDPOINT_STALE",
+                Error = "The active DevBridge route changed while the RimBridge operation was in " +
+                        "flight; the result was discarded."
+            };
+
+        return null;
     }
 
     private static string ExtractOperationId(JsonElement? rawResponse, JsonElement? payload)

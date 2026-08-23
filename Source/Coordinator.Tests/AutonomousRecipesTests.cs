@@ -151,6 +151,30 @@ internal static partial class OfflineTests
             "profile mutation must remain forbidden in v2 recipes");
     }
 
+    private static void TestRecipeRouteFailurePreservesDiagnostic()
+    {
+        RecipeOperationDefinition operation = new()
+        {
+            ToolName = "rimworld/get_game_state",
+            Expectation = new RecipeOperationExpectation { ExpectedSuccess = true }
+        };
+        RimBridgeRouteResult route = new()
+        {
+            ToolName = operation.ToolName,
+            Success = false,
+            ErrorCode = "RIMBRIDGE_PROTOCOL_ERROR",
+            Error = "RimBridge closed the routed connection before completing the request.",
+            Generation = 14,
+            LaunchId = "launch-route-failure"
+        };
+
+        RecipeOperationResult result = CoordinatorState.EvaluateRecipeOperation(operation, 4, route);
+        Assert(!result.Success && result.ErrorCode == route.ErrorCode &&
+               result.Error == route.Error && result.Generation == route.Generation &&
+               result.LaunchId == route.LaunchId,
+            "recipe failures must preserve the routed diagnostic instead of replacing it with a generic message");
+    }
+
     private static void TestRecipePlanningIsPureAndBounded()
     {
         using Fixture fixture = Fixture.ReadyWithoutLease();

@@ -207,7 +207,6 @@ internal static partial class OfflineTests
                    RimBridgeOperationCategories.LifecycleMutation),
             "only read-only operations may be automatically replayed");
     }
-
     private static void TestRecipePlanningIsPureAndBounded()
     {
         using Fixture fixture = Fixture.ReadyWithoutLease();

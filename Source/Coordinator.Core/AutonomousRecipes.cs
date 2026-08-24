@@ -876,6 +876,198 @@ internal sealed partial class CoordinatorState
     private const int CoordinatorRecipeMaxRefreshes = 8;
     private const int CoordinatorRecipeMaxTimeoutSeconds = 900;
 
+    private sealed class RecipeTransitionRecoveryResult
+    {
+        internal bool Replayed { get; init; }
+        internal bool WasTransition { get; init; }
+        internal int RefreshesConsumed { get; init; }
+        internal string ErrorCode { get; init; }
+        internal string Error { get; init; }
+    }
+
+    private static bool IsSharedTransitionRouteCode(string code) =>
+        RimBridgeTransitionRecoveryPolicy.IsTransitionFailureCode(code);
+
+    private bool HasAuthoritativeSharedTransitionEvidenceLocked(RimBridgeRouteResult route)
+    {
+        if (route == null || !IsSharedTransitionRouteCode(route.ErrorCode))
+            return false;
+
+        // A route failure is recoverable only when the coordinator itself has
+        // durable evidence that a later generation is queued/accepted or that
+        // the current generation is still inside its owned transition.  A
+        // protocol error without this evidence remains a normal failure.
+        return RimBridgeTransitionRecoveryPolicy.HasAuthoritativeEvidence(
+            route.ErrorCode, route.Generation, state.Generation,
+            state.TargetGeneration, state.RestartPending);
+    }
+
+    private bool TryRebindRecipeLeaseAfterTransition(BridgeRequest request,
+        ref string leaseId, bool ownsLease,
+        Func<bool> budgetAvailable, out string errorCode, out string error)
+    {
+        errorCode = null;
+        error = null;
+        bool needsRebind;
+        string candidateLeaseId = leaseId;
+        lock (gate)
+        {
+            SynchronizeLocked();
+            TestLease current = string.IsNullOrWhiteSpace(candidateLeaseId) ? null :
+                state.Leases.FirstOrDefault(value =>
+                    string.Equals(value.Id, candidateLeaseId, StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(value.Agent, request.Agent, StringComparison.Ordinal));
+            needsRebind = current == null || current.Generation != state.Generation;
+            if (!needsRebind && state.Phase == BridgePhase.READY && !state.RestartPending)
+                return true;
+
+            if (!ownsLease)
+            {
+                errorCode = state.RestartPending
+                    ? "RECIPE_SUPPLIED_LEASE_CONCURRENT_TRANSITION"
+                    : "RECIPE_SUPPLIED_LEASE_GENERATION_MISMATCH";
+                error = "The caller-supplied lease cannot be rebound across the shared DevBridge " +
+                    "generation transition; it was not stolen or replaced.";
+                return false;
+            }
+        }
+
+        // The recipe may release only the lease it acquired itself.  This is
+        // also what lets an external restart already accepted by DevBridge
+        // proceed instead of leaving the recipe's stale lease as a blocker.
+        if (!string.IsNullOrWhiteSpace(leaseId))
+            ReleaseLeaseSilently(leaseId);
+        leaseId = null;
+
+        if (!budgetAvailable())
+        {
+            errorCode = "RECIPE_SHARED_TRANSITION_TIMEOUT";
+            error = "The recipe budget expired while rebinding its owned lease after a shared generation transition.";
+            return false;
+        }
+
+        TestLease reacquired = null;
+        int result = BeginLease(request, SilentRecipeEmit, () => true,
+            acquired: value => reacquired = value, budgetAvailable: budgetAvailable);
+        if (result != 0 || reacquired == null)
+        {
+            errorCode = "RECIPE_SHARED_TRANSITION_LEASE_REBIND_FAILED";
+            error = "The recipe-owned lease could not be safely reacquired after the shared generation became READY.";
+            return false;
+        }
+
+        leaseId = reacquired.Id;
+        return true;
+    }
+
+    private RecipeTransitionRecoveryResult RecoverSharedTransitionForRecipe(
+        RecipeOperationDefinition operation,
+        BridgeRequest request, List<string> callArguments,
+        RimBridgeRouteResult staleRoute,
+        ref string leaseId, bool ownsLease, int maxRefreshes,
+        Func<bool> budgetAvailable, Func<bool> connected)
+    {
+        RecipeTransitionRecoveryResult Terminal(string code, string error,
+            int consumed, bool transition) => new()
+        {
+            WasTransition = transition,
+            RefreshesConsumed = consumed,
+            ErrorCode = code,
+            Error = error
+        };
+
+        bool transitionEvidence;
+        lock (gate)
+        {
+            SynchronizeLocked();
+            transitionEvidence = HasAuthoritativeSharedTransitionEvidenceLocked(staleRoute);
+        }
+        if (!transitionEvidence)
+            return Terminal(null, null, 0, false);
+
+        if (!RimBridgeTransitionRecoveryPolicy.CanReplay(
+                RimBridgeOperationPolicy.CategoryFor(operation?.ToolName)))
+        {
+            return Terminal("RECIPE_MUTATION_REPLAY_UNSAFE",
+                "The first RimBridge mutation may have reached RimWorld before the shared transition; " +
+                "automatic replay is prohibited because no idempotency proof was provided.", 0, true);
+        }
+
+        int consumed = 0;
+        while (consumed < maxRefreshes)
+        {
+            if (!budgetAvailable())
+                return Terminal("RECIPE_SHARED_TRANSITION_TIMEOUT",
+                    "The recipe budget expired while observing the shared DevBridge transition.", consumed, true);
+            consumed++;
+
+            if (!TryRebindRecipeLeaseAfterTransition(request, ref leaseId,
+                    ownsLease, budgetAvailable, out string leaseErrorCode, out string leaseError))
+                return Terminal(leaseErrorCode, leaseError, consumed, true);
+
+            int leaseOption = callArguments.FindIndex(value =>
+                string.Equals(value, "--lease", StringComparison.OrdinalIgnoreCase));
+            if (leaseOption >= 0 && leaseOption + 1 < callArguments.Count)
+            {
+                if (string.IsNullOrWhiteSpace(leaseId))
+                {
+                    callArguments.RemoveAt(leaseOption + 1);
+                    callArguments.RemoveAt(leaseOption);
+                }
+                else
+                    callArguments[leaseOption + 1] = leaseId;
+            }
+            else if (!string.IsNullOrWhiteSpace(leaseId))
+            {
+                callArguments.Add("--lease");
+                callArguments.Add(leaseId);
+            }
+
+            if (!WaitForReady(SilentRecipeEmit, requireNoRestart: true,
+                    connected: connected, waitForMaintenance: true,
+                    budgetAvailable: budgetAvailable))
+            {
+                if (!budgetAvailable())
+                    return Terminal("RECIPE_SHARED_TRANSITION_TIMEOUT",
+                        "The recipe budget expired while waiting for the existing DevBridge transition to reach READY.",
+                        consumed, true);
+                return Terminal("RECIPE_SHARED_TRANSITION_NOT_READY",
+                    "The existing DevBridge transition did not reach READY; no replacement lifecycle action was attempted.",
+                    consumed, true);
+            }
+
+            int replayExit = BridgeCallCommand(callArguments, request, SilentRecipeEmit);
+            RimBridgeRouteResult replay = request.RimBridgeRouteResult;
+            if (replayExit == 0 && replay?.Success == true)
+                return new RecipeTransitionRecoveryResult
+                {
+                    Replayed = true,
+                    WasTransition = true,
+                    RefreshesConsumed = consumed
+                };
+
+            bool stillTransitioning;
+            lock (gate)
+            {
+                SynchronizeLocked();
+                stillTransitioning = HasAuthoritativeSharedTransitionEvidenceLocked(replay);
+            }
+            if (!stillTransitioning)
+                return Terminal(null, null, consumed, true);
+
+            if (consumed >= maxRefreshes)
+                return Terminal("RECIPE_SHARED_TRANSITION_REFRESH_BUDGET_EXHAUSTED",
+                    "The shared DevBridge transition remained authoritative but did not settle within the recipe's " +
+                    "bounded coordinator-refresh budget.", consumed, true);
+
+            WaitForStateChange(TimeSpan.FromMilliseconds(50));
+        }
+
+        return Terminal("RECIPE_SHARED_TRANSITION_REFRESH_BUDGET_EXHAUSTED",
+            "The shared DevBridge transition did not settle within the recipe's bounded coordinator-refresh budget.",
+            consumed, true);
+    }
+
     private static bool IsPureRecipeCommand(BridgeRequest request)
     {
         IReadOnlyList<string> arguments = request?.Arguments ?? new List<string>();
@@ -1155,6 +1347,7 @@ internal sealed partial class CoordinatorState
         bool leavePendingForRecovery = false;
         string leaseId = null;
         bool ownsLease = false;
+        int coordinatorRefreshesConsumed = 0;
         List<RecipeOperationResult> operationResults = new();
         try
         {
@@ -1214,7 +1407,7 @@ internal sealed partial class CoordinatorState
                     leavePendingForRecovery = state.RestartPending;
                 if (restartResult != 0)
                 {
-                    budgetResult = WithConsumed(budgetResult, launchesConsumed, 0);
+                    budgetResult = WithConsumed(budgetResult, launchesConsumed, coordinatorRefreshesConsumed);
                     return SetRecipeFailure(request, id,
                         !BudgetAvailable() ? "AUTONOMOUS_BUDGET_EXHAUSTED" :
                             restartRequest.TestInputErrorCode ?? "RECIPE_RESTART_FAILED",
@@ -1230,7 +1423,7 @@ internal sealed partial class CoordinatorState
                 return SetRecipeFailure(request, id, "AUTONOMOUS_BUDGET_EXHAUSTED",
                     "The recipe budget expired before lease acquisition; no unsafe cleanup or restart was attempted.",
                     CurrentGenerationForRecipe(), restartRequired, launchesConsumed, null,
-                    WithConsumed(budgetResult, launchesConsumed, 0), "wait-event", null, plan,
+                    WithConsumed(budgetResult, launchesConsumed, coordinatorRefreshesConsumed), "wait-event", null, plan,
                     callerBudget.SourceFingerprint);
 
             if (string.IsNullOrWhiteSpace(leaseId) &&
@@ -1248,7 +1441,7 @@ internal sealed partial class CoordinatorState
                         !BudgetAvailable() ? "The recipe budget expired while waiting for a safe lease boundary." :
                             "The required DevBridge test lease could not be acquired.",
                         CurrentGenerationForRecipe(), restartRequired, launchesConsumed, null,
-                        WithConsumed(budgetResult, launchesConsumed, 0),
+                        WithConsumed(budgetResult, launchesConsumed, coordinatorRefreshesConsumed),
                         leavePendingForRecovery ? "wait-event" : "acquire-lease", null, plan,
                         callerBudget.SourceFingerprint);
                 }
@@ -1264,7 +1457,7 @@ internal sealed partial class CoordinatorState
                             ? "The recipe budget expired before the next read-only operation."
                             : "The recipe budget expired before the next RimBridge operation.",
                         CurrentGenerationForRecipe(), restartRequired, launchesConsumed, leaseId,
-                        WithConsumed(budgetResult, launchesConsumed, 0),
+                        WithConsumed(budgetResult, launchesConsumed, coordinatorRefreshesConsumed),
                         "wait-event", operationResults, plan, callerBudget.SourceFingerprint);
                 List<string> callArguments = new() { operation.ToolName,
                     JsonSerializer.Serialize(operation.Arguments, CoordinatorSerialization.JsonOptions) };
@@ -1275,19 +1468,58 @@ internal sealed partial class CoordinatorState
                 }
                 int operationExit = BridgeCallCommand(callArguments, request, SilentRecipeEmit);
                 RimBridgeRouteResult route = request.RimBridgeRouteResult;
+                if (operationExit != 0 && route != null &&
+                    IsSharedTransitionRouteCode(route.ErrorCode))
+                {
+                    RecipeTransitionRecoveryResult recovery =
+                        RecoverSharedTransitionForRecipe(operation, request,
+                            callArguments, route,
+                            ref leaseId, ownsLease, budget.MaxCoordinatorRefreshes -
+                            coordinatorRefreshesConsumed, BudgetAvailable, connected);
+                    coordinatorRefreshesConsumed += recovery.RefreshesConsumed;
+                    if (recovery.Replayed)
+                    {
+                        operationExit = request.RimBridgeRouteResult?.Success == true ? 0 : 4;
+                        route = request.RimBridgeRouteResult;
+                    }
+                    else if (recovery.WasTransition && recovery.ErrorCode != null)
+                    {
+                        operationResults.Add(new RecipeOperationResult
+                        {
+                            Tool = operation.ToolName,
+                            OperationId = route.OperationId,
+                            WorkflowId = route.WorkflowId,
+                            Generation = route.Generation,
+                            LaunchId = route.LaunchId,
+                            Success = false,
+                            ExpectedSuccess = operation.Expectation != null
+                                ? operation.Expectation.ExpectedSuccess : null,
+                            ErrorCode = recovery.ErrorCode,
+                            Error = recovery.Error
+                        });
+                        return SetRecipeFailure(request, id, recovery.ErrorCode,
+                            recovery.Error, CurrentGenerationForRecipe(), restartRequired,
+                            launchesConsumed, leaseId,
+                            WithConsumed(budgetResult, launchesConsumed,
+                                coordinatorRefreshesConsumed),
+                            recovery.ErrorCode == "RECIPE_SHARED_TRANSITION_TIMEOUT"
+                                ? "wait-event" : "inspect-evidence", operationResults,
+                            plan, callerBudget.SourceFingerprint);
+                    }
+                }
                 RecipeOperationResult operationResult = EvaluateRecipeOperation(operation, operationExit, route);
                 operationResults.Add(operationResult);
                 if (!operationResult.Success)
                     return SetRecipeFailure(request, id, operationResult.ErrorCode ?? "RECIPE_OPERATION_FAILED",
                         operationResult.Error ?? "The recipe operation did not satisfy its bounded expectation.",
                         CurrentGenerationForRecipe(), restartRequired, launchesConsumed, leaseId,
-                        WithConsumed(budgetResult, launchesConsumed, 0),
+                        WithConsumed(budgetResult, launchesConsumed, coordinatorRefreshesConsumed),
                         "inspect-evidence", operationResults, plan, callerBudget.SourceFingerprint);
             }
 
             RecipeRunResponse result = BuildRecipeSuccess(id, recipe, request, restartRequired,
                 launchesConsumed, leaseId, budgetResult, operationResults, plan,
-                callerBudget.SourceFingerprint);
+                callerBudget.SourceFingerprint, coordinatorRefreshesConsumed);
             request.RecipeResponse = result;
             return result.Success ? 0 : 4;
         }
@@ -1305,7 +1537,7 @@ internal sealed partial class CoordinatorState
     private RecipeRunResponse BuildRecipeSuccess(string id, TestRecipeDefinition recipe,
         BridgeRequest request, bool restartRequired, int launchesConsumed, string leaseId,
         RecipeBudgetResult budget, List<RecipeOperationResult> operations, RecipePlanData plan,
-        string sourceFingerprint)
+        string sourceFingerprint, int coordinatorRefreshesConsumed)
     {
         bool success;
         int generation;
@@ -1348,7 +1580,7 @@ internal sealed partial class CoordinatorState
             EvidenceId = evidenceId,
             FailureFingerprint = success ? null : failureFingerprint ?? failure,
             FinalNextAction = nextAction,
-            Budget = WithConsumed(budget, launchesConsumed, 0),
+            Budget = WithConsumed(budget, launchesConsumed, coordinatorRefreshesConsumed),
             Operations = operations ?? new List<RecipeOperationResult>(),
             ErrorCode = success ? null : failure,
             Error = success ? null : "The recipe did not produce all expected structured evidence."
@@ -1361,8 +1593,7 @@ internal sealed partial class CoordinatorState
         RecipePlanData plan = null, string sourceFingerprint = null)
     {
         string failureFingerprint = null;
-        if (plan != null && !string.Equals(code, "AUTONOMOUS_BUDGET_EXHAUSTED",
-                StringComparison.Ordinal))
+        if (plan != null && ShouldRecordRecipeFailure(code))
             failureFingerprint = RecordRecipeFailure(id, code, error, generation,
                 plan.ProfileFingerprint, plan.TestInputs, sourceFingerprint);
         string evidenceId = null;
@@ -1392,6 +1623,11 @@ internal sealed partial class CoordinatorState
         };
         return 4;
     }
+
+    private static bool ShouldRecordRecipeFailure(string code) =>
+        !string.Equals(code, "AUTONOMOUS_BUDGET_EXHAUSTED", StringComparison.Ordinal) &&
+        !code.StartsWith("RECIPE_SHARED_TRANSITION_", StringComparison.Ordinal) &&
+        !string.Equals(code, "RECIPE_MUTATION_REPLAY_UNSAFE", StringComparison.Ordinal);
 
     private static RecipeRunResponse RecipeRunFailure(string id, string code, string error,
         string leaseId, int generation, int launchesConsumed, string nextAction,

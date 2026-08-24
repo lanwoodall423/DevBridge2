@@ -520,6 +520,7 @@ internal sealed partial class CoordinatorState
     private RimBridgeRouteResult CompleteRimBridgeRoute(string operation, string toolName,
         RimBridgeRouteContext context, RimBridgeWireResult wire)
     {
+        options.BeforeRimBridgeRouteCompletion?.Invoke(this);
         RimBridgeWireResult completionFailure = null;
         lock (gate)
         {

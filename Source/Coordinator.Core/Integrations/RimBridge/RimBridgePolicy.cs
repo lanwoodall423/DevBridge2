@@ -84,3 +84,30 @@ internal static class RimBridgeOperationPolicy
         };
     }
 }
+
+internal static class RimBridgeTransitionRecoveryPolicy
+{
+    internal static bool IsTransitionFailureCode(string code) =>
+        string.Equals(code, "RIMBRIDGE_ENDPOINT_STALE", StringComparison.Ordinal) ||
+        string.Equals(code, "RIMBRIDGE_PROCESS_IDENTITY_MISMATCH", StringComparison.Ordinal) ||
+        string.Equals(code, "RIMBRIDGE_PROCESS_MISMATCH", StringComparison.Ordinal) ||
+        string.Equals(code, "RIMBRIDGE_PROTOCOL_ERROR", StringComparison.Ordinal) ||
+        string.Equals(code, "RIMBRIDGE_COMPANION_UNAVAILABLE", StringComparison.Ordinal) ||
+        string.Equals(code, "RIMBRIDGE_ENDPOINT_UNAVAILABLE", StringComparison.Ordinal) ||
+        string.Equals(code, "RIMBRIDGE_ENDPOINT_NOT_FOUND", StringComparison.Ordinal) ||
+        string.Equals(code, "ENDPOINT_UNAVAILABLE", StringComparison.Ordinal) ||
+        string.IsNullOrWhiteSpace(code);
+
+    internal static bool HasAuthoritativeEvidence(string code, int routeGeneration,
+        int currentGeneration, int targetGeneration, bool restartPending)
+    {
+        if (!IsTransitionFailureCode(code))
+            return false;
+        int observedGeneration = Math.Max(0, routeGeneration);
+        return (restartPending && targetGeneration > observedGeneration) ||
+            currentGeneration > observedGeneration;
+    }
+
+    internal static bool CanReplay(string category) =>
+        string.Equals(category, RimBridgeOperationCategories.ReadOnly, StringComparison.Ordinal);
+}

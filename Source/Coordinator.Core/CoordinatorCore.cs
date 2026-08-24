@@ -1061,6 +1061,10 @@ internal sealed class CoordinatorOptions
     internal string PlayerLogPath { get; init; }
     internal IRimBridgeClient RimBridgeClient { get; init; }
     internal IRimBridgeGenerationVerifier RimBridgeGenerationVerifier { get; init; }
+    // Offline tests use this seam to deterministically advance the shared
+    // generation between a wire response and its strict completion check.
+    // Production never supplies it.
+    internal Action<CoordinatorState> BeforeRimBridgeRouteCompletion { get; init; }
     internal Action BeforeModsConfigWrite { get; init; }
     internal ICoordinatorFaultInjector FaultInjector { get; set; }
     internal IViewportEnvironmentController ViewportEnvironmentController { get; init; } =
@@ -1093,6 +1097,7 @@ internal sealed class CoordinatorOptions
             PlayerLogPath = PlayerLogPath,
             RimBridgeClient = RimBridgeClient,
             RimBridgeGenerationVerifier = RimBridgeGenerationVerifier,
+            BeforeRimBridgeRouteCompletion = BeforeRimBridgeRouteCompletion,
             BeforeModsConfigWrite = BeforeModsConfigWrite,
             FaultInjector = FaultInjector,
             ViewportEnvironmentController = ViewportEnvironmentController
@@ -2239,6 +2244,18 @@ internal sealed partial class CoordinatorState
 
     internal bool ShutdownRequested => Volatile.Read(ref shutdownRequested) != 0;
     internal CancellationToken ShutdownToken => shutdownCancellation.Token;
+
+    internal void ReplaceStateForTesting(PersistedState replacement)
+    {
+        if (replacement == null)
+            throw new ArgumentNullException(nameof(replacement));
+        lock (gate)
+        {
+            state = replacement;
+            SaveStateLocked();
+            Monitor.PulseAll(gate);
+        }
+    }
 
     internal void RequestShutdown()
     {

@@ -29,6 +29,15 @@ serializes requests through a Windows named pipe restricted to the current user.
 become coordinator-owned merely by having the same PID: ownership requires the durable root/slot,
 PID, process-start identity, launch ID, generation, and readiness evidence to agree.
 
+Every status/readiness JSON response and `doctor --json` response also exposes the
+`devbridge-identity/v1` object. `installationId`/`ownerId` are generated once in
+durable `Runtime/state.json` and remain stable across coordinator and RimWorld
+restarts. `coordinator.instanceId`, `runtime.generation`, and the expected/current
+RimWorld PID/start identity are volatile. `runtime.transition` reports replacing,
+waiting-for-bridge, loading, stopped, or stable-ready; it is not a readiness claim.
+`alternateRoots` is diagnostic only: a non-empty value makes doctor unhealthy and
+never causes an alternate root to be adopted.
+
 The root path is canonicalized independently from opaque identifiers. The runtime slot is a stable
 96-bit hash-derived ID; pipe and mutex names use the same canonical namespace rules. A persisted legacy
 short slot is rejected with migration guidance rather than silently rebound. Full lease, registration,

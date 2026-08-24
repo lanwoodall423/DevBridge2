@@ -169,6 +169,8 @@ internal static partial class OfflineTests
     private static bool IsKnownLaunchEnvironmentKey(string key) => key switch
     {
         "DEVBRIDGE_ROOT" => true,
+        "DEVBRIDGE_INSTALLATION_ID" => true,
+        "DEVBRIDGE_RUNTIME_SLOT_ID" => true,
         "DEVBRIDGE_LAUNCH_ID" => true,
         "DEVBRIDGE_GENERATION" => true,
         "DEVBRIDGE_QUICKTEST_REQUESTED" => true,

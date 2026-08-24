@@ -477,6 +477,8 @@ internal sealed partial class CoordinatorState
             Dictionary<string, string> launchEnvironment = new()
             {
                 ["DEVBRIDGE_ROOT"] = root,
+                ["DEVBRIDGE_INSTALLATION_ID"] = state.InstallationId ?? string.Empty,
+                ["DEVBRIDGE_RUNTIME_SLOT_ID"] = runtimeSlotId,
                 ["DEVBRIDGE_LAUNCH_ID"] = launchId,
                 ["DEVBRIDGE_GENERATION"] = targetGeneration.ToString(),
                 ["DEVBRIDGE_QUICKTEST_REQUESTED"] = launchInputs.QuicktestEnabled ? "1" : "0",

@@ -179,6 +179,7 @@ internal static partial class OfflineTests
         Run("doctor audits artifact permissions without writes", TestDoctorAuditsPermissions);
         Run("doctor detects stale readiness", TestDoctorDetectsStaleReadiness);
         Run("doctor findings are deterministic", TestDoctorFindingsAreDeterministic);
+        Run("canonical identity separates owner, coordinator, generation, and process", TestCanonicalIdentityContract);
         Run("doctor detects process identity ambiguity", TestDoctorDetectsProcessIdentityAmbiguity);
         Run("doctor detects external ModsConfig mutation", TestDoctorDetectsExternalModsConfigMutation);
         Run("doctor diagnoses unsupported state schema", TestDoctorRejectsUnsupportedStateSchema);

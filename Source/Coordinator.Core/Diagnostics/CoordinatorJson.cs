@@ -102,6 +102,9 @@ internal sealed partial class CoordinatorState
             ExitCode = effectiveExitCode,
             State = snapshot.Phase.ToString(),
             CoordinatorRoot = snapshot.CoordinatorRoot,
+            Identity = doctorCommand && request.DoctorAudit?.Identity != null
+                ? request.DoctorAudit.Identity
+                : BuildIdentityContract(snapshot, request.ProcessSnapshot),
             CoordinatorBuild = RunningBuildIdentity,
             PublishedCoordinatorBuild = PublishedCoordinatorBuildIdentity,
             CoordinatorBuildMatchesPublished = CoordinatorBuildMatchesPublished,

@@ -129,12 +129,32 @@ internal sealed partial class CoordinatorState
     {
         if (persistedStateLoadBlocked)
             return;
+        bool changed = true;
+
+        if (string.IsNullOrWhiteSpace(state.InstallationId))
+        {
+            state.InstallationId = Guid.NewGuid().ToString("N");
+            changed = true;
+        }
+        if (!string.Equals(state.CoordinatorInstanceId, coordinatorInstanceId, StringComparison.Ordinal))
+        {
+            if (!string.IsNullOrWhiteSpace(state.CoordinatorInstanceId))
+            {
+                state.PreviousCoordinatorInstanceId = state.CoordinatorInstanceId;
+                state.PreviousCoordinatorProcessId = state.CoordinatorProcessId;
+                state.PreviousCoordinatorStartedUtc = state.CoordinatorStartedUtc == default
+                    ? null : state.CoordinatorStartedUtc;
+            }
+            state.CoordinatorInstanceId = coordinatorInstanceId;
+            state.CoordinatorProcessId = Environment.ProcessId;
+            state.CoordinatorStartedUtc = processStartedUtc;
+            changed = true;
+        }
 
         BeginAgentEpochLocked();
         // The epoch is process-scoped. Persist the fresh epoch even when the
         // rest of the legacy state needs no normalization so a crash cannot
         // leave an old cursor silently durable.
-        bool changed = true;
         if (state.SchemaVersion != DevBridgeSchemaVersions.RuntimeState)
         {
             state.SchemaVersion = DevBridgeSchemaVersions.RuntimeState;

@@ -33,6 +33,7 @@ internal sealed partial class CoordinatorState
 
         PersistedState finalSnapshot = SnapshotForDoctor();
         report.GenerationHistory = generationHistory ?? BuildGenerationHistoryViewLocked(finalSnapshot.Generation);
+        report.Identity = BuildIdentityContract(finalSnapshot, processSnapshot);
         report.OperationalState = BuildOperationalState(finalSnapshot, processSnapshot, modsOwnership,
             report.GenerationHistory, report.NextGenerationConfig);
         report.Complete();
@@ -146,6 +147,17 @@ internal sealed partial class CoordinatorState
                 {
                     ["schemaVersion"] = (snapshot?.SchemaVersion ?? 0).ToString(CultureInfo.InvariantCulture),
                     ["supportedSchemaVersion"] = DevBridgeSchemaVersions.RuntimeState.ToString(CultureInfo.InvariantCulture)
+                });
+        }
+        List<AlternateRootContract> alternateRoots = FindAlternateRoots();
+        if (alternateRoots.Count > 0)
+        {
+            report.AddFinding(DoctorSeverities.Error, "DUPLICATE_INSTALLATION_ROOT",
+                "More than one DevBridge installation has durable state in the authoritative root's environment; no alternate root was adopted.",
+                "Coordinator", new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["authoritativeRoot"] = coordinatorRoot,
+                    ["alternateRoots"] = string.Join(",", alternateRoots.Select(value => value.Root))
                 });
         }
     }

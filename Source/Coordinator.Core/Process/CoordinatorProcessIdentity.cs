@@ -61,6 +61,15 @@ internal sealed partial class CoordinatorState
                 return false;
             if (record.ProcessId != processId || record.Generation != targetGeneration)
                 return false;
+            if (!string.IsNullOrWhiteSpace(record.InstallationId) &&
+                !string.Equals(record.InstallationId, state.InstallationId, StringComparison.Ordinal))
+                return false;
+            if (!string.IsNullOrWhiteSpace(record.RuntimeSlotId) &&
+                !string.Equals(record.RuntimeSlotId, state.RuntimeSlotId, StringComparison.Ordinal))
+                return false;
+            if (record.ProcessStartUtcTicks > 0 &&
+                record.ProcessStartUtcTicks != state.ProcessStartUtcTicks)
+                return false;
             return record.TimestampUtc.ToUniversalTime() >= launchStartedUtc.ToUniversalTime().AddSeconds(-2);
         }
         catch
@@ -446,6 +455,7 @@ internal sealed partial class CoordinatorState
 
         bool ownedProcessRunning = false;
         int matchingProcessCount = 0;
+        List<UnmanagedRimWorldProcess> matchingProcesses = new();
         List<UnmanagedRimWorldProcess> unmanagedProcesses = new();
         try
         {
@@ -467,10 +477,19 @@ internal sealed partial class CoordinatorState
                     throw ProcessInspection.Failure();
 
                 matchingProcessCount++;
+                matchingProcesses.Add(new UnmanagedRimWorldProcess
+                {
+                    ProcessId = processId,
+                    ProcessStartIdentity = startTicks
+                });
                 if (processId == state.ProcessId && startTicks == state.ProcessStartUtcTicks)
                     ownedProcessRunning = true;
                 else
-                    unmanagedProcesses.Add(new UnmanagedRimWorldProcess { ProcessId = processId });
+                    unmanagedProcesses.Add(new UnmanagedRimWorldProcess
+                    {
+                        ProcessId = processId,
+                        ProcessStartIdentity = startTicks
+                    });
             }
         }
         catch (ProcessInspectionException)
@@ -494,6 +513,7 @@ internal sealed partial class CoordinatorState
         {
             OwnedProcessRunning = ownedProcessRunning,
             MatchingProcessCount = matchingProcessCount,
+            MatchingProcesses = matchingProcesses,
             UnmanagedProcesses = unmanagedProcesses
         };
     }

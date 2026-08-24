@@ -156,6 +156,7 @@ internal sealed class DoctorAuditReport
     internal List<DoctorFinding> Findings { get; } = new();
     internal ComponentVersionReport Components { get; set; }
     internal DoctorOperationalState OperationalState { get; set; }
+    internal DevBridgeIdentityContract Identity { get; set; }
     internal GenerationHistoryView GenerationHistory { get; set; }
     internal ConfigurationHealth NextGenerationConfig { get; set; }
     internal List<DoctorNextAction> NextActions { get; } = new();

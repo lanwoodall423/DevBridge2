@@ -104,6 +104,7 @@ internal sealed partial class CoordinatorState
 
             RefreshRimBridgePolicyStateLocked();
             snapshot = CloneStateLocked();
+        request.ProcessSnapshot = processSnapshot;
             snapshot.BaselineFingerprint = ReadBaselineFingerprintLocked() ?? snapshot.BaselineFingerprint;
             snapshot.ModsConfigOwnership = CurrentModsConfigOwnershipLocked();
         }

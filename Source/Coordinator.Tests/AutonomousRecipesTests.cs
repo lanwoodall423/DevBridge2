@@ -175,6 +175,38 @@ internal static partial class OfflineTests
             "recipe failures must preserve the routed diagnostic instead of replacing it with a generic message");
     }
 
+    private static void TestSharedTransitionRecoveryPolicyIsStrictAndBounded()
+    {
+        Assert(RimBridgeTransitionRecoveryPolicy.IsTransitionFailureCode(
+                   "RIMBRIDGE_ENDPOINT_STALE") &&
+               RimBridgeTransitionRecoveryPolicy.IsTransitionFailureCode(
+                   "RIMBRIDGE_PROCESS_IDENTITY_MISMATCH") &&
+               RimBridgeTransitionRecoveryPolicy.IsTransitionFailureCode(
+                   "RIMBRIDGE_PROTOCOL_ERROR"),
+            "shared-transition recovery must recognize only the documented route failure family");
+        Assert(!RimBridgeTransitionRecoveryPolicy.IsTransitionFailureCode(
+                   "RIMBRIDGE_AUTH_FAILED") &&
+               !RimBridgeTransitionRecoveryPolicy.IsTransitionFailureCode(
+                   "RIMBRIDGE_INVALID_ARGUMENTS"),
+            "authentication and argument failures must never enter transition recovery");
+        Assert(RimBridgeTransitionRecoveryPolicy.HasAuthoritativeEvidence(
+                   "RIMBRIDGE_PROTOCOL_ERROR", 4, 5, 5, false) &&
+               RimBridgeTransitionRecoveryPolicy.HasAuthoritativeEvidence(
+                   "RIMBRIDGE_ENDPOINT_STALE", 4, 4, 5, true),
+            "a later accepted generation or queued target must authorize observation");
+        Assert(!RimBridgeTransitionRecoveryPolicy.HasAuthoritativeEvidence(
+                   "RIMBRIDGE_PROTOCOL_ERROR", 4, 4, 4, false) &&
+               !RimBridgeTransitionRecoveryPolicy.HasAuthoritativeEvidence(
+                   "RIMBRIDGE_ENDPOINT_STALE", 4, 3, 4, false),
+            "a protocol interruption without authoritative transition evidence must remain fatal");
+        Assert(RimBridgeTransitionRecoveryPolicy.CanReplay(
+                   RimBridgeOperationCategories.ReadOnly) &&
+               !RimBridgeTransitionRecoveryPolicy.CanReplay(
+                   RimBridgeOperationCategories.InGameMutation) &&
+               !RimBridgeTransitionRecoveryPolicy.CanReplay(
+                   RimBridgeOperationCategories.LifecycleMutation),
+            "only read-only operations may be automatically replayed");
+    }
     private static void TestRecipePlanningIsPureAndBounded()
     {
         using Fixture fixture = Fixture.ReadyWithoutLease();

@@ -112,6 +112,7 @@ internal static partial class OfflineTests
         Run("RimBridge companion absence is endpoint-only and nonfatal", TestRimBridgeCompanionUnavailable);
         Run("RimBridge routes read-only calls with identity and provenance", TestRimBridgeRouteForwarding);
         Run("recipe route failures preserve bounded diagnostics", TestRecipeRouteFailurePreservesDiagnostic);
+        Run("shared transition recovery policy is strict and bounded", TestSharedTransitionRecoveryPolicyIsStrictAndBounded);
         Run("RimBridge route blocks persistent and lifecycle mutations", TestRimBridgeRoutePolicyBlocks);
         Run("RimBridge route rejects stale generation and process identity", TestRimBridgeRouteIdentitySafety);
         Run("RimBridge route enforces valid shared leases", TestRimBridgeRouteLeaseSafety);
@@ -178,6 +179,7 @@ internal static partial class OfflineTests
         Run("doctor audits artifact permissions without writes", TestDoctorAuditsPermissions);
         Run("doctor detects stale readiness", TestDoctorDetectsStaleReadiness);
         Run("doctor findings are deterministic", TestDoctorFindingsAreDeterministic);
+        Run("canonical identity separates owner, coordinator, generation, and process", TestCanonicalIdentityContract);
         Run("doctor detects process identity ambiguity", TestDoctorDetectsProcessIdentityAmbiguity);
         Run("doctor detects external ModsConfig mutation", TestDoctorDetectsExternalModsConfigMutation);
         Run("doctor diagnoses unsupported state schema", TestDoctorRejectsUnsupportedStateSchema);
@@ -339,6 +341,7 @@ internal static partial class OfflineTests
         internal string PlayerLogPath { get; set; }
         internal IRimBridgeClient RouteClient { get; set; }
         internal IRimBridgeGenerationVerifier RouteVerifier { get; set; }
+        internal Action<CoordinatorState> BeforeRimBridgeRouteCompletion { get; set; }
         internal Action BeforeModsConfigWrite { get; set; }
         internal ICoordinatorFaultInjector FaultInjector { get; set; }
         internal IViewportEnvironmentController ViewportEnvironmentController { get; set; }
@@ -534,6 +537,7 @@ internal static partial class OfflineTests
                 PlayerLogPath = PlayerLogPath ?? Path.Combine(Root, "Player.log"),
                 RimBridgeClient = RouteClient,
                 RimBridgeGenerationVerifier = RouteVerifier,
+                BeforeRimBridgeRouteCompletion = BeforeRimBridgeRouteCompletion,
                 BeforeModsConfigWrite = BeforeModsConfigWrite,
                 ViewportEnvironmentController = ViewportEnvironmentController,
                 // The fixture applies fault plans after construction so the

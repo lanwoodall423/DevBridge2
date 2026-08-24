@@ -191,6 +191,8 @@ namespace DevBridge2
     {
         private static readonly object Gate = new object();
         private static string root;
+        private static string configuredInstallationId;
+        private static string configuredRuntimeSlotId;
         private static string launchId;
         private static int generation;
         private static bool configured;
@@ -210,6 +212,8 @@ namespace DevBridge2
             lock (Gate)
             {
                 root = Environment.GetEnvironmentVariable("DEVBRIDGE_ROOT");
+                configuredInstallationId = Environment.GetEnvironmentVariable("DEVBRIDGE_INSTALLATION_ID");
+                configuredRuntimeSlotId = Environment.GetEnvironmentVariable("DEVBRIDGE_RUNTIME_SLOT_ID");
                 launchId = Environment.GetEnvironmentVariable("DEVBRIDGE_LAUNCH_ID");
                 int.TryParse(Environment.GetEnvironmentVariable("DEVBRIDGE_GENERATION"), out generation);
                 configured = !string.IsNullOrWhiteSpace(root) && !string.IsNullOrWhiteSpace(launchId);
@@ -251,6 +255,8 @@ namespace DevBridge2
         internal static bool TryWriteReadiness()
         {
             string configuredRoot;
+            string configuredInstallationId;
+            string configuredRuntimeSlotId;
             string configuredLaunchId;
             int configuredGeneration;
             lock (Gate)
@@ -258,6 +264,8 @@ namespace DevBridge2
                 if (!configured || signaled)
                     return signaled;
                 configuredRoot = root;
+                configuredInstallationId = DevBridgeReadiness.configuredInstallationId;
+                configuredRuntimeSlotId = DevBridgeReadiness.configuredRuntimeSlotId;
                 configuredLaunchId = launchId;
                 configuredGeneration = generation;
             }
@@ -266,12 +274,25 @@ namespace DevBridge2
             string readinessPath = Path.Combine(runtime, "readiness.json");
             string temporaryPath = readinessPath + ".tmp-" + Guid.NewGuid().ToString("N");
             DateTime timestamp = DateTime.UtcNow;
-            int processId = Process.GetCurrentProcess().Id;
+            Process currentProcess = Process.GetCurrentProcess();
+            int processId = currentProcess.Id;
+            long processStartIdentity = 0;
+            try
+            {
+                processStartIdentity = currentProcess.StartTime.ToUniversalTime().Ticks;
+            }
+            catch
+            {
+                // The coordinator independently proves PID/start identity.
+            }
             string json = "{\n" +
                 "  \"schemaVersion\": " + DevBridgeSchemaVersions.Readiness.ToString(CultureInfo.InvariantCulture) + ",\n" +
+                "  \"installationId\": \"" + EscapeJson(configuredInstallationId ?? string.Empty) + "\",\n" +
+                "  \"runtimeSlotId\": \"" + EscapeJson(configuredRuntimeSlotId ?? string.Empty) + "\",\n" +
                 "  \"launchId\": \"" + EscapeJson(configuredLaunchId) + "\",\n" +
                 "  \"generation\": " + configuredGeneration.ToString(CultureInfo.InvariantCulture) + ",\n" +
                 "  \"processId\": " + processId.ToString(CultureInfo.InvariantCulture) + ",\n" +
+                "  \"processStartUtcTicks\": " + processStartIdentity.ToString(CultureInfo.InvariantCulture) + ",\n" +
                 "  \"timestampUtc\": \"" + timestamp.ToString("O", CultureInfo.InvariantCulture) + "\"\n" +
                 "}";
 

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Hardens the canonical identity contract with a durable installation/owner ID,
+  explicit coordinator, lifecycle-generation, and RimWorld PID/start identities,
+  transitional restart states, stale-state diagnostics, and duplicate-root findings
+  in status/readiness JSON and `doctor --json`.
+
 - Adds a bounded declared test-input surface for the existing built-in Quicktest path. `project
   resolve` accepts normalized boolean, integer, and string-enum inputs for Quicktest behavior;
   values participate in profile/generation fingerprints, frozen state, immutable manifests,

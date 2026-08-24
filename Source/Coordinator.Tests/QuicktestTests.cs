@@ -239,7 +239,7 @@ internal static partial class OfflineTests
         foreach (string forbidden in new[]
         {
             "GetCommandLineArgs", "--quicktest", "Input.GetMouseButton", "Event.current",
-            "SaveGame", ".rws", "Process.Start", "MapGenerator", "MousePosition"
+            "SaveGame", ".rws", "Process.Start(", "MapGenerator", "MousePosition"
         })
         {
             Assert(!quicktestSource.Contains(forbidden, StringComparison.Ordinal),

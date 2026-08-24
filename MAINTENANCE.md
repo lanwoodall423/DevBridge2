@@ -331,11 +331,17 @@ generation, launch, profile, PID, endpoint, tool, timestamp, and opaque tool evi
 
 Persistent `rimworld/set_mod_enabled` and `rimworld/reorder_mod`, plus lifecycle tools, are centrally
 denied with `RIMBRIDGE_OPERATION_BLOCKED_BY_DEVBRIDGE_POLICY`; use the exclusive `stop <lease-id>` →
-edit/profile or baseline reconciliation → `ensure-ready <lease-id>` workflow instead. A missing bridge,
-stale identity, authentication failure, tool-not-found, timeout, or protocol error is reported as a
-bounded route failure and never starts an automatic restart. `bridge policy` and `status --json` expose
-the policy without credentials. Routing is optional and preserves direct live-game RimBridge use when
-DevBridge integration is off or the endpoint is unavailable.
+edit/profile or baseline reconciliation → `ensure-ready <lease-id>` workflow instead. A direct bridge
+call still reports a missing bridge, stale identity, authentication failure, tool-not-found, timeout,
+or protocol error as a bounded route failure and never starts an automatic restart. During an
+authoritatively queued or accepted generation transition, an autonomous recipe may discard that stale
+route, observe the coordinator-owned transition through `wait-ready`, reverify the new endpoint,
+companion, process identity, and generation, then replay only a read-only operation. The recipe's
+`maxCoordinatorRefreshes` budget bounds observation/rebind attempts; external transitions do not consume
+its RimWorld-launch budget. Supplied leases are never stolen or silently rebound, and ambiguous
+mutations are never replayed. `bridge policy` and `status --json` expose the policy without credentials.
+Routing is optional and preserves direct live-game RimBridge use when DevBridge integration is off or the
+endpoint is unavailable.
 
 ### ModsConfig ownership boundary
 

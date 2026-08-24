@@ -168,6 +168,11 @@ internal sealed class BridgeRequest
     // Server-side only.  This is populated after dispatch so the normal JSON
     // response can carry a routed result without making route state durable.
     internal RimBridgeRouteResult RimBridgeRouteResult { get; set; }
+    // Server-side only. Status/doctor retain the census used for their
+    // lifecycle decision so identity JSON cannot silently describe another
+    // observation.
+    internal ProcessStatusSnapshot ProcessSnapshot { get; set; }
+
     // Server-side only. Doctor caches its complete audit here so JSON
     // serialization cannot rerun checks or observe a different state.
     internal DoctorAuditReport DoctorAudit { get; set; }
@@ -222,6 +227,17 @@ internal sealed class PersistedState
     // Version 0 is the supported pre-schema format. It is upgraded in place
     // after the rest of the state has been validated.
     public int SchemaVersion { get; set; }
+    // Stable installation identity. This is generated once in the durable
+    // state file and never replaced by coordinator or RimWorld lifecycle
+    // churn.
+    public string InstallationId { get; set; }
+    public string CoordinatorInstanceId { get; set; }
+    public int CoordinatorProcessId { get; set; }
+    public DateTime CoordinatorStartedUtc { get; set; }
+    public string PreviousCoordinatorInstanceId { get; set; }
+    public int PreviousCoordinatorProcessId { get; set; }
+    public DateTime? PreviousCoordinatorStartedUtc { get; set; }
+
     public string CoordinatorRoot { get; set; }
     public string RuntimeSlotId { get; set; }
     public int Generation { get; set; }
@@ -336,12 +352,159 @@ internal sealed class PersistedState
     public List<AggregateGenerationEvidence> AggregateGenerations { get; set; } = new();
     public RimBridgeIntegrationState RimBridge { get; set; } = new();
 
+
     // Agent API sequencing is durable only for the lifetime of the current
     // coordinator process. A new process creates a new epoch and clears the
     // bounded journal, so an old client cursor can never be accepted silently.
     public string AgentEpoch { get; set; }
     public long AgentSequence { get; set; }
     public List<AgentChangeRecord> AgentChangeJournal { get; set; } = new();
+}
+internal sealed class DevBridgeIdentityContract
+{
+    [JsonPropertyName("contract")]
+    public string Contract { get; init; } = DevBridgeSchemaVersions.IdentityContract;
+
+    [JsonPropertyName("schemaVersion")]
+    public int SchemaVersion { get; init; } = DevBridgeSchemaVersions.Identity;
+
+    [JsonPropertyName("authoritativeRoot")]
+    public string AuthoritativeRoot { get; init; }
+
+    [JsonPropertyName("rootSelectionSource")]
+    public string RootSelectionSource { get; init; }
+
+    [JsonPropertyName("installationId")]
+    public string InstallationId { get; init; }
+
+    [JsonPropertyName("ownerId")]
+    public string OwnerId { get; init; }
+
+    [JsonPropertyName("runtimeSlotId")]
+    public string RuntimeSlotId { get; init; }
+
+    [JsonPropertyName("coordinator")]
+    public CoordinatorIdentityContract Coordinator { get; init; }
+
+    [JsonPropertyName("runtime")]
+    public RuntimeIdentityContract Runtime { get; init; }
+
+    [JsonPropertyName("expectedRimWorldProcess")]
+    public RimWorldIdentityContract ExpectedRimWorldProcess { get; init; }
+
+    [JsonPropertyName("currentRimWorldProcesses")]
+    public List<RimWorldIdentityContract> CurrentRimWorldProcesses { get; init; } = new();
+
+    [JsonPropertyName("protocol")]
+    public ProtocolIdentityContract Protocol { get; init; }
+
+    [JsonPropertyName("staleState")]
+    public StaleStateContract StaleState { get; init; }
+
+    [JsonPropertyName("alternateRoots")]
+    public List<AlternateRootContract> AlternateRoots { get; init; } = new();
+}
+
+internal sealed class CoordinatorIdentityContract
+{
+    [JsonPropertyName("instanceId")]
+    public string InstanceId { get; init; }
+
+    [JsonPropertyName("status")]
+    public string Status { get; init; }
+
+    [JsonPropertyName("processId")]
+    public int ProcessId { get; init; }
+
+    [JsonPropertyName("startedUtc")]
+    public DateTime StartedUtc { get; init; }
+
+    [JsonPropertyName("previousInstanceId")]
+    public string PreviousInstanceId { get; init; }
+
+    [JsonPropertyName("previousStatus")]
+    public string PreviousStatus { get; init; }
+}
+
+internal sealed class RuntimeIdentityContract
+{
+    [JsonPropertyName("generation")]
+    public int Generation { get; init; }
+
+    [JsonPropertyName("targetGeneration")]
+    public int? TargetGeneration { get; init; }
+
+    [JsonPropertyName("launchGeneration")]
+    public int LaunchGeneration { get; init; }
+
+    [JsonPropertyName("lifecycleState")]
+    public string LifecycleState { get; init; }
+
+    [JsonPropertyName("transition")]
+    public string Transition { get; init; }
+}
+
+internal sealed class RimWorldIdentityContract
+{
+    [JsonPropertyName("pid")]
+    public int ProcessId { get; init; }
+
+    [JsonPropertyName("startIdentity")]
+    public long StartIdentity { get; init; }
+
+    [JsonPropertyName("generation")]
+    public int Generation { get; init; }
+
+    [JsonPropertyName("launchId")]
+    public string LaunchId { get; init; }
+
+    [JsonPropertyName("present")]
+    public bool Present { get; init; }
+
+    [JsonPropertyName("matchesExpected")]
+    public bool MatchesExpected { get; init; }
+}
+
+internal sealed class ProtocolIdentityContract
+{
+    [JsonPropertyName("coordinatorProtocolMajor")]
+    public int CoordinatorProtocolMajor { get; init; } = DevBridgeSchemaVersions.CoordinatorProtocolMajor;
+
+    [JsonPropertyName("coordinatorContract")]
+    public string CoordinatorContract { get; init; } = DevBridgeSchemaVersions.CoordinatorProtocolContract;
+
+    [JsonPropertyName("runtimeStateContract")]
+    public string RuntimeStateContract { get; init; } = DevBridgeSchemaVersions.RuntimeStateContract;
+
+    [JsonPropertyName("readinessContract")]
+    public string ReadinessContract { get; init; } = DevBridgeSchemaVersions.ReadinessContract;
+}
+
+internal sealed class StaleStateContract
+{
+    [JsonPropertyName("expectedProcessStatus")]
+    public string ExpectedProcessStatus { get; init; }
+
+    [JsonPropertyName("retiredRegistrationCount")]
+    public int RetiredRegistrationCount { get; init; }
+
+    [JsonPropertyName("supersededGeneration")]
+    public int? SupersededGeneration { get; init; }
+
+    [JsonPropertyName("cleanupPolicy")]
+    public string CleanupPolicy { get; init; }
+}
+
+internal sealed class AlternateRootContract
+{
+    [JsonPropertyName("root")]
+    public string Root { get; init; }
+
+    [JsonPropertyName("installationId")]
+    public string InstallationId { get; init; }
+
+    [JsonPropertyName("statePath")]
+    public string StatePath { get; init; }
 }
 
 internal sealed class ProjectIntentRegistration
@@ -685,6 +848,8 @@ internal sealed class JsonCommandResponse
     public RimBridgeIntegrationState RimBridge { get; set; }
 
     // Populated only by the explicit `bridge endpoint` command. Ordinary status,
+    [JsonPropertyName("identity")]
+    public DevBridgeIdentityContract Identity { get; set; }
     // doctor, and lifecycle responses leave this null so credentials cannot leak.
     [JsonPropertyName("rimBridgeEndpoint")]
     public JsonRimBridgeEndpoint RimBridgeEndpoint { get; set; }
@@ -941,11 +1106,22 @@ internal sealed class ReadinessRecord
     public int Generation { get; set; }
     public int ProcessId { get; set; }
     public DateTime TimestampUtc { get; set; }
+    public string InstallationId { get; set; }
+    public string RuntimeSlotId { get; set; }
+    public long ProcessStartUtcTicks { get; set; }
 }
 
 internal sealed class UnmanagedRimWorldProcess
 {
     public int ProcessId { get; set; }
+    public long ProcessStartIdentity { get; set; }
+}
+internal sealed class ProcessStatusSnapshot
+{
+    internal bool OwnedProcessRunning { get; init; }
+    internal int MatchingProcessCount { get; init; }
+    internal List<UnmanagedRimWorldProcess> UnmanagedProcesses { get; init; } = new();
+    internal List<UnmanagedRimWorldProcess> MatchingProcesses { get; init; } = new();
 }
 
 internal sealed class ProcessLaunchRequest
@@ -1061,6 +1237,10 @@ internal sealed class CoordinatorOptions
     internal string PlayerLogPath { get; init; }
     internal IRimBridgeClient RimBridgeClient { get; init; }
     internal IRimBridgeGenerationVerifier RimBridgeGenerationVerifier { get; init; }
+    // Offline tests use this seam to deterministically advance the shared
+    // generation between a wire response and its strict completion check.
+    // Production never supplies it.
+    internal Action<CoordinatorState> BeforeRimBridgeRouteCompletion { get; init; }
     internal Action BeforeModsConfigWrite { get; init; }
     internal ICoordinatorFaultInjector FaultInjector { get; set; }
     internal IViewportEnvironmentController ViewportEnvironmentController { get; init; } =
@@ -1093,6 +1273,7 @@ internal sealed class CoordinatorOptions
             PlayerLogPath = PlayerLogPath,
             RimBridgeClient = RimBridgeClient,
             RimBridgeGenerationVerifier = RimBridgeGenerationVerifier,
+            BeforeRimBridgeRouteCompletion = BeforeRimBridgeRouteCompletion,
             BeforeModsConfigWrite = BeforeModsConfigWrite,
             FaultInjector = FaultInjector,
             ViewportEnvironmentController = ViewportEnvironmentController
@@ -2203,6 +2384,7 @@ internal sealed partial class CoordinatorState
     private BridgePhase lastTracedPhase;
     private Dictionary<string, string> agentObservation;
     private bool agentObservationInitialized;
+    private readonly string coordinatorInstanceId = Guid.NewGuid().ToString("N");
 
     internal TimeSpan ReadinessTimeoutForTesting => options.ReadinessTimeout;
     internal DateTime ProcessStartedUtcForTesting => processStartedUtc;
@@ -2239,6 +2421,18 @@ internal sealed partial class CoordinatorState
 
     internal bool ShutdownRequested => Volatile.Read(ref shutdownRequested) != 0;
     internal CancellationToken ShutdownToken => shutdownCancellation.Token;
+
+    internal void ReplaceStateForTesting(PersistedState replacement)
+    {
+        if (replacement == null)
+            throw new ArgumentNullException(nameof(replacement));
+        lock (gate)
+        {
+            state = replacement;
+            SaveStateLocked();
+            Monitor.PulseAll(gate);
+        }
+    }
 
     internal void RequestShutdown()
     {
@@ -2293,13 +2487,6 @@ internal sealed partial class CoordinatorState
         internal bool HasProjects { get; init; }
         internal List<string> Projects { get; init; } = new();
         internal List<TestInputAssignment> TestInputs { get; init; } = new();
-    }
-
-    private sealed class ProcessStatusSnapshot
-    {
-        internal bool OwnedProcessRunning { get; init; }
-        internal int MatchingProcessCount { get; init; }
-        internal List<UnmanagedRimWorldProcess> UnmanagedProcesses { get; init; } = new();
     }
 
     private sealed class RimBridgeRoutePreparation

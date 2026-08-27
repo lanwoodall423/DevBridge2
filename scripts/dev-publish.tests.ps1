@@ -86,6 +86,11 @@ function Assert-True {
 try {
     New-Item -ItemType Directory -Force -Path $testRoot | Out-Null
 
+    $previousTestRimWorldPath = [Environment]::GetEnvironmentVariable('DEVBRIDGE_TEST_RIMWORLD_PATH')
+    $testRimWorldPath = Join-Path $testRoot 'RimWorldWin64.exe'
+    [IO.File]::WriteAllText($testRimWorldPath, 'test runtime identity')
+    $env:DEVBRIDGE_TEST_RIMWORLD_PATH = $testRimWorldPath
+
     # Build/deploy once, rebuild the identical bytes, then change only the
     # deployed runtimeconfig (valid JSON whitespace) to prove the graceful
     # shutdown path is taken before a changed coordinator replacement.
@@ -173,6 +178,7 @@ try {
     Write-Host 'DEV PUBLISH TESTS PASS'
 }
 finally {
+    [Environment]::SetEnvironmentVariable('DEVBRIDGE_TEST_RIMWORLD_PATH', $previousTestRimWorldPath)
     if ([IO.Directory]::Exists($testRoot)) {
         [IO.Directory]::Delete($testRoot, $true)
     }

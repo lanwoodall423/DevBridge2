@@ -241,6 +241,21 @@ The tool returns this token-free schema (nullable values are `null` when unavail
 }
 ```
 
+#### Canonical runtime identity
+
+Managed live commands require an explicit identity boundary. Configure the machine-local
+`C:\RimDev\.rimdev\workspace.json` with `rimWorldRoot`, `rimWorldExecutable`,
+`devBridgeRuntimeRoot` (`<rimWorldRoot>\Mods\DevBridge2`), and `devBridgeSourceRoot`; add
+`devBridgePinnedWorktreeRoot` when a pinned compatibility worktree is used. Per-process
+`RIMWORLD_ROOT` and `RIMWORLD_EXECUTABLE` overrides are deliberate and take precedence.
+
+DevBridge never derives a game executable or live state root from the current directory, source
+checkout, or pinned worktree. If the installed runtime is requested through a source wrapper,
+the wrapper is recovered to the configured installed mod root only after the canonical game root,
+executable, package ID, and installed coordinator layout are verified. Doctor reports distinct
+configuration, executable, runtime-root mismatch, and installed-runtime errors with bounded
+identity fields and a `nextAction`.
+
 It reads the inherited `DEVBRIDGE_ROOT`, launch, generation, profile, and baseline environment
 values, using `Runtime/state.json` only as a durable fallback, and derives the current RimWorld
 process identity. It never returns the RimBridge token. Missing or malformed launch values return

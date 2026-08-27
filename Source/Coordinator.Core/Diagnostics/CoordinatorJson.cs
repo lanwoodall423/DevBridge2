@@ -102,6 +102,12 @@ internal sealed partial class CoordinatorState
             ExitCode = effectiveExitCode,
             State = snapshot.Phase.ToString(),
             CoordinatorRoot = snapshot.CoordinatorRoot,
+            RimWorldRoot = rimWorldRoot,
+            RimWorldExecutable = rimWorldExe,
+            DevBridgeSourceRoot = runtimeIdentity?.DevBridgeSourceRoot,
+            DevBridgeRuntimeRoot = runtimeIdentity?.DevBridgeRuntimeRoot ?? coordinatorRoot,
+            DevBridgePinnedWorktreeRoot = runtimeIdentity?.DevBridgePinnedWorktreeRoot,
+            RuntimeIdentity = runtimeIdentity,
             Identity = doctorCommand && request.DoctorAudit?.Identity != null
                 ? request.DoctorAudit.Identity
                 : BuildIdentityContract(snapshot, request.ProcessSnapshot),
@@ -315,6 +321,7 @@ internal sealed partial class CoordinatorState
             }
         }
 
+        int doctorFindingsTotalCount = 0;
         if (doctorCommand)
         {
             DoctorAuditReport audit = request.DoctorAudit ?? new DoctorAuditReport();
@@ -328,6 +335,7 @@ internal sealed partial class CoordinatorState
             response.CurrentGenerationTrust = audit.OperationalState?.CurrentGenerationTrust;
             response.NextGenerationConfig = audit.NextGenerationConfig ??
                 audit.OperationalState?.NextGenerationConfig;
+            doctorFindingsTotalCount = audit.FindingsTotalCount;
             if (audit.FirstError != null)
             {
                 response.ErrorCode = audit.FirstError.Code;
@@ -358,6 +366,17 @@ internal sealed partial class CoordinatorState
                 : RecoveryGuidance.For(response.ErrorCode, response.Error);
         }
 
+        if (doctorCommand || statusCommand)
+        {
+            string unbounded = JsonSerializer.Serialize(response, CoordinatorSerialization.JsonOptions);
+            if (Encoding.UTF8.GetByteCount(unbounded) >
+                DevBridgeSchemaVersions.CoordinatorMaxOutputPayloadBytes)
+            {
+                BoundDiagnosticResponse(response, doctorCommand ? "doctor" : "status",
+                    doctorFindingsTotalCount);
+            }
+        }
+
         if (doctorCommand || statusCommand || historyCommand || projectResolveCommand)
         {
             string serialized = JsonSerializer.Serialize(response, CoordinatorSerialization.JsonOptions);
@@ -365,6 +384,154 @@ internal sealed partial class CoordinatorState
             response = JsonSerializer.Deserialize<JsonCommandResponse>(redacted, CoordinatorSerialization.JsonOptions) ?? response;
         }
         return response;
+    }
+
+    private static void BoundDiagnosticResponse(JsonCommandResponse response, string operation,
+        int findingsTotalCount = 0)
+    {
+        DiagnosticPayloadMetadata metadata = new()
+        {
+            Operation = operation,
+            ConfiguredLimitBytes = DevBridgeSchemaVersions.CoordinatorMaxOutputPayloadBytes,
+            Summarized = true
+        };
+        response.PayloadMetadata = metadata;
+
+        response.RequestedProjects = BoundDiagnosticObject(response.RequestedProjects, metadata, "requestedProjects");
+        response.ResolvedProjectPackageIds = BoundDiagnosticObject(response.ResolvedProjectPackageIds, metadata,
+            "resolvedProjectPackageIds");
+        response.ResolvedMods = BoundDiagnosticObject(response.ResolvedMods, metadata, "resolvedMods");
+        response.TestInputs = BoundDiagnosticObject(response.TestInputs, metadata, "testInputs");
+        response.FrozenRequestedProjects = BoundDiagnosticObject(response.FrozenRequestedProjects, metadata,
+            "frozenRequestedProjects");
+        response.FrozenResolvedProjectPackageIds = BoundDiagnosticObject(
+            response.FrozenResolvedProjectPackageIds, metadata, "frozenResolvedProjectPackageIds");
+        response.FrozenResolvedMods = BoundDiagnosticObject(response.FrozenResolvedMods, metadata,
+            "frozenResolvedMods");
+        response.FrozenTestInputs = BoundDiagnosticObject(response.FrozenTestInputs, metadata, "frozenTestInputs");
+        response.FrozenRegistrationIds = BoundDiagnosticObject(response.FrozenRegistrationIds, metadata,
+            "frozenRegistrationIds");
+        response.FrozenRegistrations = BoundDiagnosticObject(response.FrozenRegistrations, metadata,
+            "frozenRegistrations");
+        response.Findings = BoundDiagnosticObject(response.Findings, metadata, "findings",
+            DiagnosticResponseLimits.MaxFindingCount);
+        response.ActiveProjectIntents = BoundDiagnosticObject(response.ActiveProjectIntents, metadata,
+            "activeProjectIntents");
+        response.QueuedProjectIntents = BoundDiagnosticObject(response.QueuedProjectIntents, metadata,
+            "queuedProjectIntents");
+        response.AggregateGenerations = BoundDiagnosticObject(response.AggregateGenerations, metadata,
+            "aggregateGenerations");
+        response.MissingProjects = BoundDiagnosticObject(response.MissingProjects, metadata, "missingProjects");
+        response.Leases = BoundDiagnosticObject(response.Leases, metadata, "leases");
+        response.Checks = BoundDiagnosticObject(response.Checks, metadata, "checks");
+        response.CrashIsolation = BoundDiagnosticObject(response.CrashIsolation, metadata, "crashIsolation");
+        response.GenerationHistory = BoundDiagnosticObject(response.GenerationHistory, metadata,
+            "generationHistory");
+        response.NextActions = BoundDiagnosticObject(response.NextActions, metadata, "nextActions");
+        response.Error = BoundDiagnosticText(response.Error);
+        response.ProfileConflict = BoundDiagnosticText(response.ProfileConflict);
+        response.TerminalFailureDetail = BoundDiagnosticText(response.TerminalFailureDetail);
+        response.TerminalFailureExceptionMessage = BoundDiagnosticText(response.TerminalFailureExceptionMessage);
+        response.TerminalFailureDiagnosticDetail = BoundDiagnosticText(response.TerminalFailureDiagnosticDetail);
+
+        if (findingsTotalCount > 0)
+        {
+            metadata.Collections["findings"] = new DiagnosticCollectionSummary
+            {
+                TotalCount = findingsTotalCount,
+                SampleCount = response.Findings?.Count ?? 0,
+                Truncated = findingsTotalCount > (response.Findings?.Count ?? 0)
+            };
+        }
+        metadata.Truncated = metadata.Collections.Values.Any(value => value.Truncated);
+        metadata.EstimatedSerializedBytes = Encoding.UTF8.GetByteCount(
+            JsonSerializer.Serialize(response, CoordinatorSerialization.JsonOptions));
+    }
+
+    private static T BoundDiagnosticObject<T>(T source, DiagnosticPayloadMetadata metadata, string path,
+        int maxSampleCount = DiagnosticResponseLimits.MaxSampleCount)
+    {
+        if (source is null)
+            return source;
+
+        string json = JsonSerializer.Serialize(source, CoordinatorSerialization.JsonOptions);
+        using JsonDocument document = JsonDocument.Parse(json);
+        using MemoryStream stream = new();
+        using (Utf8JsonWriter writer = new(stream))
+        {
+            WriteBoundedDiagnosticJson(document.RootElement, writer, metadata, path, maxSampleCount);
+            writer.Flush();
+        }
+
+        return JsonSerializer.Deserialize<T>(stream.ToArray(), CoordinatorSerialization.JsonOptions);
+    }
+
+    private static void WriteBoundedDiagnosticJson(JsonElement element, Utf8JsonWriter writer,
+        DiagnosticPayloadMetadata metadata, string path, int maxSampleCount = DiagnosticResponseLimits.MaxSampleCount)
+    {
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.Object:
+                writer.WriteStartObject();
+                IEnumerable<JsonProperty> properties = element.EnumerateObject();
+                if (path.EndsWith("projectRequesters", StringComparison.Ordinal) ||
+                    path.EndsWith("originalDiagnosticMetadata", StringComparison.Ordinal))
+                {
+                    List<JsonProperty> selected = properties.OrderBy(value => value.Name, StringComparer.Ordinal)
+                        .Take(DiagnosticResponseLimits.MaxSampleCount).ToList();
+                    RecordDiagnosticCollection(metadata, path, element.EnumerateObject().Count(), selected.Count);
+                    properties = selected;
+                }
+                foreach (JsonProperty property in properties)
+                {
+                    writer.WritePropertyName(property.Name);
+                    string childPath = path + "." + property.Name;
+                    WriteBoundedDiagnosticJson(property.Value, writer, metadata, childPath);
+                }
+                writer.WriteEndObject();
+                break;
+            case JsonValueKind.Array:
+                int total = element.GetArrayLength();
+                int start = Math.Max(0, total - maxSampleCount);
+                RecordDiagnosticCollection(metadata, path, total, total - start);
+                writer.WriteStartArray();
+                int index = 0;
+                foreach (JsonElement item in element.EnumerateArray())
+                {
+                    if (index++ < start)
+                        continue;
+                    WriteBoundedDiagnosticJson(item, writer, metadata, path + "[]");
+                }
+                writer.WriteEndArray();
+                break;
+            case JsonValueKind.String:
+                writer.WriteStringValue(BoundDiagnosticText(element.GetString()));
+                break;
+            default:
+                element.WriteTo(writer);
+                break;
+        }
+    }
+
+    private static void RecordDiagnosticCollection(DiagnosticPayloadMetadata metadata, string path,
+        int total, int sample)
+    {
+        metadata.Collections[path] = new DiagnosticCollectionSummary
+        {
+            TotalCount = total,
+            SampleCount = sample,
+            Truncated = total > sample
+        };
+    }
+
+    private static string BoundDiagnosticText(string value)
+    {
+        string redacted = DiagnosticRedactor.Text(value);
+        if (string.IsNullOrEmpty(redacted) ||
+            redacted.Length <= DiagnosticResponseLimits.MaxDiagnosticStringLength)
+            return redacted;
+        const string suffix = "...[diagnostic text truncated]";
+        return redacted[..(DiagnosticResponseLimits.MaxDiagnosticStringLength - suffix.Length)] + suffix;
     }
 
     private static RimBridgeIntegrationState RedactedRimBridge(RimBridgeIntegrationState source)

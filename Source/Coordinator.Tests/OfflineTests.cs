@@ -180,6 +180,22 @@ internal static partial class OfflineTests
         Run("doctor detects stale readiness", TestDoctorDetectsStaleReadiness);
         Run("doctor findings are deterministic", TestDoctorFindingsAreDeterministic);
         Run("canonical identity separates owner, coordinator, generation, and process", TestCanonicalIdentityContract);
+        Run("installed runtime resolves canonical RimWorld identity",
+            RuntimeIdentityTests.InstalledRuntimeRootResolvesCanonicalRimWorld);
+        Run("source checkout cannot redefine RimWorld identity",
+            RuntimeIdentityTests.SourceCheckoutCannotRedefineRimWorld);
+        Run("pinned worktree cannot redefine RimWorld identity",
+            RuntimeIdentityTests.PinnedWorktreeCannotRedefineRimWorld);
+        Run("machine configuration resolves without RimWorld environment",
+            RuntimeIdentityTests.MachineConfigurationWorksWithoutRimWorldEnvironment);
+        Run("source/runtime confusion has precise classification",
+            RuntimeIdentityTests.SourceRuntimeConfusionHasPreciseClassification);
+        Run("missing executable is distinct from wrong path derivation",
+            RuntimeIdentityTests.MissingExecutableIsNotWrongPathDerivation);
+        Run("explicit valid identity override wins",
+            RuntimeIdentityTests.ExplicitValidOverrideWins);
+        Run("invalid identity override does not fall back",
+            RuntimeIdentityTests.InvalidExplicitOverrideDoesNotFallBack);
         Run("doctor detects process identity ambiguity", TestDoctorDetectsProcessIdentityAmbiguity);
         Run("doctor detects external ModsConfig mutation", TestDoctorDetectsExternalModsConfigMutation);
         Run("doctor diagnoses unsupported state schema", TestDoctorRejectsUnsupportedStateSchema);
@@ -187,6 +203,8 @@ internal static partial class OfflineTests
         Run("doctor reports lease and maintenance conflicts", TestDoctorReportsLeaseAndMaintenanceConflicts);
         Run("doctor reports crash isolation and safe actions", TestDoctorReportsCrashIsolationAndSafeActions);
         Run("doctor redacts secret-shaped diagnostic values", TestDoctorRedactsSecrets);
+        Run("doctor bounds accumulated diagnostic state", TestDoctorBoundsAccumulatedDiagnosticState);
+        Run("oversized doctor fallback is bounded and truthful", TestOversizedDiagnosticFallbackIsBounded);
         Run("structured recovery guidance is safe and parameterized", TestStructuredRecoveryGuidance);
         Run("wrapper propagates native exit codes", DevBridgeWrapperTests.Run);
         Run("named-pipe stop completes the originating client", TestNamedPipeStopCompletesClient);
@@ -238,6 +256,7 @@ internal static partial class OfflineTests
         Run("satisfied recipe execution avoids restart", TestRecipeAlreadySatisfiedAvoidsRestart);
         Run("recipe execution uses one launch and enforces caller budget", TestRecipeRunUsesOneLaunchAndEnforcesBudget);
         Run("recipe budgets cannot weaken coordinator safety limits", TestRecipeRunBudgetCannotWeakenCoordinatorLimit);
+        Run("successful equivalent recipes retire the repeated-failure guard", TestSuccessfulRecipeRetiresEquivalentFailureGuard);
         Run("supplied lease refusals do not poison the repeated-failure guard", TestSuppliedLeaseRefusalDoesNotPoisonRepeatedGuard);
         Run("legacy supplied lease evidence does not trigger the repeated-failure guard", TestLegacySuppliedLeaseEvidenceDoesNotTriggerRepeatedGuard);
         Run("failure fingerprints normalize noise and preserve context changes", TestFailureFingerprintNormalization);

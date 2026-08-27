@@ -44,6 +44,27 @@ short slot is rejected with migration guidance rather than silently rebound. Ful
 scope-ticket, launch-key, and request identifiers are used for authorization and equality; short
 prefixes are display-only.
 
+### Runtime identities
+
+DevBridge keeps source, installed runtime, pinned worktree, and game identities separate:
+`devBridgeSourceRoot`, `devBridgeRuntimeRoot`, `devBridgePinnedWorktreeRoot`,
+`rimWorldRoot`, and `rimWorldExecutable`. The installed runtime is the
+`<rimWorldRoot>\Mods\DevBridge2` copy; a source checkout or compatibility worktree is never
+accepted as that runtime root.
+
+RimWorld resolution precedence is deterministic:
+
+1. deliberate `RIMWORLD_ROOT`/`RIMWORLD_EXECUTABLE` overrides;
+2. the canonical machine/workspace `.rimdev/workspace.json` values;
+3. a validated installed-layout fallback only when the requested root is directly below a
+   `Mods` directory and its sibling game root contains `RimWorldWin64.exe`.
+
+`RIMDEV_WORKSPACE_CONFIG` may identify the canonical workspace file without changing the
+resolution order. Missing canonical executables, invalid configuration, runtime-root/source-root
+mismatches, and missing installed runtime layout have distinct error codes. Doctor and all
+preflight failures expose the bounded attempted executable, resolution source, identity roots,
+existence flags, and next action. Tooling-only operations do not resolve a live game identity.
+
 Leases are durable, owner/session-bound records. The lease ID and stable agent identity authorize
 renew/end/stop/ensure-ready operations. Connected test sessions renew only while connected. Expiry,
 disconnect, and restart recovery never transfer authorization to another owner.
@@ -302,9 +323,14 @@ source project live in different authoritative roots. RimLiaison uses one target
 the DevBridge coordinator root; the owner still validates every resolved source path before build.
 
 The `devbridge-mod-development/v1` descriptor contains only the project alias, source `.csproj`,
-`Debug`/`Release` configuration, expected assembly, deployment-relative path, and declared recipe.
-The transaction plans first, builds into bounded staging, compares SHA-256 bytes, then uses the
-existing project registration, lease, `stop`, deployment, `ensure-ready`, and recipe contracts. A
+`Debug`/`Release` configuration, expected assembly, deployment-relative path, declared recipe, and
+optional scalar `buildProperties`. `scripts/mod-test.ps1` queries the coordinator before building and
+uses its canonical `RIMWORLD_ROOT`-derived installation root as `-p:RIMWORLD_DIR=...`; a descriptor
+`buildProperties.RIMWORLD_DIR`/`RimWorldDir` value deliberately overrides discovery. The resolved
+root must contain `RimWorldWin64_Data\Managed\Assembly-CSharp.dll`, otherwise the transaction fails
+before MSBuild with `RIMWORLD_DIR_UNRESOLVED`. Mod authors and agents therefore do not set
+`RIMWORLD_DIR` manually when invoking DevBridge2.
+The transaction reuses existing project registration, lease, `stop`, deployment, `ensure-ready`, and recipe contracts. A
 caller may pass its complete `lease-<32 hex>` capability with `-LeaseId`; ownership is validated,
 never transferred, and never ended by the transaction. A byte-identical artifact with an already
 satisfied generation/recipe is a no-op. On uncertainty the report preserves maintenance ownership
@@ -324,6 +350,13 @@ boundary so a noisy compiler cannot accumulate unbounded output or require a Pow
 a worker thread. `scripts/process-e2e.tests.ps1 -OnlyBuildFailure` proves this owner-side
 serialization with an intentionally invalid C# project; consumers persist and assemble the
 user-facing export rather than rerunning the build or reading an unbounded log.
+
+Failed controlled builds are compared only with a native build that first restores into its
+transaction-local intermediate directory and then builds with `--no-restore`. A restore/build
+failure in that reference path is reported as `DEVELOPMENT_DIAGNOSTIC_COMPARISON_FAILED` with
+`comparisonValid=false`; it cannot lower project ownership confidence through an incomparable
+diagnostic. Causal extraction gives explicit fatal prerequisites such as `RIMWORLD_DIR is required`
+priority over preceding MSB3245 reference warnings.
 
 RimLiaison uses this transaction in owner mode with `-SourceFingerprint` and `-SkipRecipe`: DevBridge2
 performs the build/deploy/generation/readiness work once, then RimLiaison runs the selected affected

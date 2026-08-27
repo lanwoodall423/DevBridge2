@@ -48,6 +48,7 @@
     <Compile Include="BridgeToolsDeploymentTests.cs" />
     <Compile Include="AgentSurfaceTests.cs" />
     <Compile Include="IdentityContractTests.cs" />
+    <Compile Include="RuntimeIdentityTests.cs" />
     <Compile Include="AutonomousRecipesTests.cs" />
     <Compile Include="FailureEvidenceTests.cs" />
   </ItemGroup>

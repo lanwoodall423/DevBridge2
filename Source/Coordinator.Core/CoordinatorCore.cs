@@ -737,6 +737,24 @@ internal sealed class JsonCommandResponse
     [JsonPropertyName("coordinatorRoot")]
     public string CoordinatorRoot { get; set; }
 
+    [JsonPropertyName("rimworldRoot")]
+    public string RimWorldRoot { get; set; }
+
+    [JsonPropertyName("rimworldExecutable")]
+    public string RimWorldExecutable { get; set; }
+
+    [JsonPropertyName("devBridgeSourceRoot")]
+    public string DevBridgeSourceRoot { get; set; }
+
+    [JsonPropertyName("devBridgeRuntimeRoot")]
+    public string DevBridgeRuntimeRoot { get; set; }
+
+    [JsonPropertyName("devBridgePinnedWorktreeRoot")]
+    public string DevBridgePinnedWorktreeRoot { get; set; }
+
+    [JsonPropertyName("runtimeIdentity")]
+    public RuntimeIdentityDiagnosticContract RuntimeIdentity { get; set; }
+
     [JsonPropertyName("coordinatorBuild")]
     public CoordinatorBuildIdentity CoordinatorBuild { get; set; }
 
@@ -987,6 +1005,9 @@ internal sealed class JsonCommandResponse
     [JsonPropertyName("healthy")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public bool? Healthy { get; set; }
+    [JsonPropertyName("payloadMetadata")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public DiagnosticPayloadMetadata PayloadMetadata { get; set; }
 
     [JsonPropertyName("findings")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
@@ -1228,6 +1249,9 @@ internal sealed class CoordinatorOptions
     internal IProcessAdapter ProcessAdapter { get; init; } = new SystemProcessAdapter();
     internal ICoordinatorClock Clock { get; init; } = SystemCoordinatorClock.Instance;
     internal string RimWorldExecutablePath { get; init; }
+    internal string RimWorldInstallationRoot { get; init; }
+    internal RuntimeIdentityResolution RuntimeIdentity { get; init; }
+
     internal string ModsConfigPath { get; init; }
     internal string CoordinatorRoot { get; init; }
     internal string RuntimeSlotId { get; init; }
@@ -1264,6 +1288,9 @@ internal sealed class CoordinatorOptions
             ProcessAdapter = ProcessAdapter,
             Clock = Clock,
             RimWorldExecutablePath = RimWorldExecutablePath,
+            RimWorldInstallationRoot = RimWorldInstallationRoot,
+            RuntimeIdentity = RuntimeIdentity,
+
             ModsConfigPath = ModsConfigPath,
             CoordinatorRoot = coordinatorRoot,
             RuntimeSlotId = runtimeSlotId,
@@ -1288,12 +1315,34 @@ internal sealed class CoordinatorOptions
         if (int.TryParse(configured, out int seconds) && seconds >= 30 && seconds <= 3600)
             timeout = TimeSpan.FromSeconds(seconds);
 
+        RuntimeIdentityResolution identity = RuntimeIdentityResolver.Resolve(
+            coordinatorRoot ?? Environment.GetEnvironmentVariable("DEVBRIDGE_ROOT") ??
+            AppContext.BaseDirectory);
+        if (!identity.IsValid)
+            throw new RuntimeIdentityException(identity);
+
+        string configuredWorkshopRoot = Environment.GetEnvironmentVariable("RIMWORLD_WORKSHOP_ROOT");
+        string[] configuredModsRoots = null;
+        string rimWorldRoot = identity.RimWorldRoot;
+        string installedModsRoot = Path.Combine(rimWorldRoot, "Mods");
+        string installedDataRoot = Path.Combine(rimWorldRoot, "Data");
+        configuredWorkshopRoot = string.IsNullOrWhiteSpace(configuredWorkshopRoot)
+            ? Path.GetFullPath(Path.Combine(rimWorldRoot, "..", "..", "workshop", "content", "294100"))
+            : Path.GetFullPath(configuredWorkshopRoot);
+        configuredModsRoots = Directory.Exists(configuredWorkshopRoot)
+            ? new[] { installedDataRoot, installedModsRoot, configuredWorkshopRoot }
+            : new[] { installedDataRoot, installedModsRoot };
+
         CoordinatorOptions options = new()
         {
             ReadinessTimeout = timeout,
             RimBridgeMode = RimBridgeModes.Parse(
                 Environment.GetEnvironmentVariable("DEVBRIDGE_RIMBRIDGE_MODE")),
-            PlayerLogPath = Environment.GetEnvironmentVariable("DEVBRIDGE_PLAYER_LOG")
+            PlayerLogPath = Environment.GetEnvironmentVariable("DEVBRIDGE_PLAYER_LOG"),
+            RimWorldExecutablePath = identity.RimWorldExecutable,
+            RimWorldInstallationRoot = identity.RimWorldRoot,
+            RuntimeIdentity = identity,
+            InstalledModsRoots = configuredModsRoots
         };
 
         // This is an explicit integration-test seam, not a general executable
@@ -1314,6 +1363,8 @@ internal sealed class CoordinatorOptions
                     ProcessInspectionRetryTimeout = TimeSpan.FromSeconds(1),
                     ProcessExitTimeout = TimeSpan.FromSeconds(1),
                     RimBridgeCallTimeout = TimeSpan.FromSeconds(1),
+                    RimWorldInstallationRoot = options.RimWorldInstallationRoot,
+                    RuntimeIdentity = options.RuntimeIdentity,
                     RimBridgeMode = options.RimBridgeMode,
                     PlayerLogPath = options.PlayerLogPath
                 };
@@ -1325,6 +1376,8 @@ internal sealed class CoordinatorOptions
                 ProcessExitTimeout = options.ProcessExitTimeout,
                 RimBridgeCallTimeout = options.RimBridgeCallTimeout,
                 RimWorldExecutablePath = Path.GetFullPath(fakeExecutable),
+                RimWorldInstallationRoot = options.RimWorldInstallationRoot,
+                RuntimeIdentity = options.RuntimeIdentity,
                 ModsConfigPath = string.IsNullOrWhiteSpace(configuredModsConfig)
                     ? Path.Combine(root ?? string.Empty, "ModsConfig.xml") : configuredModsConfig,
                 CoordinatorRoot = root,
@@ -1340,6 +1393,7 @@ internal sealed class CoordinatorOptions
 
         return options;
     }
+
 }
 
 internal sealed class ProfileException : Exception
@@ -1886,10 +1940,15 @@ internal static class ModProfileResolver
             Environment.GetEnvironmentVariable("DEVBRIDGE_TEST_RIMWORLD_PATH"));
         if (!testOnlyRestrictedDiscovery)
         {
-            AddRoot(coordinatorRoot);
-            AddRoot(Path.Combine(coordinatorRoot, ".."));
-            AddRoot(Path.Combine(coordinatorRoot, "..", "..", "Data"));
-            AddRoot(Path.Combine(coordinatorRoot, "..", "..", "Data", "Mods"));
+            bool configuredExternalRuntime = configuredRoots is not null && configuredRoots.Count > 0 &&
+                File.Exists(Path.Combine(coordinatorRoot, "About", "About.xml"));
+            if (!configuredExternalRuntime)
+            {
+                AddRoot(coordinatorRoot);
+                AddRoot(Path.Combine(coordinatorRoot, ".."));
+                AddRoot(Path.Combine(coordinatorRoot, "..", "..", "Data"));
+                AddRoot(Path.Combine(coordinatorRoot, "..", "..", "Data", "Mods"));
+            }
             string workshopOverride = Environment.GetEnvironmentVariable("RIMWORLD_WORKSHOP_PATH");
             AddRoot(workshopOverride);
 
@@ -2346,6 +2405,8 @@ internal sealed partial class CoordinatorState
     private const string DevBridgePackageId = "lan.devbridge2";
     private static readonly TimeSpan ProgressInterval = TimeSpan.FromSeconds(5);
 
+    private readonly RuntimeIdentityDiagnosticContract runtimeIdentity;
+
     private readonly string root;
     private readonly string runtimeRoot;
     private readonly string statePath;
@@ -2356,6 +2417,7 @@ internal sealed partial class CoordinatorState
     private readonly string generationsRoot;
     private readonly string generationHistoryPath;
     private readonly string rimWorldExe;
+    private readonly string rimWorldRoot;
     private readonly string modsConfigPath;
     private readonly string rimBridgeLogPath;
     private readonly string coordinatorRoot;
@@ -2510,6 +2572,15 @@ internal sealed partial class CoordinatorState
         processStartedUtc = this.options.ProcessStartedUtc ?? DateTime.UtcNow;
         if (string.IsNullOrWhiteSpace(runtimeSlotId))
             throw new InvalidOperationException("Runtime slot identity is required.");
+        RuntimeIdentityResolution resolvedIdentity = this.options.RuntimeIdentity ??
+            RuntimeIdentityResolver.ResolveFromOptions(
+                this.root,
+                this.options.RimWorldInstallationRoot,
+                this.options.RimWorldExecutablePath);
+        if (!resolvedIdentity.IsValid)
+            throw new RuntimeIdentityException(resolvedIdentity);
+        runtimeIdentity = resolvedIdentity.ToContract();
+
         processAdapter = this.options.ProcessAdapter ?? new SystemProcessAdapter();
         clock = this.options.Clock ?? SystemCoordinatorClock.Instance;
         rimBridgeClient = this.options.RimBridgeClient ?? new RimBridgeClient();
@@ -2523,10 +2594,9 @@ internal sealed partial class CoordinatorState
         generatedManifestPath = Path.Combine(runtimeRoot, "ModsConfig.generated.json");
         generationsRoot = Path.Combine(runtimeRoot, "generations");
         generationHistoryPath = Path.Combine(runtimeRoot, "generation-history.json");
-        rimWorldExe = Path.GetFullPath(this.options.RimWorldExecutablePath ??
-            Path.Combine(this.root, "..", "..", "RimWorldWin64.exe"));
+        rimWorldExe = Path.GetFullPath(resolvedIdentity.RimWorldExecutable);
+        rimWorldRoot = Path.GetFullPath(resolvedIdentity.RimWorldRoot);
         modsConfigPath = this.options.ModsConfigPath ?? Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
             "AppData", "LocalLow", "Ludeon Studios", "RimWorld by Ludeon Studios", "Config", "ModsConfig.xml");
         string modsConfigDirectory = Directory.GetParent(Path.GetFullPath(modsConfigPath))?.FullName;
         string rimWorldUserDataDirectory = Directory.GetParent(modsConfigDirectory ?? string.Empty)?.FullName

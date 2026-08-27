@@ -39,7 +39,11 @@ internal static class Program
             if (string.IsNullOrWhiteSpace(parsed.Root))
                 throw new ArgumentException("missing --root");
 
-            string root = Path.GetFullPath(parsed.Root);
+            RuntimeIdentityResolution identity = RuntimeIdentityResolver.Resolve(parsed.Root);
+            if (!identity.IsValid)
+                return WriteRuntimeIdentityFailure(parsed.Command, identity);
+
+            string root = Path.GetFullPath(identity.DevBridgeRuntimeRoot);
             Directory.CreateDirectory(root);
 
             if (parsed.Server)
@@ -64,6 +68,31 @@ internal static class Program
             Console.Error.WriteLine("DevBridge error: " + exception.Message);
             return 2;
         }
+    }
+
+    private static int WriteRuntimeIdentityFailure(
+        IReadOnlyList<string> command, RuntimeIdentityResolution identity)
+    {
+        string commandName = command is { Count: > 0 } ? string.Join(" ", command) : "startup";
+        if (command?.Any(value => string.Equals(value, "--json", StringComparison.OrdinalIgnoreCase)) == true)
+        {
+            Console.WriteLine(JsonSerializer.Serialize(new
+            {
+                success = false,
+                command = commandName,
+                exitCode = 3,
+                errorCode = identity.ErrorCode,
+                error = identity.Error,
+                nextAction = identity.NextAction,
+                runtimeIdentity = identity.ToContract()
+            }, JsonOptions));
+        }
+        else
+        {
+            Console.Error.WriteLine("DevBridge error: " + identity.ErrorCode + ": " + identity.Error);
+            Console.Error.WriteLine("Next action: " + identity.NextAction);
+        }
+        return 3;
     }
 
     private static void PrintUsage()
@@ -276,6 +305,9 @@ internal static class CoordinatorClient
                 }
                 catch (CoordinatorIpcException exception)
                 {
+                    if (json)
+                        return WriteClientProtocolFailure(normalizedCommand[0], exception.ErrorCode,
+                            exception.Message);
                     throw new IOException("coordinator returned an invalid IPC frame: " + exception.Message,
                         exception);
                 }
@@ -308,8 +340,15 @@ internal static class CoordinatorClient
                 }
 
                 if (!CoordinatorIpcProtocol.TryValidateResponse(frame, request.RequestId, terminalSeen,
-                        out string protocolError))
+                        out string responseErrorCode, out string protocolError))
+                {
+                    if (json && responseErrorCode == "OUTPUT_TOO_LARGE")
+                        return WriteClientProtocolFailure(normalizedCommand[0], responseErrorCode,
+                            "The coordinator result for operation '" + normalizedCommand[0] +
+                            "' exceeded the maximum payload length.",
+                            frame, Encoding.UTF8.GetByteCount(frame.Payload?.GetRawText() ?? string.Empty));
                     throw new IOException("coordinator IPC protocol error: " + protocolError);
+                }
 
                 if (string.Equals(frame.Type, CoordinatorIpcProtocol.EventType, StringComparison.Ordinal))
                 {
@@ -357,6 +396,16 @@ internal static class CoordinatorClient
             File.WriteAllText(fullPath, payload, new UTF8Encoding(false));
         }
         Console.WriteLine(payload);
+    }
+
+    private static int WriteClientProtocolFailure(string command, string errorCode, string error,
+        CoordinatorIpcFrame frame = null, long? actualSerializedBytes = null)
+    {
+        JsonCommandResponse failure = CoordinatorIpcProtocol.ProtocolFailure(command, errorCode, error,
+            frame?.CoordinatorBuild, frame?.PublishedCoordinatorBuild,
+            frame?.CoordinatorBuildMatchesPublished, actualSerializedBytes);
+        WriteJsonPayload(JsonSerializer.Serialize(failure, Program.JsonOptions));
+        return failure.ExitCode;
     }
 
     private static void StartServer(string root, string runtimeSlotId, string ticketId)

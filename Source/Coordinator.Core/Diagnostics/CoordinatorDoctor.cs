@@ -77,6 +77,26 @@ internal sealed partial class CoordinatorState
     {
         report.AddFinding(DoctorSeverities.Info, "COORDINATOR_REACHABLE",
             "The coordinator accepted the doctor request.", "Coordinator");
+        report.AddFinding(DoctorSeverities.Info, "RUNTIME_IDENTITY_RESOLVED",
+            "Resolved source, installed runtime, and RimWorld identities are available.",
+            "Runtime identity",
+            new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["requestedDevBridgeRoot"] = runtimeIdentity?.RequestedDevBridgeRoot,
+                ["devBridgeSourceRoot"] = runtimeIdentity?.DevBridgeSourceRoot,
+                ["devBridgeRuntimeRoot"] = runtimeIdentity?.DevBridgeRuntimeRoot,
+                ["devBridgePinnedWorktreeRoot"] = runtimeIdentity?.DevBridgePinnedWorktreeRoot,
+                ["rimWorldRoot"] = runtimeIdentity?.RimWorldRoot,
+                ["rimWorldExecutable"] = runtimeIdentity?.RimWorldExecutable,
+                ["resolutionSource"] = runtimeIdentity?.ResolutionSource,
+                ["rimWorldRootExists"] = (runtimeIdentity?.RimWorldRootExists ?? false).ToString().ToLowerInvariant(),
+                ["rimWorldExecutableExists"] = (runtimeIdentity?.RimWorldExecutableExists ?? false).ToString().ToLowerInvariant(),
+                ["devBridgeSourceRootExists"] = (runtimeIdentity?.DevBridgeSourceRootExists ?? false).ToString().ToLowerInvariant(),
+                ["devBridgePinnedWorktreeRootExists"] = (runtimeIdentity?.DevBridgePinnedWorktreeRootExists ?? false).ToString().ToLowerInvariant(),
+                ["devBridgeRuntimeRootExists"] = (runtimeIdentity?.DevBridgeRuntimeRootExists ?? false).ToString().ToLowerInvariant(),
+                ["installedRuntimeLayoutValid"] = (runtimeIdentity?.InstalledRuntimeLayoutValid ?? false).ToString().ToLowerInvariant(),
+                ["runtimeBelongsToRimWorld"] = (runtimeIdentity?.RuntimeBelongsToRimWorld ?? false).ToString().ToLowerInvariant()
+            });
 
         bool runtimeExists = Directory.Exists(runtimeRoot);
         report.AddFinding(runtimeExists ? DoctorSeverities.Info : DoctorSeverities.Error,
@@ -1346,6 +1366,16 @@ internal sealed partial class CoordinatorState
 
     private string ExpectedBridgeToolsAssemblyPath()
     {
+        string configuredRimWorldRoot = Environment.GetEnvironmentVariable("RIMWORLD_ROOT");
+        if (!string.IsNullOrWhiteSpace(configuredRimWorldRoot))
+        {
+            return Path.Combine(
+                Path.GetFullPath(configuredRimWorldRoot),
+                "BridgeTools",
+                Path.GetFileName(root),
+                "DevBridge2.BridgeTools.dll");
+        }
+
         DirectoryInfo modRoot = new(root);
         DirectoryInfo modsRoot = modRoot.Parent;
         DirectoryInfo rimWorldRoot = modsRoot?.Parent;

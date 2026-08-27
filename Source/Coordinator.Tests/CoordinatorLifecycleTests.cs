@@ -99,10 +99,12 @@ internal static partial class OfflineTests
         using Fixture fixture = Fixture.ReadyWithLease();
         string previousTimeout = Environment.GetEnvironmentVariable("DEVBRIDGE_READINESS_TIMEOUT_SECONDS");
         string previousMode = Environment.GetEnvironmentVariable("DEVBRIDGE_RIMBRIDGE_MODE");
+        string previousTestRimWorldPath = Environment.GetEnvironmentVariable("DEVBRIDGE_TEST_RIMWORLD_PATH");
         try
         {
             Environment.SetEnvironmentVariable("DEVBRIDGE_READINESS_TIMEOUT_SECONDS", "31");
             Environment.SetEnvironmentVariable("DEVBRIDGE_RIMBRIDGE_MODE", "off");
+            Environment.SetEnvironmentVariable("DEVBRIDGE_TEST_RIMWORLD_PATH", fixture.RimWorldPath);
             using (CoordinatorHarness first = CoordinatorHarness.StartProduction(fixture))
             {
                 Assert(first.StartedState.ReadinessTimeoutForTesting == TimeSpan.FromSeconds(31),
@@ -122,6 +124,7 @@ internal static partial class OfflineTests
         {
             Environment.SetEnvironmentVariable("DEVBRIDGE_READINESS_TIMEOUT_SECONDS", previousTimeout);
             Environment.SetEnvironmentVariable("DEVBRIDGE_RIMBRIDGE_MODE", previousMode);
+            Environment.SetEnvironmentVariable("DEVBRIDGE_TEST_RIMWORLD_PATH", previousTestRimWorldPath);
         }
 
         List<string> started = new();

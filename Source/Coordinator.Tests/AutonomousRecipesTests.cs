@@ -275,6 +275,68 @@ internal static partial class OfflineTests
             "a bounded recipe run must request exactly one launch when required");
     }
 
+    private static void TestSuccessfulRecipeRetiresEquivalentFailureGuard()
+    {
+        using ProfileSetup setup = ProfileSetup.Create();
+        Assert(setup.CaptureBaseline(), "failure retirement setup must capture the baseline");
+        setup.Fixture.Adapter.ReadyOnLaunch = true;
+        Assert(setup.Fixture.State.Execute(Request("restart", "recipe-agent", 991,
+                       "--projects", "none", "--input", "quicktest=true"), _ => { }, () => true) == 0,
+            "failure retirement setup must create a ready generation");
+        WriteRecipe(setup.Fixture, "quicktest-smoke", SmokeRecipe);
+
+        const string sourceFingerprint =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        PersistedState current = ReadPersistedState(setup.Fixture.Root);
+        string failureFingerprint = setup.Fixture.State.RecordRecipeFailure(
+            "quicktest-smoke",
+            "RECIPE_RESTART_FAILED",
+            "Synthetic prior restart failure.",
+            current.Generation,
+            current.ProfileFingerprint,
+            [new TestInputValue { Name = "quicktest", Value = "true" }],
+            sourceFingerprint);
+        FailureOccurrenceSummary occurrence = ReadPersistedState(setup.Fixture.Root)
+            .FailureOccurrences
+            .Single(value => value.FailureFingerprint == failureFingerprint);
+        string evidenceId = occurrence.EvidenceId;
+
+        Assert(
+            setup.Fixture.State.FindEquivalentRecipeFailureLocked(
+                "quicktest-smoke",
+                current.ProfileFingerprint,
+                [new TestInputValue { Name = "quicktest", Value = "true" }],
+                1,
+                sourceFingerprint) is not null,
+            "synthetic failure must match the equivalent recipe context before recovery");
+        RecipeResponse response = ExecuteRecipe(
+            setup.Fixture,
+            "run",
+            "quicktest-smoke",
+            "--source-fingerprint",
+            sourceFingerprint);
+        Assert(
+            response is RecipeRunResponse run && run.Success,
+            "a successful equivalent recipe must retire the repeated-failure guard");
+
+        PersistedState persisted = ReadPersistedState(setup.Fixture.Root);
+        Assert(
+            !persisted.FailureOccurrences.Any(value =>
+                value.FailureFingerprint == failureFingerprint),
+            "retired failures must leave the active repeated-failure guard");
+        Assert(
+            !string.IsNullOrWhiteSpace(evidenceId) &&
+            File.Exists(Path.Combine(
+                setup.Fixture.Root,
+                "Runtime",
+                "evidence",
+                evidenceId + ".json")),
+            "retiring the guard must preserve historical evidence");
+        Assert(
+            string.IsNullOrWhiteSpace(persisted.LatestFailureFingerprint),
+            "successful recovery must clear the active latest-failure projection");
+    }
+
     private static void TestRecipeRunBudgetCannotWeakenCoordinatorLimit()
     {
         using ProfileSetup setup = ProfileSetup.Create();

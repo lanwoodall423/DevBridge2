@@ -103,6 +103,7 @@ exit /b %ERRORLEVEL%
     Copy-Item -LiteralPath (Join-Path $repoRoot 'scripts\mod-test-build.props') -Destination (Join-Path $devRoot 'scripts\mod-test-build.props')
     Copy-Item -LiteralPath (Join-Path $repoRoot 'global.json') -Destination (Join-Path $devRoot 'global.json')
     Set-Content -LiteralPath (Join-Path $gameRoot 'RimWorldWin64.exe') -Value 'fixture' -Encoding ascii
+    Set-Content -LiteralPath (Join-Path $gameRoot 'RimWorldWin64_Data\Managed\Assembly-CSharp.dll') -Value 'fixture managed assembly' -Encoding ascii
     Set-Content -LiteralPath (Join-Path $gameRoot 'Version.txt') -Value '1.6.test rev0' -Encoding ascii
     Set-Content -LiteralPath (Join-Path $gameRoot 'Mods\RimBridgeServer\About\About.xml') -Value '<ModMetaData><packageId>brrainz.rimbridgeserver</packageId><modVersion>2.1.test</modVersion></ModMetaData>' -Encoding utf8
     Set-Content -LiteralPath (Join-Path $gameRoot 'Mods\Frontier\About\About.xml') -Value '<ModMetaData><packageId>lan.frontier</packageId><modVersion>fixture.test</modVersion></ModMetaData>' -Encoding utf8
@@ -149,7 +150,7 @@ $workflowIndex = [Array]::IndexOf($values, '--workflow-id')
 $workflow = if ($workflowIndex -ge 0 -and $workflowIndex + 1 -lt $values.Count) { $values[$workflowIndex + 1] } else { 'workflow-fake' }
 function Emit([object]$Value) { $Value | ConvertTo-Json -Depth 20 -Compress }
 if ($values -contains 'status') {
-    Emit @{ success = $true; state = 'READY'; gameState = 'READY'; generation = $generation; launchId = 'launch-fake'; rimworldPid = 4242; requestedProjects = @('frontier'); rimBridge = @{ CompanionVerified = $true; Version = '2.1.test' }; leases = @() }
+    Emit @{ success = $true; state = 'READY'; gameState = 'READY'; generation = $generation; launchId = 'launch-fake'; rimworldPid = 4242; rimworldRoot = $env:RIMWORLD_ROOT; requestedProjects = @('frontier'); rimBridge = @{ CompanionVerified = $true; Version = '2.1.test' }; leases = @() }
     exit 0
 }
 if ($values -contains 'begin') {
@@ -190,15 +191,26 @@ Emit @{ success = $true }
 param([Parameter(ValueFromRemainingArguments = $true)][string[]]$InputArgs)
 $values = @($InputArgs)
 function Emit([object]$Value) { $Value | ConvertTo-Json -Depth 20 -Compress }
+function Require-Lease {
+    $leaseIndex = [Array]::IndexOf($values, '--lease')
+    if ($leaseIndex -lt 0 -or $leaseIndex + 1 -ge $values.Count -or
+        [string]$values[$leaseIndex + 1] -ne 'lease-11111111111111111111111111111111') {
+        Emit @{ status = 'error'; code = 'TEST_LEASE_MISSING'; error = 'live RimLiaison calls must carry the owned lease' }
+        exit 1
+    }
+}
 if ($values -contains 'capabilities') {
+    Require-Lease
     Emit @{ status = 'ok'; capabilities = @(@{ id = 'rimbridge/ping' }, @{ id = 'rimworld/get_screen_targets' }, @{ id = 'rimworld/take_screenshot' }); totalMatches = 3; truncated = $false }
     exit 0
 }
 if ($values -contains 'targets') {
+    Require-Lease
     Emit @{ status = 'ok'; targets = @(@{ id = 'main-menu' }) }
     exit 0
 }
 if ($values -contains 'screenshot') {
+    Require-Lease
     $path = Join-Path $PSScriptRoot 'capture.png'
     Set-Content -LiteralPath $path -Value 'fake screenshot' -Encoding ascii
     Emit @{ status = 'ok'; path = $path; operationId = 'op-screenshot-fake'; workflowId = 'workflow-fake'; evidenceId = 'evidence-screenshot-fake' }

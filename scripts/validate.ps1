@@ -1,14 +1,16 @@
 [CmdletBinding()]
 param(
     [switch]$UpdatePackages,
-    [string]$BaseRevision,
-    [string]$HeadRevision,
     [Alias('ChangedFiles', 'Path')]
     [string[]]$ChangedFile,
     [switch]$Full,
     [switch]$Conservative,
     [switch]$InvariantsOnly,
-    [switch]$Json
+    [switch]$Json,
+    [switch]$SelfTest,
+    [ValidateRange(1, 3600)]
+    [int]$ChildTimeoutSeconds = 600,
+    [string]$ProgressPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -23,6 +25,14 @@ $bridgeToolsProject = 'Source\BridgeTools\DevBridge2.BridgeTools.csproj'
 $fakeRimWorldProject = 'Source\FakeRimWorld\FakeRimWorld.csproj'
 $bridgeToolsOutput = Join-Path $repoRoot 'Source\BridgeTools\bin\Release'
 $restoreMode = if ($UpdatePackages) { '--force-evaluate' } else { '--locked-mode' }
+$progressPath = if ([string]::IsNullOrWhiteSpace($ProgressPath)) {
+    Join-Path ([IO.Path]::GetTempPath()) ('DevBridge2-validation-progress-' + $PID + '.jsonl')
+} else {
+    [IO.Path]::GetFullPath($ProgressPath)
+}
+$script:ProgressSequence = 0
+$script:LastFailureCode = $null
+
 
 function Limit-Output {
     param(
@@ -36,6 +46,36 @@ function Limit-Output {
     return $normalized.Substring(0, $Limit) + "`n...[truncated to $Limit characters]"
 }
 
+function Write-ValidationProgress {
+    param(
+        [Parameter(Mandatory = $true)][string]$Event,
+        [string]$Stage,
+        [string]$Description,
+        [hashtable]$Data
+    )
+
+    try {
+        $script:ProgressSequence++
+        $entry = [ordered]@{
+            schemaVersion = 'devbridge-validation-progress/v1'
+            sequence = $script:ProgressSequence
+            timestampUtc = [DateTime]::UtcNow.ToString('o')
+            processId = $PID
+            event = $Event
+            stage = $Stage
+            description = $Description
+            data = if ($null -eq $Data) { @{} } else { $Data }
+        }
+        $parent = Split-Path -Parent $progressPath
+        if (-not [string]::IsNullOrWhiteSpace($parent)) {
+            New-Item -ItemType Directory -Force -Path $parent | Out-Null
+        }
+        Add-Content -LiteralPath $progressPath -Value ($entry | ConvertTo-Json -Compress -Depth 8) -Encoding UTF8
+    } catch {
+        # Progress diagnostics must never change validation behavior.
+    }
+}
+
 function Invoke-Required {
     param(
         [Parameter(Mandatory = $true)][string]$Description,
@@ -43,14 +83,68 @@ function Invoke-Required {
         [Parameter(Mandatory = $true)][string[]]$Arguments
     )
 
-    $captured = @(& $Command @Arguments 2>&1)
-    $exitCode = $LASTEXITCODE
-    $output = ($captured | ForEach-Object { [string]$_ }) -join "`n"
-    if ($exitCode -ne 0) {
-        throw "$Description failed with exit code $exitCode.`n$(Limit-Output $output)"
+    Write-ValidationProgress 'child.starting' $null $Description @{
+        command = $Command
+        arguments = @($Arguments | ForEach-Object { [string]$_ })
+        timeoutSeconds = $ChildTimeoutSeconds
     }
-    if (-not $Json) {
-        Write-Host ('PASS ' + $Description)
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = [Diagnostics.ProcessStartInfo]::new()
+    $process.StartInfo.FileName = $Command
+    $process.StartInfo.WorkingDirectory = $repoRoot
+    $process.StartInfo.UseShellExecute = $false
+    $process.StartInfo.CreateNoWindow = $true
+    $process.StartInfo.RedirectStandardOutput = $true
+    $process.StartInfo.RedirectStandardError = $true
+    foreach ($argument in $Arguments) {
+        [void]$process.StartInfo.ArgumentList.Add([string]$argument)
+    }
+    try {
+        try {
+            if (-not $process.Start()) {
+                $script:LastFailureCode = 'VALIDATION_CHILD_START_FAILED'
+                throw "$Description could not start."
+            }
+        } catch {
+            if ($null -eq $script:LastFailureCode) {
+                $script:LastFailureCode = 'VALIDATION_CHILD_START_FAILED'
+            }
+            throw "$Description could not start: $($_.Exception.Message)"
+        }
+        Write-ValidationProgress 'child.started' $null $Description @{ childProcessId = $process.Id }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $timeoutMilliseconds = [int][Math]::Min([int]::MaxValue, $ChildTimeoutSeconds * 1000L)
+        if (-not $process.WaitForExit($timeoutMilliseconds)) {
+            $script:LastFailureCode = 'VALIDATION_CHILD_TIMEOUT'
+            Write-ValidationProgress 'child.timeout' $null $Description @{
+                childProcessId = $process.Id
+                timeoutSeconds = $ChildTimeoutSeconds
+            }
+            try { $process.Kill($true) } catch { }
+            $process.WaitForExit(5000) | Out-Null
+            $stdout = $stdoutTask.GetAwaiter().GetResult()
+            $stderr = $stderrTask.GetAwaiter().GetResult()
+            throw "$Description timed out after $ChildTimeoutSeconds seconds; process tree was terminated. progress=$progressPath"
+        }
+        $process.WaitForExit()
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        $exitCode = $process.ExitCode
+        $output = (($stdout, $stderr | Where-Object { -not [string]::IsNullOrEmpty($_) }) -join "`n")
+        Write-ValidationProgress 'child.completed' $null $Description @{
+            childProcessId = $process.Id
+            exitCode = $exitCode
+        }
+        if ($exitCode -ne 0) {
+            $script:LastFailureCode = 'VALIDATION_CHILD_FAILED'
+            throw "$Description failed with exit code $exitCode.`n$(Limit-Output $output)"
+        }
+        if (-not $Json) {
+            Write-Host ('PASS ' + $Description)
+        }
+    } finally {
+        $process.Dispose()
     }
 }
 
@@ -363,6 +457,34 @@ function Write-PlanSummary {
     }
 }
 
+if ($SelfTest) {
+    $timeoutObserved = $false
+    try {
+        Invoke-Required 'Validator child-timeout regression probe' 'pwsh' @(
+            '-NoProfile', '-Command',
+            '$p = Start-Process -FilePath "pwsh" -ArgumentList @("-NoProfile","-Command","Start-Sleep -Seconds 120") -PassThru; Write-Output $p.Id; Start-Sleep -Seconds 120'
+        )
+    } catch {
+        if ($script:LastFailureCode -ne 'VALIDATION_CHILD_TIMEOUT') { throw }
+        $timeoutObserved = $true
+    }
+    if (-not $timeoutObserved) {
+        throw 'Validator child-timeout regression probe completed unexpectedly.'
+    }
+    $selfTestReport = [ordered]@{
+        schemaVersion = 'devbridge-validation/v2'
+        status = 'pass'
+        selfTest = 'bounded-child-timeout'
+        progressPath = $progressPath
+    }
+    if ($Json) {
+        Write-Output ($selfTestReport | ConvertTo-Json -Depth 8)
+    } else {
+        Write-Host 'VALIDATION SELF-TEST PASS'
+    }
+    exit 0
+}
+
 $plan = $null
 $executedStages = [System.Collections.Generic.List[string]]::new()
 try {
@@ -374,8 +496,17 @@ try {
     }
     Write-PlanSummary $plan $executionStages
     foreach ($stage in $executionStages) {
-        Invoke-Stage $stage
-        [void]$executedStages.Add($stage)
+        Write-ValidationProgress 'stage.started' $stage $null @{}
+        try {
+            Invoke-Stage $stage
+            [void]$executedStages.Add($stage)
+            Write-ValidationProgress 'stage.completed' $stage $null @{}
+        } catch {
+            Write-ValidationProgress 'stage.failed' $stage $_.Exception.Message @{
+                failureCode = $script:LastFailureCode
+            }
+            throw
+        }
     }
 
     $report = [ordered]@{
@@ -385,15 +516,19 @@ try {
         executedStages = @($executedStages)
         selectedStages = @($executionStages)
         invariantsOnly = [bool]$InvariantsOnly
+        progressPath = $progressPath
     }
     if ($Json) {
         Write-Output ($report | ConvertTo-Json -Depth 16)
     } else {
         Write-Host ("`nVALIDATION PASS ($($executionStages.Count) stages)")
     }
-    exit 0
 } catch {
     $message = $_.Exception.Message
+    Write-ValidationProgress 'validation.failed' $null $message @{
+        failureCode = $script:LastFailureCode
+        executedStages = @($executedStages)
+    }
     if ($Json) {
         $failureReport = [ordered]@{
             schemaVersion = 'devbridge-validation/v2'
@@ -401,6 +536,8 @@ try {
             plan = $plan
             executedStages = @($executedStages)
             failure = $message
+            failureCode = $script:LastFailureCode
+            progressPath = $progressPath
         }
         Write-Output ($failureReport | ConvertTo-Json -Depth 16)
         exit 1

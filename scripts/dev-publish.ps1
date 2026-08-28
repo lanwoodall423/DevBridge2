@@ -8,6 +8,8 @@ param(
     [string]$ChangedSince,
     [Alias('ChangedFiles', 'Path')]
     [string[]]$ChangedFile,
+    [switch]$CompleteRuntime,
+    [switch]$BootstrapRuntime,
     [switch]$DryRun,
     [switch]$Json
 )
@@ -94,6 +96,182 @@ function Get-BuildProperties {
         ('-p:SourceRevisionId=' + $sourceRevision)
         ('-p:DevBridgeBuildDirty=' + ($(if ($dirty) { 'true' } else { 'false' })))
     )
+}
+
+function Test-PathEqual {
+    param([Parameter(Mandatory = $true)][string]$Left,
+        [Parameter(Mandatory = $true)][string]$Right)
+    return [string]::Equals(
+        [System.IO.Path]::GetFullPath($Left).TrimEnd('\'),
+        [System.IO.Path]::GetFullPath($Right).TrimEnd('\'),
+        [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Assert-CompleteRuntimeTarget {
+    if (-not ($CompleteRuntime -or $BootstrapRuntime)) { return }
+    if (-not (Test-Path -LiteralPath $DeploymentRoot -PathType Container)) {
+        throw 'DEVBRIDGE_RUNTIME_TARGET_MISSING: complete runtime target does not exist.'
+    }
+    $aboutPath = Join-Path $DeploymentRoot 'About\About.xml'
+    if (-not (Test-Path -LiteralPath $aboutPath -PathType Leaf)) {
+        throw 'DEVBRIDGE_RUNTIME_TARGET_INVALID: target is missing About/About.xml.'
+    }
+    try {
+        [xml]$about = Get-Content -LiteralPath $aboutPath -Raw
+        $packageId = [string]$about.ModMetaData.packageId
+    }
+    catch {
+        throw 'DEVBRIDGE_RUNTIME_TARGET_INVALID: target About/About.xml is unreadable.'
+    }
+    if (-not [string]::Equals($packageId.Trim(), 'lan.devbridge2',
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'DEVBRIDGE_RUNTIME_TARGET_INVALID: target packageId is not lan.devbridge2.'
+    }
+    $modsRoot = [System.IO.Directory]::GetParent($DeploymentRoot)
+    $rimWorldRoot = if ($null -eq $modsRoot) { $null } else {
+        [System.IO.Directory]::GetParent($modsRoot.FullName)
+    }
+    if ($null -eq $modsRoot -or $null -eq $rimWorldRoot -or
+        -not [string]::Equals($modsRoot.Name, 'Mods', [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals(([System.IO.Path]::GetFileName($DeploymentRoot)), 'DevBridge2',
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'DEVBRIDGE_RUNTIME_TARGET_INVALID: target must be RimWorld\Mods\DevBridge2.'
+    }
+    $rimWorldExecutable = Join-Path $rimWorldRoot.FullName 'RimWorldWin64.exe'
+    if (-not (Test-Path -LiteralPath $rimWorldExecutable -PathType Leaf)) {
+        throw 'RIMWORLD_EXECUTABLE_MISSING: canonical RimWorld executable is absent.'
+    }
+    if ($CompleteRuntime) {
+        $running = @(Get-Process -Name 'RimWorldWin64' -ErrorAction SilentlyContinue)
+        if ($running.Count -gt 0) {
+            throw 'DEVBRIDGE_RUNTIME_REPAIR_REQUIRES_STOP: RimWorld is running and the incomplete runtime cannot be safely repaired.'
+        }
+    }
+}
+
+function Acquire-DeploymentLock {
+    if (-not ($CompleteRuntime -or $BootstrapRuntime)) { return }
+    $hashBytes = [Text.Encoding]::UTF8.GetBytes(
+        ([System.IO.Path]::GetFullPath($DeploymentRoot)).ToLowerInvariant())
+    $hash = ([Security.Cryptography.SHA256]::Create().ComputeHash($hashBytes) |
+        ForEach-Object { $_.ToString('x2') }) -join ''
+    $script:DeploymentMutex = [Threading.Mutex]::new(
+        $false, 'Global\DevBridge2-RuntimeDeploy-' + $hash)
+    if (-not $script:DeploymentMutex.WaitOne(0)) {
+        $script:DeploymentMutex.Dispose()
+        $script:DeploymentMutex = $null
+        throw 'DEVBRIDGE_DEPLOYMENT_CONTENTION: another runtime deployment is active.'
+    }
+}
+
+
+function Release-DeploymentLock {
+    if ($null -ne $script:DeploymentMutex) {
+        try { $script:DeploymentMutex.ReleaseMutex() } catch { }
+        try { $script:DeploymentMutex.Dispose() } catch { }
+        $script:DeploymentMutex = $null
+    }
+}
+
+function Get-RuntimePackageHash {
+    param([Parameter(Mandatory = $true)][object[]]$Artifacts)
+    $lines = @($Artifacts | Sort-Object Destination | ForEach-Object {
+        $relative = [System.IO.Path]::GetRelativePath(
+            $DeploymentRoot, [string]$_.Destination).Replace('\', '/').ToLowerInvariant()
+        $relative + "`0" + [string]$_.DestinationHash
+    })
+    $bytes = [Text.Encoding]::UTF8.GetBytes(($lines -join "`n"))
+    return ([Security.Cryptography.SHA256]::Create().ComputeHash($bytes) |
+        ForEach-Object { $_.ToString('x2') }) -join ''
+}
+
+function Write-RuntimeManifest {
+    param([Parameter(Mandatory = $true)][object[]]$Artifacts,
+        [Parameter(Mandatory = $true)][string]$PackageHash,
+        [Parameter(Mandatory = $true)][string]$SourceCommit,
+        [Parameter(Mandatory = $true)][bool]$SourceDirty)
+    $manifestPath = Join-Path $DeploymentRoot '.devbridge-runtime-manifest.json'
+    $manifest = [ordered]@{
+        schemaVersion = 'devbridge-runtime-manifest/v1'
+        project = 'DevBridge2'
+        packageId = 'lan.devbridge2'
+        sourceRoot = $repoRoot
+        sourceCommit = $SourceCommit
+        sourceDirty = $SourceDirty
+        productVersion = $productVersion
+        packageSha256 = $PackageHash
+        files = @($Artifacts | Sort-Object Destination | ForEach-Object {
+            [ordered]@{
+                path = [System.IO.Path]::GetRelativePath(
+                    $DeploymentRoot, [string]$_.Destination).Replace('\', '/')
+                sha256 = [string]$_.DestinationHash
+                source = [string]$_.Source
+            }
+        })
+    }
+    $temporary = $manifestPath + '.' + $PID + '.tmp'
+    [IO.File]::WriteAllText(
+        $temporary,
+        ($manifest | ConvertTo-Json -Depth 12),
+        [Text.UTF8Encoding]::new($false))
+    try {
+        [IO.File]::Move($temporary, $manifestPath, $true)
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporary -PathType Leaf) {
+            Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $manifestHash = Get-FileSha256 $manifestPath
+    if ([string]::IsNullOrWhiteSpace($manifestHash)) {
+        throw 'DEVBRIDGE_RUNTIME_MANIFEST_IDENTITY_UNPROVEN: runtime manifest could not be hashed.'
+    }
+    return [pscustomobject]@{
+        Path = $manifestPath
+        PackageHash = $PackageHash
+        ManifestSha256 = $manifestHash
+    }
+}
+
+function Read-RuntimeManifest {
+    if (-not $CompleteRuntime) { return $null }
+    $path = Join-Path $DeploymentRoot '.devbridge-runtime-manifest.json'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+    try {
+        $manifest = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -Depth 12
+        if ($manifest.schemaVersion -ne 'devbridge-runtime-manifest/v1' -or
+            $manifest.packageId -ne 'lan.devbridge2') { return $null }
+        return $manifest
+    }
+    catch {
+        throw 'DEVBRIDGE_RUNTIME_MANIFEST_INVALID: installed runtime manifest is unreadable.'
+    }
+}
+
+function Remove-Proven-StaleRuntimeArtifacts {
+    param([Parameter(Mandatory = $true)][AllowNull()]$PreviousManifest,
+        [Parameter(Mandatory = $true)][string[]]$ExpectedPaths)
+    if ($null -eq $PreviousManifest) { return }
+    foreach ($entry in @($PreviousManifest.files)) {
+        $relative = [string]$entry.path
+        if ([string]::IsNullOrWhiteSpace($relative) -or
+            [IO.Path]::IsPathRooted($relative) -or $relative.Contains(':') -or
+            $relative.Replace('\', '/').StartsWith('../', [StringComparison]::Ordinal)) {
+            throw 'DEVBRIDGE_RUNTIME_MANIFEST_INVALID: managed path is unsafe.'
+        }
+        $normalized = $relative.Replace('\', '/')
+        if ($normalized -eq '.devbridge-runtime-manifest.json' -or
+            $normalized.StartsWith('Runtime/', [StringComparison]::OrdinalIgnoreCase) -or
+            $normalized -in $ExpectedPaths) { continue }
+        $destination = Join-Path $DeploymentRoot ($relative -replace '/', '\')
+        if (-not (Test-Path -LiteralPath $destination -PathType Leaf)) { continue }
+        $actual = Get-FileSha256 $destination
+        if (-not [string]::Equals($actual, [string]$entry.sha256,
+                [StringComparison]::OrdinalIgnoreCase)) {
+            throw ('DEVBRIDGE_DEPLOYMENT_OWNERSHIP_AMBIGUOUS: managed static file was changed outside DevBridge2: ' + $relative)
+        }
+        Remove-Item -LiteralPath $destination -Force
+    }
 }
 
 function Get-Plan {
@@ -381,6 +559,7 @@ function Add-ArtifactRecord {
         built = [bool]$DidBuild
         sourceSha256 = $SourceHash
         deployedSha256 = $DestinationHash
+        destinationHash = $DestinationHash
         previousDestinationSha256 = $PreviousDestinationHash
         deployRequired = $DeployRequired
         deployPerformed = [bool]$DidDeploy
@@ -391,6 +570,18 @@ function Add-ArtifactRecord {
 }
 
 $plan = Get-Plan
+if ($CompleteRuntime) {
+    $plan.build = @($plan.build + @('coordinator', 'rimworld-mod') | Sort-Object -Unique)
+    $plan.deploy = @($plan.deploy + @('coordinator', 'rimworld-mod') | Sort-Object -Unique)
+    $plan.changeClass = 'complete-runtime'
+    $plan.changeClasses = @($plan.changeClasses + 'complete-runtime' | Sort-Object -Unique)
+}
+elseif ($BootstrapRuntime) {
+    $plan.build = @($plan.build + 'coordinator' | Sort-Object -Unique)
+    $plan.deploy = @($plan.deploy + 'coordinator' | Sort-Object -Unique)
+    $plan.changeClass = 'runtime-bootstrap'
+    $plan.changeClasses = @($plan.changeClasses + 'runtime-bootstrap' | Sort-Object -Unique)
+}
 $records = [System.Collections.Generic.List[object]]::new()
 $built = [System.Collections.Generic.List[string]]::new()
 $deployed = [System.Collections.Generic.List[string]]::new()
@@ -399,14 +590,19 @@ $stagingRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
     'DevBridge2-dev-publish-' + $PID + '-' + [guid]::NewGuid().ToString('N'))
 $buildProperties = Get-BuildProperties
 $productVersion = Get-AuthoritativeProductVersion
+$sourceCommit = Get-GitValue @('rev-parse', 'HEAD')
+$sourceDirty = @(git status --porcelain=v1 --untracked-files=all).Count -gt 0
 
 $report = $null
 $failure = $null
 try {
+    Assert-CompleteRuntimeTarget
+    Acquire-DeploymentLock
     New-Item -ItemType Directory -Force -Path $stagingRoot | Out-Null
     $coordinatorStaging = Join-Path $stagingRoot 'Coordinator'
     $modStaging = Join-Path $stagingRoot 'Mod'
-    $bridgeToolsDestination = $null
+    $runtimeStaticStaging = Join-Path $stagingRoot 'RuntimeStatic'
+    $runtimeStaticArtifacts = [System.Collections.Generic.List[object]]::new()
     if ($DryRun) {
         $report = [ordered]@{
             schemaVersion = 'devbridge-dev-publish/v1'
@@ -498,6 +694,44 @@ try {
                 -DeployRequired:$bridgeToolsChanged
         }
 
+        if ($CompleteRuntime -or $BootstrapRuntime) {
+            $staticSources = @(
+                [pscustomobject]@{ RelativePath = 'DevBridge.cmd'; Source = Join-Path $repoRoot 'DevBridge.cmd' },
+                [pscustomobject]@{ RelativePath = 'About/About.xml'; Source = Join-Path $repoRoot 'About\About.xml' },
+                [pscustomobject]@{ RelativePath = 'LoadFolders.xml'; Source = Join-Path $repoRoot 'LoadFolders.xml' }
+            )
+            foreach ($static in $staticSources) {
+                if (-not (Test-Path -LiteralPath $static.Source -PathType Leaf)) {
+                    throw ('DEVBRIDGE_SOURCE_ARTIFACT_MISSING: ' + $static.Source)
+                }
+                $staged = Join-Path $runtimeStaticStaging ($static.RelativePath -replace '/', '\')
+                New-Item -ItemType Directory -Force -Path (Split-Path -Parent $staged) | Out-Null
+                Copy-Item -LiteralPath $static.Source -Destination $staged -Force
+                [void]$runtimeStaticArtifacts.Add([pscustomobject]@{
+                    relativePath = $static.RelativePath
+                    source = $static.Source
+                    staged = $staged
+                    destination = Join-Path $DeploymentRoot ($static.RelativePath -replace '/', '\')
+                })
+            }
+        }
+
+        if ($CompleteRuntime) {
+            $expectedRuntimePaths = @(
+                'DevBridge.cmd',
+                'About/About.xml',
+                'LoadFolders.xml',
+                'Coordinator/DevBridge.Coordinator.exe',
+                'Coordinator/DevBridge.Coordinator.dll',
+                'Coordinator/DevBridge.Coordinator.Core.dll',
+                'Coordinator/DevBridge.Coordinator.deps.json',
+                'Coordinator/DevBridge.Coordinator.runtimeconfig.json',
+                '1.6/Assemblies/DevBridge2.dll'
+            )
+            $previousRuntimeManifest = Read-RuntimeManifest
+            Remove-Proven-StaleRuntimeArtifacts $previousRuntimeManifest $expectedRuntimePaths
+        }
+
         $coordinatorDeployRequired = $false
         $coordinatorArtifacts = [System.Collections.Generic.List[object]]::new()
         if ($plan.build -contains 'coordinator') {
@@ -584,6 +818,38 @@ try {
                 -ReconciliationAction $reconciliation.action -IdentityVerified:$reconciliation.identityVerified `
                 -DeployRequired:$different
         }
+        if ($CompleteRuntime -or $BootstrapRuntime) {
+            foreach ($static in $runtimeStaticArtifacts) {
+                $destinationBefore = Get-DestinationSha256 $static.destination
+                $sourceHash = Get-FileSha256 $static.staged
+                $different = $null -eq $destinationBefore -or
+                    -not [string]::Equals($sourceHash, $destinationBefore,
+                        [StringComparison]::OrdinalIgnoreCase)
+                if ($different) {
+                    $reconciliation = Copy-Atomic -Source $static.staged `
+                        -Destination $static.destination -ExpectedHash $sourceHash
+                    [void]$deployed.Add('runtime-static')
+                }
+                else {
+                    $reconciliation = [pscustomobject]@{
+                        action = 'unchanged'
+                        sourceSha256 = $sourceHash
+                        destinationSha256 = $destinationBefore
+                        previousDestinationSha256 = $destinationBefore
+                        identityVerified = $true
+                    }
+                }
+                Add-ArtifactRecord -Records $records -Component 'runtime-static' `
+                    -Source $static.source -Destination $static.destination `
+                    -LoadedStatus 'not-applicable' -DidDeploy:$different `
+                    -DidBuild:$false -SourceHash $reconciliation.sourceSha256 `
+                    -DestinationHash $reconciliation.destinationSha256 `
+                    -PreviousDestinationHash $reconciliation.previousDestinationSha256 `
+                    -ReconciliationAction $reconciliation.action `
+                    -IdentityVerified:$reconciliation.identityVerified `
+                    -DeployRequired:$different
+            }
+        }
 
         if ($plan.deploy -contains 'rimworld-content') {
             $contentFiles = @($plan.fileClassifications |
@@ -659,6 +925,26 @@ try {
             }
         }
 
+        $runtimeManifest = $null
+        if ($CompleteRuntime) {
+            $runtimeArtifacts = @($records | Where-Object {
+                $_.component -in @('coordinator', 'rimworld-mod', 'runtime-static')
+            })
+            if ($runtimeArtifacts.Count -ne 9 -or
+                @($runtimeArtifacts | Where-Object {
+                    -not $_.identityVerified -or [string]::IsNullOrWhiteSpace([string]$_.destinationHash)
+                }).Count -gt 0) {
+                throw 'DEVBRIDGE_RUNTIME_IDENTITY_UNPROVEN: complete runtime package was not fully hash-verified.'
+            }
+            $runtimeManifest = Write-RuntimeManifest $runtimeArtifacts `
+                (Get-RuntimePackageHash $runtimeArtifacts) $sourceCommit $sourceDirty
+            if (-not [string]::Equals(
+                    (Get-FileSha256 $runtimeManifest.Path),
+                    (Get-FileSha256 $runtimeManifest.Path),
+                    [StringComparison]::OrdinalIgnoreCase)) {
+                throw 'DEVBRIDGE_RUNTIME_MANIFEST_IDENTITY_UNPROVEN: runtime manifest could not be verified.'
+            }
+        }
         $modDeployed = @($records | Where-Object { $_.component -eq 'rimworld-mod' -and $_.deployRequired }).Count -gt 0
         $contentDeployed = @($records | Where-Object { $_.component -eq 'rimworld-content' -and $_.deployRequired }).Count -gt 0
         $bridgeDeployed = @($records | Where-Object { $_.component -eq 'bridgeTools' -and $_.deployRequired }).Count -gt 0
@@ -678,6 +964,7 @@ try {
             built = @($built | Sort-Object -Unique)
             deployed = @($deployed | Sort-Object -Unique)
             artifacts = @($records)
+            runtimeManifest = $runtimeManifest
             coordinatorShutdown = $coordinatorShutdown
             deployRequired = @($records | Where-Object { $_.deployRequired }).Count -gt 0
             coordinatorRefreshRequired = $coordinatorDeployed
@@ -693,6 +980,7 @@ try {
             notes = @(
                 'Coordinator replacement is preceded by coordinator shutdown only when a coordinator artifact hash differs.'
                 'A byte-identical build is reported as deployRequired=false and does not trigger refresh or restart.'
+                'Complete runtime deployment manages only static wrapper, metadata, coordinator, and mod artifacts; Runtime state is preserved.'
                 'Copied RimWorld and BridgeTools files are never reported as loaded code.'
             )
         }
@@ -741,6 +1029,7 @@ catch {
     }
 }
 finally {
+    Release-DeploymentLock
     if (Test-Path -LiteralPath $stagingRoot -PathType Container) {
         Remove-Item -LiteralPath $stagingRoot -Recurse -Force -ErrorAction SilentlyContinue
     }

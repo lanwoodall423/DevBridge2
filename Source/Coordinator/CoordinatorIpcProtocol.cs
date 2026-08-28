@@ -24,7 +24,7 @@ internal static class CoordinatorIpcProtocol
     internal const int MaxEventMessageLength = 16 * 1024;
     internal const int MaxBufferedEventCount = 1024;
     internal const int MaxBufferedEventOutputLength = 128 * 1024;
-    internal const int MaxOutputPayloadLength = 192 * 1024;
+    internal const int MaxOutputPayloadLength = DevBridgeSchemaVersions.CoordinatorMaxOutputPayloadBytes;
     internal const int MaxRequestIdLength = 128;
     internal const int MaxAgentLength = 256;
     internal const int MaxPathLength = 32768;
@@ -231,8 +231,13 @@ internal static class CoordinatorIpcProtocol
     }
 
     internal static bool TryValidateResponse(CoordinatorIpcFrame? frame, string requestId,
-        bool terminalSeen, out string? error)
+        bool terminalSeen, out string? error) =>
+        TryValidateResponse(frame, requestId, terminalSeen, out _, out error);
+
+    internal static bool TryValidateResponse(CoordinatorIpcFrame? frame, string requestId,
+        bool terminalSeen, out string? errorCode, out string? error)
     {
+        errorCode = null;
         error = null;
         if (frame == null)
         {
@@ -241,6 +246,7 @@ internal static class CoordinatorIpcProtocol
         }
         if (frame.ProtocolVersion != Version)
         {
+            errorCode = "INCOMPATIBLE_PROTOCOL";
             error = "coordinator returned unsupported IPC protocol version " + frame.ProtocolVersion +
                 "; expected " + Version;
             return false;
@@ -276,8 +282,11 @@ internal static class CoordinatorIpcProtocol
                 error = "coordinator result frame did not contain an exitCode";
                 return false;
             }
-            if (frame.Payload.HasValue && frame.Payload.Value.GetRawText().Length > MaxOutputPayloadLength)
+            if (frame.Payload.HasValue &&
+                (frame.Payload.Value.GetRawText().Length > MaxOutputPayloadLength ||
+                 Encoding.UTF8.GetByteCount(frame.Payload.Value.GetRawText()) > MaxOutputPayloadLength))
             {
+                errorCode = "OUTPUT_TOO_LARGE";
                 error = "coordinator result exceeded the maximum payload length";
                 return false;
             }
@@ -290,21 +299,46 @@ internal static class CoordinatorIpcProtocol
 
     internal static JsonCommandResponse ProtocolFailure(string command, string errorCode, string error,
         CoordinatorBuildIdentity? buildIdentity, CoordinatorBuildIdentity? publishedBuild = null,
-        bool? buildMatchesPublished = null)
+        bool? buildMatchesPublished = null, long? actualSerializedBytes = null)
     {
+        bool doctor = string.Equals(command, "doctor", StringComparison.OrdinalIgnoreCase);
         return new JsonCommandResponse
         {
             Success = false,
             Command = command ?? "protocol",
             ExitCode = 2,
             State = BridgePhase.ERROR.ToString(),
+            Healthy = doctor ? false : null,
             ErrorCode = errorCode,
             Error = error,
-            NextAction = "Update the client and coordinator together; supported coordinator IPC protocol is v" +
-                Version.ToString(System.Globalization.CultureInfo.InvariantCulture) + ".",
+            NextAction = NextActionFor(errorCode),
+            PayloadMetadata = new DiagnosticPayloadMetadata
+            {
+                Operation = command ?? "protocol",
+                ConfiguredLimitBytes = MaxOutputPayloadLength,
+                EstimatedSerializedBytes = actualSerializedBytes,
+                Summarized = true,
+                Truncated = string.Equals(errorCode, "OUTPUT_TOO_LARGE", StringComparison.Ordinal),
+                Fallback = string.Equals(errorCode, "OUTPUT_TOO_LARGE", StringComparison.Ordinal)
+            },
             CoordinatorBuild = buildIdentity,
             PublishedCoordinatorBuild = publishedBuild,
             CoordinatorBuildMatchesPublished = buildMatchesPublished
+        };
+    }
+
+    private static string NextActionFor(string errorCode)
+    {
+        return errorCode switch
+        {
+            "INCOMPATIBLE_PROTOCOL" =>
+                "Update the client and coordinator together; supported coordinator IPC protocol is v" +
+                Version.ToString(System.Globalization.CultureInfo.InvariantCulture) + ".",
+            "OUTPUT_TOO_LARGE" =>
+                "Retry the command; the coordinator diagnostic was summarized. Inspect the reported operation and size metadata.",
+            "REQUEST_TOO_LARGE" =>
+                "Reduce the request to the supported IPC limit and retry.",
+            _ => "Run DevBridge.cmd doctor --json for bounded coordinator diagnostics."
         };
     }
 
@@ -327,14 +361,20 @@ internal static class CoordinatorIpcProtocol
             return null;
 
         JsonElement result = JsonSerializer.SerializeToElement(payload, Program.JsonOptions);
-        if (result.GetRawText().Length <= MaxOutputPayloadLength)
+        string raw = result.GetRawText();
+        long actualBytes = Encoding.UTF8.GetByteCount(raw);
+        if (raw.Length <= MaxOutputPayloadLength && actualBytes <= MaxOutputPayloadLength)
             return result;
 
         exitCode = 2;
+        string operation = payload is JsonCommandResponse commandResponse
+            ? commandResponse.Command
+            : "unknown";
         return JsonSerializer.SerializeToElement(
-            ProtocolFailure("protocol", "OUTPUT_TOO_LARGE",
-                "The coordinator result exceeded the maximum payload length.", buildIdentity,
-                publishedBuild, buildMatchesPublished), Program.JsonOptions);
+            ProtocolFailure(operation, "OUTPUT_TOO_LARGE",
+                "The coordinator result for operation '" + operation +
+                "' exceeded the maximum payload length.", buildIdentity,
+                publishedBuild, buildMatchesPublished, actualBytes), Program.JsonOptions);
     }
 }
 

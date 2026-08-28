@@ -5,5 +5,19 @@
   "configuration": "Release",
   "expectedAssembly": "KnowledgeFramework.dll",
   "deploymentTarget": "1.6/Assemblies/KnowledgeFramework.dll",
-  "testRecipe": "knowledge-framework-development-smoke"
+  "testRecipe": "knowledge-framework-development-smoke",
+  "runtimePackage": {
+    "sourceRoot": ".",
+    "include": [
+      "About/**",
+      "Defs/**",
+      "Patches/**",
+      "Languages/**",
+      "Textures/**",
+      "Sounds/**",
+      "Assemblies/**",
+      "1.*/**"
+    ],
+    "exclude": []
+  }
 }

@@ -14,6 +14,7 @@ internal static class RuntimeIdentityErrorCodes
     internal const string ExplicitOverrideInvalid = "DEVBRIDGE_EXPLICIT_OVERRIDE_INVALID";
     internal const string RuntimeRootMismatch = "DEVBRIDGE_RUNTIME_ROOT_MISMATCH";
     internal const string RuntimeMissing = "DEVBRIDGE_RUNTIME_MISSING";
+    internal const string RuntimeIncomplete = "DEVBRIDGE_RUNTIME_INCOMPLETE";
 }
 
 internal static class RuntimeIdentityResolutionSources
@@ -263,9 +264,16 @@ internal static class RuntimeIdentityResolver
             resolutionSource = RuntimeIdentityResolutionSources.CanonicalMachineConfigurationRecovery;
 
         if (!testOverride && !layoutValid)
+        {
+            string runtimeErrorCode = runtimeExists
+                ? RuntimeIdentityErrorCodes.RuntimeIncomplete
+                : RuntimeIdentityErrorCodes.RuntimeMissing;
+            string runtimeError = runtimeExists
+                ? "The installed DevBridge runtime exists but is incomplete."
+                : "The installed DevBridge runtime is missing.";
             return Failure(requestedRoot, sourceRoot, pinnedRoot, runtimeRoot, rimWorldRoot, executable,
-                resolutionSource, RuntimeIdentityErrorCodes.RuntimeMissing,
-                "The installed DevBridge runtime is missing or does not have the expected installed layout.");
+                resolutionSource, runtimeErrorCode, runtimeError);
+        }
 
         return Success(requestedRoot, sourceRoot, pinnedRoot, runtimeRoot, rimWorldRoot, executable,
             resolutionSource, rimWorldExists, executableExists, sourceExists, pinnedExists,

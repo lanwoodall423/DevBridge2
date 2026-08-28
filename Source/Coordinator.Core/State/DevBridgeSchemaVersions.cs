@@ -16,6 +16,7 @@ public static class DevBridgeSchemaVersions
     public const int HistoryDiff = 1;
     public const int HistoryDiagnosis = 1;
     public const int CoordinatorProtocolMajor = 2;
+    public const int CoordinatorMaxOutputPayloadBytes = 192 * 1024;
     public const int Identity = 1;
 
     public const string IdentityContract = "devbridge-identity/v1";

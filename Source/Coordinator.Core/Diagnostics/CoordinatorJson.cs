@@ -341,6 +341,11 @@ internal sealed partial class CoordinatorState
                 response.ErrorCode = audit.FirstError.Code;
                 response.Error = audit.FirstError.Message;
             }
+            else
+            {
+                response.ErrorCode = null;
+                response.Error = null;
+            }
             response.Success = response.Healthy == true;
             response.ExitCode = response.Success ? 0 : 1;
             response.NextAction = response.NextActions.Count == 0 ? response.NextAction :

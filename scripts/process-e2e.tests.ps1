@@ -2,10 +2,14 @@
 param(
     [switch]$KeepRoots,
     [switch]$OnlyBuildFailure,
+    [switch]$OnlyRimWorldBuildMatrix,
+    [switch]$OnlyDiagnosticComparisonFailure,
     [string]$DiagnosticFixturePath
 )
 
 $ErrorActionPreference = 'Stop'
+$env:RIMWORLD_ROOT = ''
+$env:RIMWORLD_EXECUTABLE = ''
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 Set-Location -LiteralPath $repoRoot
 
@@ -163,7 +167,9 @@ function New-Fixture {
     $logPath = Join-Path $root 'Player.log'
     $readyGatePath = Join-Path $runtime 'ready.gate'
     $readyWaitingPath = $readyGatePath + '.waiting'
-    New-Item -ItemType Directory -Force -Path $runtime, $modsRoot | Out-Null
+    $managedRoot = Join-Path $root 'RimWorldWin64_Data\Managed'
+    New-Item -ItemType Directory -Force -Path $runtime, $modsRoot, $managedRoot | Out-Null
+    Write-Utf8File (Join-Path $managedRoot 'Assembly-CSharp.dll') 'process-e2e RimWorld managed assembly marker'
 
     foreach ($packageId in $alwaysOnPackages) {
         Write-InstalledMetadata -Root $modsRoot -PackageId $packageId
@@ -348,6 +354,9 @@ function Invoke-Bridge {
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
     $start.Environment['DEVBRIDGE_TEST_RESULT_FILE'] = $resultPath
+    $start.Environment['DEVBRIDGE_TEST_RIMWORLD_PATH'] = [Environment]::GetEnvironmentVariable('DEVBRIDGE_TEST_RIMWORLD_PATH')
+    $start.Environment['RIMWORLD_ROOT'] = ''
+    $start.Environment['RIMWORLD_EXECUTABLE'] = ''
     foreach ($argument in $cliArguments) { [void]$start.ArgumentList.Add([string]$argument) }
     $command = Format-Command (@($start.FileName) + $cliArguments)
     $process = [System.Diagnostics.Process]::Start($start)
@@ -548,7 +557,11 @@ function Invoke-Case {
 }
 
 function Invoke-BuildFailureContract {
-    param([pscustomobject]$Fixture)
+    param([pscustomobject]$Fixture,
+        [switch]$PathWithSpaces,
+        [switch]$MissingRimWorld,
+        [switch]$DescriptorOverride,
+        [switch]$DiagnosticComparisonFailure)
     $ownsFixture = $null -eq $Fixture
     $fixture = if ($ownsFixture) {
         New-Fixture 'mod-test-build-failure' -RimBridgeMode off
@@ -564,8 +577,8 @@ function Invoke-BuildFailureContract {
         Write-InstalledMetadata -Root (Join-Path $fixture.Root 'InstalledMods') -PackageId 'lan.frontier'
         New-Item -ItemType Directory -Force -Path $badProjectRoot, (Join-Path $transactionRoot '1.6\Assemblies') | Out-Null
         $badProject = Join-Path $badProjectRoot 'FailingBuild.csproj'
-        Write-Utf8File $badProject @'
-        <Project Sdk="Microsoft.NET.Sdk">
+        $projectText = @'
+<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
@@ -576,9 +589,28 @@ function Invoke-BuildFailureContract {
   </ItemGroup>
 </Project>
 '@
+        if ($DiagnosticComparisonFailure) {
+            $projectText = $projectText.Replace('</Project>',
+                '  <PropertyGroup><RestoreSources>$(MSBuildThisFileDirectory)missing-package-source</RestoreSources></PropertyGroup>' +
+                [Environment]::NewLine +
+                '  <ItemGroup><PackageReference Include="DevBridgeDiagnosticMissingPackage" Version="1.0.0" /></ItemGroup>' +
+                [Environment]::NewLine + '</Project>')
+        }
+        Write-Utf8File $badProject $projectText
         Write-Utf8File (Join-Path $badProjectRoot 'FailingBuild.cs') 'public static class FailingBuild {'
         foreach ($index in 1..320) {
             Write-Utf8File (Join-Path $badProjectRoot ("Broken$index.cs")) "public static class Broken$index"
+        }
+        if ($PathWithSpaces) { $DescriptorOverride = $true }
+        $expectedRimWorldDirectory = $fixture.Root
+        if ($MissingRimWorld) {
+            Remove-Item -LiteralPath (Join-Path $fixture.Root 'RimWorldWin64_Data') -Recurse -Force
+        }
+        if ($DescriptorOverride) {
+            $expectedRimWorldDirectory = Join-Path $fixture.Root 'Override Root With Spaces'
+            $overrideManagedRoot = Join-Path $expectedRimWorldDirectory 'RimWorldWin64_Data\Managed'
+            New-Item -ItemType Directory -Force -Path $overrideManagedRoot | Out-Null
+            Write-Utf8File (Join-Path $overrideManagedRoot 'Assembly-CSharp.dll') 'descriptor override managed assembly marker'
         }
         $badDescriptor = Join-Path $fixture.Root 'bad-mod-development.json'
         $badSourceProject = [System.IO.Path]::GetRelativePath($repoRoot, $badProject).Replace('\', '/')
@@ -591,6 +623,12 @@ function Invoke-BuildFailureContract {
             deploymentTarget = '1.6/Assemblies/FailingBuild.dll'
             testRecipe = 'mod-development-smoke'
         }
+        if ($DescriptorOverride) {
+            $badDescriptorData.buildProperties = [ordered]@{ RIMWORLD_DIR = $expectedRimWorldDirectory }
+        }
+        else {
+            $badDescriptorData.buildProperties = [ordered]@{ RIMWORLD_DIR = $expectedRimWorldDirectory }
+        }
         Write-Utf8File $badDescriptor ($badDescriptorData | ConvertTo-Json -Depth 4)
         $transactionScript = Join-Path $repoRoot 'scripts\mod-test.ps1'
         $workflowId = 'workflow-devbridge-diagnostic-contract-v1'
@@ -602,6 +640,25 @@ function Invoke-BuildFailureContract {
             '-WorkflowId', $workflowId, '-SourceFingerprint', $sourceFingerprint, '-Json') 2>&1 | Out-String
         if ($LASTEXITCODE -eq 0) { throw "invalid build unexpectedly succeeded: $badOutput" }
         $bad = Get-JsonResponse $badOutput
+        if ($MissingRimWorld) {
+            if ([string]$bad.stage -ne 'build' -or
+                [string]$bad.failure.errorCode -ne 'RIMWORLD_DIR_UNRESOLVED' -or
+                $null -ne $bad.build) {
+                throw "missing RimWorld installation was not rejected before build: $badOutput"
+            }
+            return
+        }
+        if ($DiagnosticComparisonFailure) {
+            if ($null -eq $bad.build -or
+                $null -eq $bad.buildDiscrimination -or
+                [bool]$bad.buildDiscrimination.comparisonValid -or
+                [string]$bad.buildDiscrimination.diagnosticFailure.code -ne 'DEVELOPMENT_DIAGNOSTIC_COMPARISON_FAILED' -or
+                [bool]$bad.buildDiscrimination.nativeBuild.valid -or
+                [string]$bad.buildDiscrimination.likelyOwner -ne 'unknown') {
+                throw "diagnostic comparison infrastructure failure was not reported explicitly: $badOutput"
+            }
+            return
+        }
         $requiredBuildFields = @(
             'stage', 'command', 'exitCode', 'output', 'outputTruncated', 'sourceProject',
             'stagingPath', 'timedOut', 'transactionId', 'workflowId', 'errorCode', 'failureMessage')
@@ -623,28 +680,40 @@ function Invoke-BuildFailureContract {
             throw "failed build did not preserve the primary build failure shape: $badOutput"
         }
         if ([string]$bad.build.sourceProject -ne [IO.Path]::GetFullPath($badProject) -or
+            [string]$bad.build.rimWorldDirectory -ne [IO.Path]::GetFullPath($expectedRimWorldDirectory) -or
             [string]$bad.build.command -notmatch 'dotnet.*build' -or
+            [string]$bad.build.command -notmatch [regex]::Escape('RIMWORLD_DIR=') -or
             [int]$bad.build.exitCode -eq 0 -or
             [bool]$bad.build.timedOut -or
             [string]$bad.build.transactionId -ne [string]$bad.transactionId -or
             [string]$bad.build.workflowId -ne $workflowId -or
             [string]$bad.failure.transactionId -ne [string]$bad.transactionId -or
             [string]$bad.failure.workflowId -ne $workflowId) {
-            throw "failed build identity or command fields were not preserved: $badOutput"
+            throw "failed build identity, command, or propagated RimWorld property was not preserved: $badOutput"
         }
-        if ([string]::IsNullOrWhiteSpace([string]$bad.build.output) -or
-            [string]$bad.build.output -notmatch '(?i)(error\s+(CS|MSB)|CS\d{4}|MSB\d{4})' -or
+        if ($null -eq $bad.buildDiscrimination -or
+            -not [bool]$bad.buildDiscrimination.comparisonValid -or
+            -not [bool]$bad.buildDiscrimination.nativeBuild.valid -or
+            -not [bool]$bad.buildDiscrimination.nativeBuild.restoreSuccess -or
+            [string]$bad.buildDiscrimination.likelyOwner -ne 'project' -or
+            [string]$bad.buildDiscrimination.ownershipConfidence -ne 'high' -or
+            [string]$bad.buildDiscrimination.nativeBuild.causalDiagnostic -match 'NETSDK1004') {
+            throw "native diagnostic comparison was not a valid project-failure comparison: $badOutput"
+        }
+        if ([string]::IsNullOrWhiteSpace([string]$bad.build.causalDiagnostic) -or
+            [string]$bad.build.causalDiagnostic -notmatch '(?i)(error\s+(CS|MSB)|CS\d{4}|MSB\d{4})' -or
             [string]$bad.failure.output -notmatch '(?i)(error\s+(CS|MSB)|CS\d{4}|MSB\d{4})') {
             throw "compiler output was not retained in both build and failure diagnostics: $badOutput"
         }
-        if ([string]$bad.build.output.Length -gt $buildDiagnosticTextLimit -or
-            [string]$bad.failure.output.Length -gt $buildDiagnosticTextLimit) {
+        if ($bad.build.output.Length -gt $buildDiagnosticTextLimit -or
+            $bad.failure.output.Length -gt $buildDiagnosticTextLimit) {
             throw 'DevBridge build diagnostics exceeded the bounded 16 KiB contract.'
         }
         if ([bool]$bad.build.outputTruncated -and
             [string]$bad.build.output -notmatch '\[truncated to') {
             throw 'DevBridge marked build output truncated without an explicit marker.'
         }
+
         if ([string]$bad.build.command -ne [string]$bad.failure.command) {
             throw 'build and failure diagnostics did not preserve the same exact command.'
         }
@@ -669,6 +738,44 @@ if ($OnlyBuildFailure) {
         throw "Focused DevBridge build diagnostic contract failed: $($result.Error)"
     }
     Write-Host 'PROCESS E2E BUILD DIAGNOSTIC CONTRACT PASS'
+    if (-not $KeepRoots) {
+        Remove-Item -LiteralPath (Join-Path $repoRoot '.process-e2e-temp') -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    exit 0
+}
+if ($OnlyRimWorldBuildMatrix) {
+    $matrix = @(
+        Invoke-Case 'RimWorld discovery supplies mod build property' {
+            Invoke-BuildFailureContract
+        }
+        Invoke-Case 'RimWorld build property survives spaces' {
+            Invoke-BuildFailureContract -PathWithSpaces
+        }
+        Invoke-Case 'descriptor RimWorld build property overrides discovery' {
+            Invoke-BuildFailureContract -DescriptorOverride
+        }
+        Invoke-Case 'missing RimWorld installation fails before build' {
+            Invoke-BuildFailureContract -MissingRimWorld
+        }
+    )
+    if (@($matrix | Where-Object { -not $_.Passed }).Count -gt 0) {
+        throw 'Focused RimWorld build property matrix failed.'
+    }
+    Write-Host 'PROCESS E2E RIMWORLD BUILD PROPERTY MATRIX PASS'
+    if (-not $KeepRoots) {
+        Remove-Item -LiteralPath (Join-Path $repoRoot '.process-e2e-temp') -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    exit 0
+}
+
+if ($OnlyDiagnosticComparisonFailure) {
+    $result = Invoke-Case 'diagnostic comparison infrastructure failure' {
+        Invoke-BuildFailureContract -DiagnosticComparisonFailure
+    }
+    if (-not $result.Passed) {
+        throw "Focused diagnostic comparison contract failed: $($result.Error)"
+    }
+    Write-Host 'PROCESS E2E DIAGNOSTIC COMPARISON CONTRACT PASS'
     if (-not $KeepRoots) {
         Remove-Item -LiteralPath (Join-Path $repoRoot '.process-e2e-temp') -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -748,7 +855,11 @@ $results.Add((Invoke-Case 'delayed readiness is observable through agent wait-ev
     $fixture = New-Fixture 'delayed-ready' -ScenarioName 'ready-delayed' -ScenarioOverrides @{ readyAfterMs = 500 }
     try {
         $restart = Start-Process -FilePath $coordinatorExe -ArgumentList @('--root', $fixture.Root,
-            '--runtime-slot', $fixture.Slot, 'restart', '--projects', 'none', '--json') -PassThru -WindowStyle Hidden
+            '--runtime-slot', $fixture.Slot, 'restart', '--projects', 'none', '--json') -Environment @{
+            DEVBRIDGE_TEST_RIMWORLD_PATH = [Environment]::GetEnvironmentVariable('DEVBRIDGE_TEST_RIMWORLD_PATH')
+            RIMWORLD_ROOT = ''
+            RIMWORLD_EXECUTABLE = ''
+        } -PassThru -WindowStyle Hidden
         try {
             Wait-File $fixture.ReadyWaitingPath
             $cursor = Invoke-Bridge -Root $fixture.Root -Slot $fixture.Slot -Arguments @('agent', 'snapshot')
@@ -1039,27 +1150,40 @@ $results.Add((Invoke-Case 'bounded mod build deploy run test transaction' {
     $fixture = New-Fixture 'mod-test-transaction' -RimBridgeMode off
     $transactionRoot = Join-Path $fixture.Root 'ManagedMod'
     $descriptorPath = Join-Path $fixture.Root 'mod-development.json'
+    $packageSourceRootName = 'TestSupport/ModDevelopmentFixture/PackageFixture-' + [Guid]::NewGuid().ToString('N')
+    $packageSourceRoot = Join-Path $repoRoot $packageSourceRootName.Replace('/', '\')
     try {
-        New-Item -ItemType Directory -Force -Path (Join-Path $fixture.Root 'InstalledMods\lan.frontier\About') | Out-Null
+        New-Item -ItemType Directory -Force -Path (Join-Path $fixture.Root 'InstalledMods\lan.frontier\About'),
+            (Join-Path $packageSourceRoot 'About'),
+            (Join-Path $packageSourceRoot 'Defs'),
+            (Join-Path $packageSourceRoot 'Textures') | Out-Null
         Write-Utf8File (Join-Path $fixture.Root 'InstalledMods\lan.frontier\About\About.xml') @'
 <ModMetaData><name>Frontier fixture</name><packageId>lan.frontier</packageId><supportedVersions><li>1.6</li></supportedVersions></ModMetaData>
 '@
+        Write-Utf8File (Join-Path $packageSourceRoot 'About\About.xml') '<ModMetaData><name>Whole package fixture</name></ModMetaData>'
+        Write-Utf8File (Join-Path $packageSourceRoot 'Defs\Thing.xml') '<Defs><ThingDef><defName>FixtureThing</defName></ThingDef></Defs>'
+        Write-Utf8File (Join-Path $packageSourceRoot 'Textures\fixture.txt') 'fixture texture'
         New-Item -ItemType Directory -Force -Path (Join-Path $transactionRoot '1.6\Assemblies') | Out-Null
-        Write-Utf8File $descriptorPath @'
-{
-  "schemaVersion": "devbridge-mod-development/v1",
-  "project": "frontier",
-  "sourceProject": "TestSupport/ModDevelopmentFixture/DevBridge.ModFixture.csproj",
-  "configuration": "Release",
-  "expectedAssembly": "DevBridge.ModFixture.dll",
-  "deploymentTarget": "1.6/Assemblies/DevBridge.ModFixture.dll",
-  "testRecipe": "mod-development-smoke"
-}
-'@
+        $descriptor = [ordered]@{
+            schemaVersion = 'devbridge-mod-development/v1'
+            project = 'frontier'
+            sourceProject = 'TestSupport/ModDevelopmentFixture/DevBridge.ModFixture.csproj'
+            configuration = 'Release'
+            expectedAssembly = 'DevBridge.ModFixture.dll'
+            deploymentTarget = '1.6/Assemblies/DevBridge.ModFixture.dll'
+            testRecipe = 'mod-development-smoke'
+            runtimePackage = [ordered]@{
+                sourceRoot = $packageSourceRootName
+                include = @('About/**', 'Defs/**', 'Textures/**', 'Sounds/**')
+                exclude = @()
+            }
+            buildProperties = [ordered]@{ RIMWORLD_DIR = $fixture.Root }
+        }
+        Write-Utf8File $descriptorPath ($descriptor | ConvertTo-Json -Depth 8)
         $transactionScript = Join-Path $repoRoot 'scripts\mod-test.ps1'
         $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $transactionScript,
             '-Project', 'frontier', '-DescriptorPath', $descriptorPath,
-            '-DevelopmentRoot', $repoRoot, '-DeploymentRoot', $transactionRoot,
+            '-DevelopmentRoot', $repoRoot, '-AdditionalDevelopmentRoot', $fixture.Root, '-DeploymentRoot', $transactionRoot,
             '-CoordinatorRoot', $fixture.Root, '-RuntimeSlot', $fixture.Slot, '-Json')
         $output = & pwsh @arguments 2>&1 | Out-String
         $exitCode = $LASTEXITCODE
@@ -1083,6 +1207,83 @@ $results.Add((Invoke-Case 'bounded mod build deploy run test transaction' {
             [string]$second.artifactFreshness.deploymentDecision -ne 'unchanged' -or
             -not [bool]$second.artifactFreshness.loadedArtifactFreshnessProven) {
             throw "identical mod-test transaction was not a no-op: $secondOutput"
+        }
+        $expectedPackagePaths = [ordered]@{
+            'About/About.xml' = Join-Path $transactionRoot 'About/About.xml'
+            'Defs/Thing.xml' = Join-Path $transactionRoot 'Defs/Thing.xml'
+            'Textures/fixture.txt' = Join-Path $transactionRoot 'Textures/fixture.txt'
+            'Assemblies/DevBridge.ModFixture.dll' = Join-Path $transactionRoot '1.6/Assemblies/DevBridge.ModFixture.dll'
+        }
+        foreach ($relativePath in $expectedPackagePaths.Keys) {
+            if (-not (Test-Path -LiteralPath $expectedPackagePaths[$relativePath])) {
+                throw "whole-package deployment omitted $relativePath"
+            }
+        }
+        if ([int]$report.deployment.managedFileCount -ne 4 -or
+            [string]::IsNullOrWhiteSpace([string]$report.artifactFreshness.builtPackageSha256) -or
+            [string]$report.artifactFreshness.builtPackageSha256 -ne
+                [string]$report.artifactFreshness.deployedPackageSha256) {
+            throw "package-manifest identity was not reported or verified: $output"
+        }
+        $descriptor.deploymentRole = 'tooling-only'
+        Write-Utf8File $descriptorPath ($descriptor | ConvertTo-Json -Depth 8)
+        $toolingOutput = & pwsh @arguments 2>&1 | Out-String
+        $toolingExitCode = $LASTEXITCODE
+        $tooling = Get-JsonResponse $toolingOutput
+        if ($toolingExitCode -eq 0 -or
+            [string]$tooling.failure.errorCode -ne 'DEVBRIDGE_TOOLING_ONLY_NOT_DEPLOYABLE') {
+            throw "tooling-only descriptor was allowed into mod deployment: $toolingOutput"
+        }
+        $descriptor.Remove('deploymentRole')
+        Write-Utf8File $descriptorPath ($descriptor | ConvertTo-Json -Depth 8)
+
+
+        Write-Utf8File (Join-Path $packageSourceRoot 'Defs\Thing.xml') '<Defs><ThingDef><defName>ChangedFixtureThing</defName></ThingDef></Defs>'
+        New-Item -ItemType Directory -Force -Path (Join-Path $packageSourceRoot 'Sounds') | Out-Null
+        Write-Utf8File (Join-Path $packageSourceRoot 'Sounds\fixture.txt') 'fixture sound'
+        Remove-Item -LiteralPath (Join-Path $packageSourceRoot 'Textures\fixture.txt')
+        $changedOutput = & pwsh @arguments -SkipRecipe 2>&1 | Out-String
+        $changedExitCode = $LASTEXITCODE
+        $changed = Get-JsonResponse $changedOutput
+        if ($changedExitCode -ne 0 -or -not [bool]$changed.success -or
+            -not [bool]$changed.deployment.changed -or
+            -not (Test-Path -LiteralPath (Join-Path $transactionRoot 'Sounds\fixture.txt')) -or
+            (Test-Path -LiteralPath (Join-Path $transactionRoot 'Textures\fixture.txt')) -or
+            -not (@($changed.deployment.staleManagedFiles) -contains 'Textures/fixture.txt')) {
+            throw "package add/change/delete reconciliation failed: $changedOutput"
+        }
+        Write-Utf8File (Join-Path $transactionRoot 'operator.keep') 'operator-owned'
+        $unknownOutput = & pwsh @arguments -SkipRecipe 2>&1 | Out-String
+        $unknownExitCode = $LASTEXITCODE
+        $unknown = Get-JsonResponse $unknownOutput
+        if ($unknownExitCode -ne 0 -or -not [bool]$unknown.success -or
+            (Test-Path -LiteralPath (Join-Path $transactionRoot 'operator.keep')) -eq $false -or
+            -not (@($unknown.deployment.unknownFiles) -contains 'operator.keep')) {
+            throw "unknown operator file was not preserved and reported: $unknownOutput"
+        }
+
+        Write-Utf8File (Join-Path $packageSourceRoot 'About\About.xml') '<ModMetaData><name>Contention fixture</name></ModMetaData>'
+        $targetRoot = $transactionRoot
+        $targetHash = ([Security.Cryptography.SHA256]::Create().ComputeHash(
+            [Text.Encoding]::UTF8.GetBytes($targetRoot.ToLowerInvariant())) |
+            ForEach-Object { $_.ToString('x2') }) -join ''
+        $holderScript = '$mutex = [Threading.Mutex]::new($true, ''Global\DevBridge2-Deployment-' +
+            $targetHash + '''); Start-Sleep -Seconds 8; $mutex.ReleaseMutex(); $mutex.Dispose()'
+        $holderEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($holderScript))
+        $holder = Start-Process -FilePath 'pwsh' -ArgumentList @(
+            '-NoProfile', '-EncodedCommand', $holderEncoded) -PassThru
+        try {
+            Start-Sleep -Seconds 1
+            $contentionOutput = & pwsh @arguments -SkipRecipe 2>&1 | Out-String
+            $contentionExitCode = $LASTEXITCODE
+            $contention = Get-JsonResponse $contentionOutput
+            if ($contentionExitCode -eq 0 -or
+                [string]$contention.failure.errorCode -ne 'DEVBRIDGE_DEPLOYMENT_CONTENTION' -or
+                [string]$contention.stage -ne 'deployment') {
+                throw "same-target deployment contention was not rejected: $contentionOutput"
+            }
+        } finally {
+            Wait-Process -Id $holder.Id -Timeout 20 -ErrorAction SilentlyContinue
         }
 
         $ownerFingerprint = 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc'
@@ -1113,43 +1314,22 @@ $results.Add((Invoke-Case 'bounded mod build deploy run test transaction' {
 
         $deploymentTarget = Join-Path $transactionRoot '1.6\Assemblies\DevBridge.ModFixture.dll'
         Write-Utf8File $deploymentTarget 'stale deployed assembly'
-        $deploymentLock = [IO.File]::Open($deploymentTarget, [IO.FileMode]::Open,
-            [IO.FileAccess]::Read, [IO.FileShare]::Read)
-        try {
-            $lockedOutput = & pwsh @arguments 2>&1 | Out-String
-            $lockedExitCode = $LASTEXITCODE
-            $locked = Get-JsonResponse $lockedOutput
-            if ($lockedExitCode -eq 0 -or [string]$locked.stage -ne 'deployment' -or
-                -not [bool]$locked.runtime.maintenanceReady -or
-                -not [bool]$locked.cleanup.deferred) {
-                throw "locked deployment did not preserve confirmed maintenance ownership: $lockedOutput"
-            }
-            $lockedStatus = Get-Status $fixture
-            if ([string]$lockedStatus.gameState -ne 'STOPPED' -or
-                [int]$lockedStatus.rimworldPid -ne 0 -or
-                -not [bool]$lockedStatus.maintenanceReady) {
-                throw "failed deployment launched or lost maintenance state: $($lockedStatus | ConvertTo-Json -Compress)"
-            }
-        } finally {
-            $deploymentLock.Dispose()
-        }
-
-        $cleanupAgent = [Environment]::GetEnvironmentVariable('DEVBRIDGE_AGENT', 'Process')
-        $cleanupSession = [Environment]::GetEnvironmentVariable('DEVBRIDGE_SESSION', 'Process')
-        try {
-            $env:DEVBRIDGE_AGENT = 'mod-test-' + [string]$locked.transactionId
-            $env:DEVBRIDGE_SESSION = 'mod-test-' + [string]$locked.transactionId
-            End-TestLease $fixture ([string]$locked.runtime.leaseId)
-            $release = Invoke-Bridge -Root $fixture.Root -Slot $fixture.Slot -Arguments @(
-                'project', 'release', [string]$locked.runtime.registrationId)
-            Assert-Success $release 'failed deployment registration cleanup'
-        } finally {
-            $env:DEVBRIDGE_AGENT = $cleanupAgent
-            $env:DEVBRIDGE_SESSION = $cleanupSession
+        $ambiguousOutput = & pwsh @arguments 2>&1 | Out-String
+        $ambiguousExitCode = $LASTEXITCODE
+        $ambiguous = Get-JsonResponse $ambiguousOutput
+        if ($ambiguousExitCode -eq 0 -or [string]$ambiguous.stage -ne 'deployment' -or
+            [string]$ambiguous.failure.errorCode -ne 'DEVBRIDGE_DEPLOYMENT_OWNERSHIP_AMBIGUOUS' -or
+            [bool]$ambiguous.cleanup.deferred) {
+            throw "managed-file mutation was not rejected without destructive repair: $ambiguousOutput"
         }
 
         Invoke-BuildFailureContract
-    } finally { Remove-Fixture $fixture }
+    } finally {
+        if (Test-Path -LiteralPath $packageSourceRoot) {
+            Remove-Item -LiteralPath $packageSourceRoot -Recurse -Force
+        }
+        Remove-Fixture $fixture
+    }
 }))
 
 $planJson = & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repoRoot 'scripts\dev-plan.ps1') `

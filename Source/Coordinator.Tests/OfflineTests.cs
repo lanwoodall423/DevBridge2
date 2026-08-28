@@ -182,6 +182,10 @@ internal static partial class OfflineTests
         Run("canonical identity separates owner, coordinator, generation, and process", TestCanonicalIdentityContract);
         Run("installed runtime resolves canonical RimWorld identity",
             RuntimeIdentityTests.InstalledRuntimeRootResolvesCanonicalRimWorld);
+        Run("existing runtime with missing coordinator is incomplete",
+            RuntimeIdentityTests.ExistingRuntimeWithMissingCoordinatorIsIncomplete);
+        Run("production ModsConfig path uses canonical user data",
+            RuntimeIdentityTests.ProductionModsConfigPathUsesCanonicalUserData);
         Run("source checkout cannot redefine RimWorld identity",
             RuntimeIdentityTests.SourceCheckoutCannotRedefineRimWorld);
         Run("pinned worktree cannot redefine RimWorld identity",

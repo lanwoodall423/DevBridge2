@@ -1394,6 +1394,19 @@ internal sealed class CoordinatorOptions
         return options;
     }
 
+    internal static string DefaultModsConfigPath()
+    {
+        string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        string appData = Directory.GetParent(localAppData)?.FullName;
+        if (string.IsNullOrWhiteSpace(appData))
+        {
+            string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            appData = Path.Combine(userProfile, "AppData");
+        }
+        return Path.Combine(appData, "LocalLow", "Ludeon Studios",
+            "RimWorld by Ludeon Studios", "Config", "ModsConfig.xml");
+    }
+
 }
 
 internal sealed class ProfileException : Exception
@@ -2596,9 +2609,8 @@ internal sealed partial class CoordinatorState
         generationHistoryPath = Path.Combine(runtimeRoot, "generation-history.json");
         rimWorldExe = Path.GetFullPath(resolvedIdentity.RimWorldExecutable);
         rimWorldRoot = Path.GetFullPath(resolvedIdentity.RimWorldRoot);
-        modsConfigPath = this.options.ModsConfigPath ?? Path.Combine(
-            "AppData", "LocalLow", "Ludeon Studios", "RimWorld by Ludeon Studios", "Config", "ModsConfig.xml");
-        string modsConfigDirectory = Directory.GetParent(Path.GetFullPath(modsConfigPath))?.FullName;
+        modsConfigPath = this.options.ModsConfigPath ?? CoordinatorOptions.DefaultModsConfigPath();
+        string modsConfigDirectory = Directory.GetParent(modsConfigPath)?.FullName;
         string rimWorldUserDataDirectory = Directory.GetParent(modsConfigDirectory ?? string.Empty)?.FullName
             ?? modsConfigDirectory ?? this.root;
         rimBridgeLogPath = Path.GetFullPath(this.options.PlayerLogPath ??

@@ -5,5 +5,19 @@
   "configuration": "Release",
   "expectedAssembly": "AquacultureFishing.dll",
   "deploymentTarget": "1.6/Assemblies/AquacultureFishing.dll",
-  "testRecipe": "aquaculture-development-smoke"
+  "testRecipe": "aquaculture-development-smoke",
+  "runtimePackage": {
+    "sourceRoot": ".",
+    "include": [
+      "About/**",
+      "Defs/**",
+      "Patches/**",
+      "Languages/**",
+      "Textures/**",
+      "Sounds/**",
+      "Assemblies/**",
+      "1.*/**"
+    ],
+    "exclude": []
+  }
 }

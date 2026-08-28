@@ -235,6 +235,79 @@ internal static partial class OfflineTests
         Assert(actions.All(IsSafeDiagnosticAction), "central recovery guidance must exclude unsafe commands");
     }
 
+    private static void TestDoctorBoundsAccumulatedDiagnosticState()
+    {
+        using Fixture fixture = new(new PersistedState
+        {
+            Phase = BridgePhase.STOPPED,
+            AggregateGenerations = Enumerable.Range(1, 300).Select(generation => new AggregateGenerationEvidence
+            {
+                Generation = generation,
+                RequestedProjects = new List<string> { "project-" + generation },
+                ResolvedMods = Enumerable.Range(1, 20).Select(value => "mod-" + value).ToList()
+            }).ToList()
+        });
+        DoctorAuditReport audit = new()
+        {
+            GenerationHistory = new GenerationHistoryView
+            {
+                Records = Enumerable.Range(1, 300).Select(generation => new GenerationHistoryRecord
+                {
+                    Generation = generation,
+                    Status = "FAILED",
+                    TerminalFailureCode = "ACCUMULATED_DIAGNOSTIC_FAILURE",
+                    TerminalFailureDetail = new string('x', 1000)
+                }).ToList()
+            }
+        };
+        audit.AddFinding(DoctorSeverities.Error, "ACCUMULATED_DIAGNOSTIC_FAILURE",
+            "The accumulated diagnostic state is unhealthy.", "Generation history");
+        audit.Complete();
+
+        BridgeRequest request = Request("doctor");
+        request.Json = true;
+        request.DoctorAudit = audit;
+        JsonCommandResponse response = fixture.State.CreateJsonResponse(request, 1, new List<string>());
+        string json = JsonSerializer.Serialize(response, Program.JsonOptions);
+        using JsonDocument document = JsonDocument.Parse(json);
+        DiagnosticPayloadMetadata metadata = response.PayloadMetadata;
+
+        Assert(Encoding.UTF8.GetByteCount(json) <= CoordinatorIpcProtocol.MaxOutputPayloadLength &&
+               document.RootElement.ValueKind == JsonValueKind.Object &&
+               response.Healthy.HasValue && response.Healthy.Value == false &&
+               response.ErrorCode == "ACCUMULATED_DIAGNOSTIC_FAILURE",
+            "large doctor state must remain valid, bounded, and unhealthy with its real error code");
+        Assert(metadata.Collections["generationHistory.records"].TotalCount == 300 &&
+               metadata.Collections["generationHistory.records"].SampleCount <= DiagnosticResponseLimits.MaxSampleCount &&
+               metadata.Collections["generationHistory.records"].Truncated &&
+               metadata.Collections["aggregateGenerations"].TotalCount == 300 &&
+               response.GenerationHistory.Records.Count <= DiagnosticResponseLimits.MaxSampleCount &&
+               response.AggregateGenerations.Count <= DiagnosticResponseLimits.MaxSampleCount,
+            "large diagnostic collections must expose bounded recent samples and truncation metadata");
+    }
+
+    private static void TestOversizedDiagnosticFallbackIsBounded()
+    {
+        CoordinatorBuildIdentity identity = CoordinatorBuildIdentity.FromInformationalVersion(
+            "1.2.4+same-revision", "Release");
+        CoordinatorIpcFrame frame = CoordinatorIpcProtocol.Result("request", 0,
+            new JsonCommandResponse
+            {
+                Command = "doctor",
+                Checks = new List<string> { new string('p', CoordinatorIpcProtocol.MaxOutputPayloadLength + 1000) }
+            }, identity, identity, true);
+        string payload = frame.Payload?.GetRawText();
+        JsonCommandResponse fallback = JsonSerializer.Deserialize<JsonCommandResponse>(payload, Program.JsonOptions);
+
+        Assert(frame.ExitCode == 2 && Encoding.UTF8.GetByteCount(payload) < CoordinatorIpcProtocol.MaxOutputPayloadLength &&
+               fallback != null && fallback.Healthy == false &&
+               fallback.ErrorCode == "OUTPUT_TOO_LARGE" &&
+               fallback.PayloadMetadata?.Fallback == true &&
+               fallback.PayloadMetadata.Operation == "doctor" &&
+               !fallback.NextAction.Contains("Update the client", StringComparison.Ordinal),
+            "an oversized same-version doctor result must become a small truthful fallback envelope");
+    }
+
     private static JsonCommandResponse RunDoctor(Fixture fixture, out int exitCode,
         out List<string> messages)
     {

@@ -94,18 +94,130 @@ internal sealed partial class CoordinatorState
         };
     }
 
-    private static int CoordinatorControl(IReadOnlyList<string> arguments, Action<string> emit)
+    private int CoordinatorControl(IReadOnlyList<string> arguments, Action<string> emit)
     {
-        if (arguments.Count != 1 ||
-            (!string.Equals(arguments[0], "shutdown", StringComparison.OrdinalIgnoreCase) &&
-             !string.Equals(arguments[0], "reload", StringComparison.OrdinalIgnoreCase)))
+        if (arguments.Count == 1 &&
+            string.Equals(arguments[0], "shutdown", StringComparison.OrdinalIgnoreCase))
         {
-            emit("Usage: DevBridge.cmd coordinator shutdown");
-            return 2;
+            emit("Coordinator shutdown accepted. Durable state and the RimWorld process are unchanged.");
+            emit("The next command will lazily start the current coordinator binary and environment.");
+            return 0;
         }
 
-        emit("Coordinator shutdown accepted. Durable state and the RimWorld process are unchanged.");
-        emit("The next command will lazily start the current coordinator binary and environment.");
+        if (arguments.Count == 2 &&
+            string.Equals(arguments[0], "recover-process", StringComparison.OrdinalIgnoreCase))
+            return RecoverProcessOwnership(arguments[1], emit);
+
+        emit("Usage: DevBridge.cmd coordinator shutdown | coordinator recover-process <source-state-path>");
+        return 2;
+    }
+
+    private int RecoverProcessOwnership(string sourceStatePath, Action<string> emit)
+    {
+        if (string.IsNullOrWhiteSpace(sourceStatePath))
+        {
+            emit("Process recovery denied: source state path is required.");
+            emit("Error code: PROCESS_RECOVERY_EVIDENCE_MISSING");
+            return 4;
+        }
+
+        PersistedState evidence;
+        string fullPath;
+        string sourceRoot;
+        try
+        {
+            fullPath = Path.GetFullPath(sourceStatePath);
+            sourceRoot = Directory.GetParent(Directory.GetParent(fullPath)?.FullName ?? string.Empty)?.FullName;
+            if (!File.Exists(fullPath))
+            {
+                emit("Process recovery denied: source state evidence is absent.");
+                emit("Error code: PROCESS_RECOVERY_EVIDENCE_MISSING");
+                return 4;
+            }
+
+            evidence = JsonSerializer.Deserialize<PersistedState>(
+                File.ReadAllText(fullPath), CoordinatorSerialization.JsonOptions);
+        }
+        catch
+        {
+            emit("Process recovery denied: source state evidence is unreadable.");
+            emit("Error code: PROCESS_RECOVERY_EVIDENCE_INVALID");
+            return 4;
+        }
+
+        if (evidence == null || evidence.SchemaVersion > DevBridgeSchemaVersions.RuntimeState ||
+            string.IsNullOrWhiteSpace(sourceRoot) ||
+            !string.Equals(Path.GetFileName(fullPath), "state.json", StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(Path.GetFileName(Path.GetDirectoryName(fullPath) ?? string.Empty),
+                "Runtime", StringComparison.OrdinalIgnoreCase) ||
+            !RuntimeScope.PathsEqual(evidence.CoordinatorRoot, sourceRoot) ||
+            RuntimeScope.PathsEqual(evidence.CoordinatorRoot, coordinatorRoot) ||
+            evidence.ProcessId <= 0 || evidence.ProcessStartUtcTicks <= 0 ||
+            string.IsNullOrWhiteSpace(evidence.OwnedProcessExecutablePath) ||
+            !RuntimeScope.PathsEqual(evidence.OwnedProcessExecutablePath, rimWorldExe))
+        {
+            emit("Process recovery denied: source state does not contain a matching durable owner identity.");
+            emit("Error code: PROCESS_RECOVERY_EVIDENCE_MISMATCH");
+            return 4;
+        }
+
+        ProcessStatusSnapshot census;
+        try
+        {
+            census = EnumerateStatusProcessesLocked();
+        }
+        catch (ProcessInspectionException)
+        {
+            emit("Process recovery denied: the current RimWorld process census was incomplete.");
+            emit("Error code: " + ProcessInspection.ErrorCode);
+            return 4;
+        }
+
+        if (census.MatchingProcessCount != 1 ||
+            !census.MatchingProcesses.Any(value => value.ProcessId == evidence.ProcessId &&
+                value.ProcessStartIdentity == evidence.ProcessStartUtcTicks))
+        {
+            emit("Process recovery denied: current process identity did not match source evidence.");
+            emit("Error code: PROCESS_RECOVERY_IDENTITY_MISMATCH");
+            return 4;
+        }
+
+        lock (lifecycleGate)
+        {
+            lock (gate)
+            {
+                SynchronizeLocked();
+                if (state.ProcessId > 0 || state.MaintenanceReady || state.Leases.Count != 0 ||
+                    state.RestartPending || state.Phase != BridgePhase.ERROR)
+                {
+                    emit("Process recovery denied: the installed runtime is not at a quiescent error boundary.");
+                    emit("Error code: PROCESS_RECOVERY_BOUNDARY_UNSAFE");
+                    return 4;
+                }
+
+                state.ProcessId = evidence.ProcessId;
+                state.ProcessStartUtcTicks = evidence.ProcessStartUtcTicks;
+                state.OwnedProcessExecutablePath = rimWorldExe;
+                state.LaunchId = evidence.LaunchId;
+                state.LaunchGeneration = evidence.LaunchGeneration > 0
+                    ? evidence.LaunchGeneration : evidence.Generation;
+                state.Generation = Math.Max(state.Generation, evidence.Generation);
+                state.ErrorCode = "PROFILE_EXTERNAL_MUTATION";
+                state.Error = "Recovered a previously coordinator-owned RimWorld process from exact source state evidence.";
+                state.Phase = BridgePhase.ERROR;
+                state.MaintenanceReady = false;
+                state.RequiresNewProcess = true;
+                state.SessionDirty = true;
+                SaveStateLocked();
+                Monitor.PulseAll(gate);
+            }
+        }
+
+        emit("Process ownership recovered from exact source state evidence.");
+        emit("PID: " + evidence.ProcessId);
+        emit("Start identity: " + evidence.ProcessStartUtcTicks);
+        emit("No RimWorld process was launched or terminated.");
+        EmitNextCommand(emit, "DevBridge.cmd test begin");
         return 0;
     }
 

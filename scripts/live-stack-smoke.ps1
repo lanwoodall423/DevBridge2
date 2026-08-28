@@ -67,7 +67,7 @@ if ([string]::IsNullOrWhiteSpace($RimLiaisonRoot)) {
     $RimLiaisonRoot = [Environment]::GetEnvironmentVariable('RIMTEST_ROOT')
 }
 if ([string]::IsNullOrWhiteSpace($RimLiaisonRoot)) {
-    $RimLiaisonRoot = Join-Path (Split-Path $DevBridgeRoot -Parent) 'RimLiaison'
+    $RimLiaisonRoot = Join-Path (Split-Path $DevBridgeRoot -Parent) 'RimTest'
 }
 $RimLiaisonRoot = Resolve-FullPath $RimLiaisonRoot
 
@@ -126,9 +126,14 @@ $sessionId = 'live-stack-' + $transactionId
 $agentId = 'live-stack-' + $transactionId
 $oldAgent = [Environment]::GetEnvironmentVariable('DEVBRIDGE_AGENT', 'Process')
 $oldSession = [Environment]::GetEnvironmentVariable('DEVBRIDGE_SESSION', 'Process')
+$oldRimTestAgent = [Environment]::GetEnvironmentVariable('RIMTEST_DEVBRIDGE_AGENT', 'Process')
+$oldRimWorldRoot = [Environment]::GetEnvironmentVariable('RIMWORLD_ROOT', 'Process')
+
 $env:DEVBRIDGE_AGENT = $agentId
 $env:DEVBRIDGE_SESSION = $sessionId
+$env:RIMTEST_DEVBRIDGE_AGENT = $agentId
 
+$env:RIMWORLD_ROOT = $RimWorldRoot
 $script:Report = [ordered]@{
     schemaVersion = 'devbridge-live-stack-smoke/v1'
     success = $false
@@ -798,7 +803,7 @@ function Run-CapabilityProbe {
     # of 20 can omit the UI provider from a real installation.  Ask for the
     # CLI's bounded maximum so the smoke verifies the complete supported
     # surface without allowing an unbounded registry response.
-    $probe = Invoke-RimLiaison @('--devbridge', $devBridgeCommand, '--devbridge-root', $DevBridgeRoot, 'capabilities', '--limit', '100', '--json')
+    $probe = Invoke-RimLiaison @('--devbridge', $devBridgeCommand, '--devbridge-root', $DevBridgeRoot, '--lease', $script:LeaseId, 'capabilities', '--limit', '100', '--json')
     if ($null -eq $probe.Json -or [string](Get-Value $probe.Json 'status') -ne 'ok') {
         Set-Failure ([string]((Get-Value $probe.Json 'code') ?? 'LIVE_CAPABILITY_DISCOVERY_FAILED')) ([string]((Get-Value $probe.Json 'error') ?? 'RimLiaison could not discover the live capability registry.')) 'capabilities'
     }
@@ -845,7 +850,7 @@ function Complete-UiEvidence {
 }
 
 function Run-UiEvidence {
-    $targets = Invoke-RimLiaison @('--devbridge', $devBridgeCommand, '--devbridge-root', $DevBridgeRoot, 'ui', 'targets', '--json')
+    $targets = Invoke-RimLiaison @('--devbridge', $devBridgeCommand, '--devbridge-root', $DevBridgeRoot, '--lease', $script:LeaseId, 'ui', 'targets', '--json')
     $targetCode = [string](Get-Value $targets.Json 'code')
     $targetStatus = [string](Get-Value $targets.Json 'status')
     if ($targetStatus -ne 'ok' -and $targetCode -ne 'RIMTEST_UI_TARGETS_SCHEMA_UNSUPPORTED') {
@@ -867,7 +872,7 @@ function Run-UiEvidence {
         $script:Report.ui.targetCount = $targetList.Count
         $script:Report.ui.targetId = $targetId
         $script:Report.ui.supported = $true
-        $capture = Invoke-RimLiaison @('--devbridge', $devBridgeCommand, '--devbridge-root', $DevBridgeRoot, 'ui', 'screenshot', '--target', $targetId, '--json')
+        $capture = Invoke-RimLiaison @('--devbridge', $devBridgeCommand, '--devbridge-root', $DevBridgeRoot, '--lease', $script:LeaseId, 'ui', 'screenshot', '--target', $targetId, '--json')
         Complete-UiEvidence $capture
         return
     }
@@ -886,7 +891,7 @@ function Run-UiEvidence {
     $script:Report.ui.cellRect = $cellRect
     $script:Report.ui.targetCount = 0
     $script:Report.ui.supported = $true
-    $capture = Invoke-RimLiaison @('--devbridge', $devBridgeCommand, '--devbridge-root', $DevBridgeRoot, 'ui', 'screenshot', '--cell-rect', $cellRect, '--json')
+    $capture = Invoke-RimLiaison @('--devbridge', $devBridgeCommand, '--devbridge-root', $DevBridgeRoot, '--lease', $script:LeaseId, 'ui', 'screenshot', '--cell-rect', $cellRect, '--json')
     Complete-UiEvidence $capture
 }
 
@@ -1126,6 +1131,8 @@ try {
     }
     [Environment]::SetEnvironmentVariable('DEVBRIDGE_AGENT', $oldAgent, 'Process')
     [Environment]::SetEnvironmentVariable('DEVBRIDGE_SESSION', $oldSession, 'Process')
+    [Environment]::SetEnvironmentVariable('RIMTEST_DEVBRIDGE_AGENT', $oldRimTestAgent, 'Process')
+    [Environment]::SetEnvironmentVariable('RIMWORLD_ROOT', $oldRimWorldRoot, 'Process')
     $script:Report.finishedAtUtc = [DateTime]::UtcNow.ToString('o')
     $outputJson = ConvertTo-Json -InputObject $script:Report -Compress -Depth 24
     if ($outputJson.Length -gt $script:MaxOutputChars) {

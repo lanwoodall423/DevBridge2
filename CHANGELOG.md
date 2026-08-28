@@ -1,6 +1,13 @@
 # Dev Bridge release notes
 
 ## Unreleased
+- Bounds doctor and status projections at the v2 IPC payload limit. The root cause was the
+  unbounded `generationHistory.records` collection: the local history artifact had 288 records
+  and was 151,419 bytes before the rest of the doctor response was added; the published doctor
+  response is now 61,943 bytes with the same state. Responses now retain deterministic recent
+  samples, report total/truncated collection metadata, cap findings and diagnostic text, and
+  return a truthful small `OUTPUT_TOO_LARGE` envelope if an unexpected oversized result still
+  reaches IPC; same-version failures no longer receive version-mismatch remediation.
 
 - Hardens the canonical identity contract with a durable installation/owner ID,
   explicit coordinator, lifecycle-generation, and RimWorld PID/start identities,

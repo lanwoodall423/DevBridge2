@@ -15,6 +15,25 @@ internal static class RuntimeIdentityTests
         Assert(result.InstalledRuntimeLayoutValid && result.RuntimeBelongsToRimWorld,
             "installed runtime must be validated against the configured game root");
     }
+    internal static void ExistingRuntimeWithMissingCoordinatorIsIncomplete()
+    {
+        using IdentityFixture fixture = new();
+        File.Delete(Path.Combine(fixture.RuntimeRoot, "Coordinator", "DevBridge.Coordinator.exe"));
+        RuntimeIdentityResolution result = fixture.Resolve(fixture.RuntimeRoot);
+        AssertEqual(RuntimeIdentityErrorCodes.RuntimeIncomplete, result.ErrorCode);
+        Assert(result.DevBridgeRuntimeRootExists, "an incomplete runtime must remain distinguishable from a missing root");
+    }
+    internal static void ProductionModsConfigPathUsesCanonicalUserData()
+    {
+        string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        string appData = Directory.GetParent(localAppData)?.FullName ??
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "AppData");
+        string expected = Path.Combine(appData, "LocalLow", "Ludeon Studios",
+            "RimWorld by Ludeon Studios", "Config", "ModsConfig.xml");
+        AssertEqual(expected, CoordinatorOptions.DefaultModsConfigPath());
+    }
+
+
 
     internal static void SourceCheckoutCannotRedefineRimWorld()
     {

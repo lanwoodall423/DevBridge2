@@ -1556,6 +1556,14 @@ internal sealed partial class CoordinatorState
                 failure = state.ErrorCode ?? quicktest.FailureCode ?? "RECIPE_EVIDENCE_MISMATCH";
             nextAction = success ? "status" :
                 state.RestartPending ? "wait-event" : "inspect-evidence";
+            if (success && plan is not null)
+            {
+                RetireEquivalentRecipeFailuresLocked(
+                    id,
+                    plan.ProfileFingerprint,
+                    plan.TestInputs,
+                    sourceFingerprint);
+            }
         }
         string failureFingerprint = success ? null : RecordRecipeFailure(id, failure,
             "The recipe did not produce all expected structured evidence.", generation,

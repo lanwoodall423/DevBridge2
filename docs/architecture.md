@@ -330,6 +330,17 @@ uses its canonical `RIMWORLD_ROOT`-derived installation root as `-p:RIMWORLD_DIR
 root must contain `RimWorldWin64_Data\Managed\Assembly-CSharp.dll`, otherwise the transaction fails
 before MSBuild with `RIMWORLD_DIR_UNRESOLVED`. Mod authors and agents therefore do not set
 `RIMWORLD_DIR` manually when invoking DevBridge2.
+
+For mod descriptors, optional `runtimePackage` declares the package source root plus bounded
+`include`/`exclude` relative wildcards. The owner stages the built assembly and every selected
+`About`, `Defs`, `Patches`, language, texture, sound, version, or other declared file as one
+package identity. It writes a deployment manifest under coordinator state, removes only paths
+owned by the prior manifest, preserves and reports unknown operator files, and records a
+`.pending` marker until the active runtime has accepted the new generation. Per-file replacement
+is atomic; the target-specific DevBridge mutation mutex serializes competing agents. A changed
+or malformed owned path fails closed as `DEVBRIDGE_DEPLOYMENT_OWNERSHIP_AMBIGUOUS`.
+Descriptors marked `deploymentRole: tooling-only` are rejected by `mod-test.ps1`; RimLiaison
+tooling builds and synchronization therefore cannot be treated as RimWorld mod deployment.
 The transaction reuses existing project registration, lease, `stop`, deployment, `ensure-ready`, and recipe contracts. A
 caller may pass its complete `lease-<32 hex>` capability with `-LeaseId`; ownership is validated,
 never transferred, and never ended by the transaction. A byte-identical artifact with an already

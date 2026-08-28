@@ -13,6 +13,50 @@ internal static class DoctorSeverities
     internal const string Error = "ERROR";
 }
 
+internal static class DiagnosticResponseLimits
+{
+    internal const int MaxSampleCount = 16;
+    internal const int MaxFindingCount = 96;
+    internal const int MaxDiagnosticStringLength = 4096;
+}
+
+internal sealed class DiagnosticCollectionSummary
+{
+    [JsonPropertyName("totalCount")]
+    public int TotalCount { get; set; }
+
+    [JsonPropertyName("sampleCount")]
+    public int SampleCount { get; set; }
+
+    [JsonPropertyName("truncated")]
+    public bool Truncated { get; set; }
+}
+
+internal sealed class DiagnosticPayloadMetadata
+{
+    [JsonPropertyName("operation")]
+    public string Operation { get; set; }
+
+    [JsonPropertyName("configuredLimitBytes")]
+    public int ConfiguredLimitBytes { get; set; }
+
+    [JsonPropertyName("estimatedSerializedBytes")]
+    public long? EstimatedSerializedBytes { get; set; }
+
+    [JsonPropertyName("summarized")]
+    public bool Summarized { get; set; }
+
+    [JsonPropertyName("truncated")]
+    public bool Truncated { get; set; }
+
+    [JsonPropertyName("fallback")]
+    public bool Fallback { get; set; }
+
+    [JsonPropertyName("collections")]
+    public SortedDictionary<string, DiagnosticCollectionSummary> Collections { get; set; } =
+        new(StringComparer.Ordinal);
+}
+
 internal sealed class DoctorNextAction
 {
     [JsonPropertyName("command")]
@@ -160,6 +204,8 @@ internal sealed class DoctorAuditReport
     internal GenerationHistoryView GenerationHistory { get; set; }
     internal ConfigurationHealth NextGenerationConfig { get; set; }
     internal List<DoctorNextAction> NextActions { get; } = new();
+    internal int FindingsTotalCount { get; private set; }
+    internal bool FindingsTruncated { get; private set; }
 
     internal void AddFinding(string severity, string code, string message, string component,
         IDictionary<string, string> details = null)
@@ -187,12 +233,27 @@ internal sealed class DoctorAuditReport
     {
         Findings.Sort((left, right) => string.Compare(left.StableKey(), right.StableKey(),
             StringComparison.Ordinal));
+        FindingsTotalCount = Findings.Count;
+        FindingsTruncated = Findings.Count > DiagnosticResponseLimits.MaxFindingCount;
+        if (FindingsTruncated)
+        {
+            DoctorFinding firstError = FirstError;
+            List<DoctorFinding> retained = Findings.Take(DiagnosticResponseLimits.MaxFindingCount).ToList();
+            if (firstError != null && !retained.Contains(firstError))
+                retained[retained.Count - 1] = firstError;
+            retained.Sort((left, right) => string.Compare(left.StableKey(), right.StableKey(),
+                StringComparison.Ordinal));
+            Findings.Clear();
+            Findings.AddRange(retained);
+        }
+
         NextActions.Clear();
         foreach (DoctorNextAction action in Findings.SelectMany(value => value.NextActions)
                      .Concat(RecoveryGuidance.For(FirstError?.Code, FirstError?.Message))
                      .GroupBy(value => value.StableKey(), StringComparer.Ordinal)
                      .Select(value => value.First())
-                     .OrderBy(value => value.StableKey(), StringComparer.Ordinal))
+                     .OrderBy(value => value.StableKey(), StringComparer.Ordinal)
+                     .Take(DiagnosticResponseLimits.MaxSampleCount))
             NextActions.Add(action);
     }
 }

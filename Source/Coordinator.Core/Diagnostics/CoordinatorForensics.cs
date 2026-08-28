@@ -451,6 +451,55 @@ internal sealed partial class CoordinatorState
                 RunningBuildIdentity?.SourceRevision, sourceFingerprint));
     }
 
+    internal int RetireEquivalentRecipeFailuresLocked(
+        string recipeId,
+        string projectFingerprint,
+        IReadOnlyList<TestInputValue> inputs,
+        string sourceFingerprint = null)
+    {
+        // A successful run is a positive observation for the recipe itself.
+        // Retire its active guard entries across prior contexts; their
+        // evidence remains durable for historical diagnosis.
+        FailureOccurrenceSummary[] retired = (state.FailureOccurrences ??
+                new List<FailureOccurrenceSummary>())
+            .Where(value => value != null &&
+                string.Equals(
+                    value.RecipeId,
+                    FailureFingerprinting.NormalizeToken(recipeId),
+                    StringComparison.Ordinal))
+            .ToArray();
+        if (retired.Length == 0)
+        {
+            return 0;
+        }
+
+        HashSet<string> retiredFingerprints = retired
+            .Select(static value => value.FailureFingerprint)
+            .Where(static value => !string.IsNullOrWhiteSpace(value))
+            .ToHashSet(StringComparer.Ordinal);
+        state.FailureOccurrences = (state.FailureOccurrences ??
+                new List<FailureOccurrenceSummary>())
+            .Where(value => value is null ||
+                !retiredFingerprints.Contains(value.FailureFingerprint))
+            .ToList();
+        if (!string.IsNullOrWhiteSpace(state.LatestFailureFingerprint) &&
+            retiredFingerprints.Contains(state.LatestFailureFingerprint))
+        {
+            state.LatestFailureFingerprint = null;
+            state.LatestFailureSeenBefore = false;
+            state.LatestFailureGeneration = 0;
+            state.LatestFailureSummary = null;
+            state.LatestFailureEvidenceId = null;
+            state.LatestFailureDiagnosisReference = null;
+            state.LatestFailureContextFingerprint = null;
+            state.LatestFailureRecipeId = null;
+            state.LatestFailureComponent = null;
+        }
+        SaveStateLocked();
+        return retired.Length;
+    }
+
+
     private bool IsRepeatableRecipeFailureOccurrenceLocked(FailureOccurrenceSummary occurrence)
     {
         if (occurrence == null)

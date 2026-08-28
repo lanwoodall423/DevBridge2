@@ -599,7 +599,7 @@ function Invoke-BuildFailureContract {
         Write-Utf8File $badProject $projectText
         Write-Utf8File (Join-Path $badProjectRoot 'FailingBuild.cs') 'public static class FailingBuild {'
         foreach ($index in 1..320) {
-            Write-Utf8File (Join-Path $badProjectRoot ("Broken$index.cs")) "public static class Broken$index"
+            Write-Utf8File (Join-Path $badProjectRoot ("Broken$index.cs")) "public static class Broken$index { }"
         }
         if ($PathWithSpaces) { $DescriptorOverride = $true }
         $expectedRimWorldDirectory = $fixture.Root
@@ -668,10 +668,15 @@ function Invoke-BuildFailureContract {
             }
         }
         foreach ($field in @('stage', 'command', 'exitCode', 'errorCode', 'message', 'output',
-                'outputTruncated', 'transactionId', 'workflowId')) {
+                'outputTruncated', 'transactionId', 'workflowId', 'causeErrorCode', 'cause',
+                'deploymentStarted', 'deploymentCommitted', 'retrySafety', 'evidence')) {
             if ($bad.failure.PSObject.Properties.Name -notcontains $field) {
                 throw "failure diagnostic field is missing from the compact response: $field"
             }
+        }
+        if ([bool]$bad.deploymentStarted -or [bool]$bad.deploymentCommitted -or
+            [string]$bad.retrySafety -ne 'SAFE_AFTER_REPAIR') {
+            throw "pre-deployment build failure did not preserve safe retry semantics: $badOutput"
         }
         if ([string]$bad.stage -ne 'build' -or
             [string]$bad.failure.stage -ne 'build' -or
@@ -1156,13 +1161,15 @@ $results.Add((Invoke-Case 'bounded mod build deploy run test transaction' {
         New-Item -ItemType Directory -Force -Path (Join-Path $fixture.Root 'InstalledMods\lan.frontier\About'),
             (Join-Path $packageSourceRoot 'About'),
             (Join-Path $packageSourceRoot 'Defs'),
-            (Join-Path $packageSourceRoot 'Textures') | Out-Null
+            (Join-Path $packageSourceRoot 'Textures'),
+            (Join-Path $packageSourceRoot '1.6\Assemblies') | Out-Null
         Write-Utf8File (Join-Path $fixture.Root 'InstalledMods\lan.frontier\About\About.xml') @'
 <ModMetaData><name>Frontier fixture</name><packageId>lan.frontier</packageId><supportedVersions><li>1.6</li></supportedVersions></ModMetaData>
 '@
-        Write-Utf8File (Join-Path $packageSourceRoot 'About\About.xml') '<ModMetaData><name>Whole package fixture</name></ModMetaData>'
+        Write-Utf8File (Join-Path $packageSourceRoot 'About\About.xml') '<ModMetaData><name>Whole package fixture</name><packageId>lan.frontier</packageId></ModMetaData>'
         Write-Utf8File (Join-Path $packageSourceRoot 'Defs\Thing.xml') '<Defs><ThingDef><defName>FixtureThing</defName></ThingDef></Defs>'
         Write-Utf8File (Join-Path $packageSourceRoot 'Textures\fixture.txt') 'fixture texture'
+        Write-Utf8File (Join-Path $packageSourceRoot '1.6\Assemblies\DevBridge.ModFixture.dll') 'stale source assembly'
         New-Item -ItemType Directory -Force -Path (Join-Path $transactionRoot '1.6\Assemblies') | Out-Null
         $descriptor = [ordered]@{
             schemaVersion = 'devbridge-mod-development/v1'
@@ -1174,7 +1181,7 @@ $results.Add((Invoke-Case 'bounded mod build deploy run test transaction' {
             testRecipe = 'mod-development-smoke'
             runtimePackage = [ordered]@{
                 sourceRoot = $packageSourceRootName
-                include = @('About/**', 'Defs/**', 'Textures/**', 'Sounds/**')
+                include = @('About/**', 'Defs/**', 'Textures/**', 'Sounds/**', '1.*/**')
                 exclude = @()
             }
             buildProperties = [ordered]@{ RIMWORLD_DIR = $fixture.Root }
@@ -1189,7 +1196,7 @@ $results.Add((Invoke-Case 'bounded mod build deploy run test transaction' {
         $exitCode = $LASTEXITCODE
         $report = Get-JsonResponse $output
         if ($exitCode -ne 0 -or -not [bool]$report.success) {
-            throw "mod-test transaction failed (exit $exitCode): $output"
+            throw "mod-test transaction failed (exit $exitCode): $output failure=$($report.failure | ConvertTo-Json -Compress)"
         }
         if ([bool]$report.deployment.changed -ne $true -or
             [string]$report.deployment.stagedSha256 -ne [string]$report.deployment.deployedSha256After -or
@@ -1200,6 +1207,21 @@ $results.Add((Invoke-Case 'bounded mod build deploy run test transaction' {
             -not [bool]$report.cleanup.registrationReleased) {
             throw "mod-test did not report hash-verified deployment and owned cleanup: $output"
         }
+        $staleSourceHash = (Get-FileHash (Join-Path $packageSourceRoot '1.6\Assemblies\DevBridge.ModFixture.dll') -Algorithm SHA256).Hash
+        $deployedAssemblyPath = Join-Path $transactionRoot '1.6\Assemblies\DevBridge.ModFixture.dll'
+        $deployedAssemblyHash = (Get-FileHash $deployedAssemblyPath -Algorithm SHA256).Hash
+        $managedAssemblyPaths = @($report.deployment.managedFiles | Where-Object {
+            $_ -ieq '1.6/Assemblies/DevBridge.ModFixture.dll'
+        })
+        if ($managedAssemblyPaths.Count -ne 1 -or
+            $deployedAssemblyHash -eq $staleSourceHash -or
+            [string]$report.deployment.stagedSha256 -ne $deployedAssemblyHash) {
+            throw "built assembly did not deterministically replace the stale package assembly: $output"
+        }
+        $managedPaths = @($report.deployment.managedFiles | ForEach-Object { $_.ToLowerInvariant() })
+        if ($managedPaths.Count -ne (@($managedPaths | Select-Object -Unique)).Count) {
+            throw "package inventory contains duplicate runtime destinations: $output"
+        }
         $secondOutput = & pwsh @arguments 2>&1 | Out-String
         $secondExitCode = $LASTEXITCODE
         $second = Get-JsonResponse $secondOutput
@@ -1207,6 +1229,57 @@ $results.Add((Invoke-Case 'bounded mod build deploy run test transaction' {
             [string]$second.artifactFreshness.deploymentDecision -ne 'unchanged' -or
             -not [bool]$second.artifactFreshness.loadedArtifactFreshnessProven) {
             throw "identical mod-test transaction was not a no-op: $secondOutput"
+        }
+        $legacyManifestPath = [string]$report.deployment.manifestPath
+        Remove-Item -LiteralPath $legacyManifestPath -Force
+        $beforeAdoption = @{}
+        Get-ChildItem -LiteralPath $transactionRoot -File -Recurse | ForEach-Object {
+            $relative = [IO.Path]::GetRelativePath($transactionRoot, $_.FullName).Replace('\', '/')
+            $beforeAdoption[$relative] = (Get-FileHash $_.FullName -Algorithm SHA256).Hash
+        }
+        $adoptionOutput = & pwsh @arguments -SkipRecipe 2>&1 | Out-String
+        $adoptionExitCode = $LASTEXITCODE
+        $adoption = Get-JsonResponse $adoptionOutput
+        if ($adoptionExitCode -ne 0 -or -not [bool]$adoption.success -or
+            [string]$adoption.deployment.ownershipReconciliation.mode -ne 'LEGACY_EXACT_ADOPTION' -or
+            [bool]$adoption.deployment.changed -or
+            [string]$adoption.deployment.deployedPackageSha256Before -ne
+                [string]$adoption.deployment.deployedPackageSha256After) {
+            throw "exact legacy deployment was not adopted without changes: $adoptionOutput"
+        }
+        $afterAdoption = @{}
+        Get-ChildItem -LiteralPath $transactionRoot -File -Recurse | ForEach-Object {
+            $relative = [IO.Path]::GetRelativePath($transactionRoot, $_.FullName).Replace('\', '/')
+            $afterAdoption[$relative] = (Get-FileHash $_.FullName -Algorithm SHA256).Hash
+        }
+        if (($beforeAdoption | ConvertTo-Json -Compress) -ne ($afterAdoption | ConvertTo-Json -Compress) -or
+            -not (Test-Path -LiteralPath $legacyManifestPath -PathType Leaf)) {
+            throw "exact adoption changed runtime bytes or did not recreate ownership metadata: $adoptionOutput"
+        }
+        $adoptionManifest = Get-Content -LiteralPath $legacyManifestPath -Raw | ConvertFrom-Json
+        if ([string]$adoptionManifest.ownershipProvenance -ne 'LEGACY_EXACT_ADOPTION' -or
+            [string]$adoptionManifest.adoption.classification -ne 'LEGACY_EXACT') {
+            throw "exact adoption provenance was not persisted: $adoptionOutput"
+        }
+        $aboutPath = Join-Path $transactionRoot 'About/About.xml'
+        $aboutBeforeIdentityCheck = Get-Content -LiteralPath $aboutPath -Raw
+        Remove-Item -LiteralPath $legacyManifestPath -Force
+        Write-Utf8File $aboutPath '<ModMetaData><name>Wrong legacy identity</name><packageId>lan.not-frontier</packageId></ModMetaData>'
+        $identityOutput = & pwsh @arguments -SkipRecipe 2>&1 | Out-String
+        $identityExitCode = $LASTEXITCODE
+        $identity = Get-JsonResponse $identityOutput
+        Write-Utf8File $aboutPath $aboutBeforeIdentityCheck
+        if ($identityExitCode -eq 0 -or
+            ([string]$identity.failure.errorCode -ne 'DEVBRIDGE_DEPLOYMENT_LEGACY_IDENTITY_MISMATCH' -and
+                [string]$identity.failure.causeErrorCode -ne 'DEVBRIDGE_DEPLOYMENT_LEGACY_IDENTITY_MISMATCH')) {
+            throw "legacy package identity mismatch was not rejected: $identityOutput"
+        }
+        $adoptAgainOutput = & pwsh @arguments -SkipRecipe 2>&1 | Out-String
+        $adoptAgainExitCode = $LASTEXITCODE
+        $adoptAgain = Get-JsonResponse $adoptAgainOutput
+        if ($adoptAgainExitCode -ne 0 -or -not [bool]$adoptAgain.success -or
+            [string]$adoptAgain.deployment.ownershipReconciliation.mode -ne 'LEGACY_EXACT_ADOPTION') {
+            throw "legacy runtime could not be re-adopted after identity rejection: $adoptAgainOutput"
         }
         $expectedPackagePaths = [ordered]@{
             'About/About.xml' = Join-Path $transactionRoot 'About/About.xml'
@@ -1260,6 +1333,35 @@ $results.Add((Invoke-Case 'bounded mod build deploy run test transaction' {
             (Test-Path -LiteralPath (Join-Path $transactionRoot 'operator.keep')) -eq $false -or
             -not (@($unknown.deployment.unknownFiles) -contains 'operator.keep')) {
             throw "unknown operator file was not preserved and reported: $unknownOutput"
+        }
+        Remove-Item -LiteralPath $legacyManifestPath -Force
+        $replacementOutput = & pwsh @arguments -SkipRecipe 2>&1 | Out-String
+        $replacementExitCode = $LASTEXITCODE
+        $replacement = Get-JsonResponse $replacementOutput
+        if ($replacementExitCode -ne 0 -or -not [bool]$replacement.success -or
+            [string]$replacement.deployment.ownershipReconciliation.mode -ne 'CONTROLLED_REPLACEMENT' -or
+            [string]$replacement.deployment.ownershipReconciliation.classification -ne 'LEGACY_WITH_UNKNOWN_CONTENT' -or
+            [string]$replacement.deployment.rollbackState -ne 'retained-after-success' -or
+            (Test-Path -LiteralPath (Join-Path $transactionRoot 'operator.keep'))) {
+            throw "legacy replacement did not quarantine unknown content safely: $replacementOutput"
+        }
+        $replacementManifest = Get-Content -LiteralPath $legacyManifestPath -Raw | ConvertFrom-Json
+        if ([string]$replacementManifest.ownershipProvenance -ne 'LEGACY_CONTROLLED_REPLACEMENT') {
+            throw "controlled replacement provenance was not persisted: $replacementOutput"
+        }
+        $outsideRoot = Join-Path $fixture.Root 'RimWorld/NotMods/Frontier'
+        Get-ChildItem -LiteralPath $transactionRoot -Force | Copy-Item -Destination $outsideRoot -Recurse -Force
+        $outsideArguments = @($arguments)
+        $deploymentArgumentIndex = [Array]::IndexOf([object[]]$outsideArguments, '-DeploymentRoot')
+        $outsideArguments[$deploymentArgumentIndex + 1] = $outsideRoot
+        $outsideOutput = & pwsh @outsideArguments -SkipRecipe 2>&1 | Out-String
+        $outsideExitCode = $LASTEXITCODE
+        $outside = Get-JsonResponse $outsideOutput
+        if ($outsideExitCode -eq 0 -or
+            ([string]$outside.failure.errorCode -notmatch 'DEPLOYMENT|RIMWORLD|TARGET|ROOT' -and
+                [string]$outside.failure.causeErrorCode -notmatch 'DEPLOYMENT|RIMWORLD|TARGET|ROOT' -and
+                [string]$outside.failure.message -notmatch '(?i)deployment|outside|rimworld|mods')) {
+            throw "legacy runtime outside the canonical Mods boundary was not rejected: $outsideOutput"
         }
 
         Write-Utf8File (Join-Path $packageSourceRoot 'About\About.xml') '<ModMetaData><name>Contention fixture</name></ModMetaData>'

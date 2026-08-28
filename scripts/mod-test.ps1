@@ -63,6 +63,9 @@ $script:Report = [ordered]@{
     stage = 'preflight'
     nextAction = 'inspect-result'
     exitCode = 1
+    deploymentStarted = $false
+    deploymentCommitted = $false
+    retrySafety = $null
     build = $null
     buildDiscrimination = $null
     deployment = $null
@@ -110,6 +113,8 @@ $script:KeepOwnership = $false
 $script:TracePath = $tracePath
 $script:DeploymentMutex = $null
 $script:DeploymentLockAcquired = $false
+$script:LegacyBackupPath = $null
+$script:LegacyRootMoved = $false
 $script:DeploymentPendingPath = $null
 
 $script:BuildDiagnosticOutputLimit = 16384
@@ -345,7 +350,7 @@ function Read-Descriptor {
     if ((Get-Item -LiteralPath $descriptorPath).Length -gt 131072) { throw 'descriptor exceeds the 128 KiB bound' }
     try { $value = Get-Content -LiteralPath $descriptorPath -Raw | ConvertFrom-Json -Depth 16 }
     catch { throw "descriptor is not bounded valid JSON: $($_.Exception.Message)" }
-    $allowed = @('schemaVersion', 'project', 'sourceProject', 'configuration', 'expectedAssembly',
+    $allowed = @('schemaVersion', 'entityType', 'productionEligible', 'project', 'sourceProject', 'configuration', 'expectedAssembly',
         'deploymentTarget', 'testRecipe', 'buildProperties', 'runtimePackage', 'deploymentRole')
     foreach ($property in $value.PSObject.Properties.Name) {
         if ($property -notin $allowed) { throw "descriptor field is not allowed: $property" }
@@ -361,6 +366,25 @@ function Read-Descriptor {
     if (-not [string]::IsNullOrWhiteSpace([string]$value.deploymentRole) -and
         [string]$value.deploymentRole -notin @('mod', 'tooling-only')) {
         throw 'deploymentRole must be mod or tooling-only'
+    }
+    if ($null -ne $value.productionEligible -and
+        $value.productionEligible -isnot [bool]) {
+        throw 'productionEligible must be a JSON boolean'
+    }
+    $nonProductionEntityTypes = @('fixture', 'test', 'internal', 'example')
+    $toolingDescriptorRoot = Join-Path $repoRoot 'DevelopmentProjects'
+    $isToolingDescriptor = Test-PathWithin $descriptorPath $toolingDescriptorRoot
+    if ($isToolingDescriptor -and
+        ($value.entityType -notin $nonProductionEntityTypes -or
+            $value.productionEligible -ne $false)) {
+        throw 'EXTERNAL_PRODUCTION_DESCRIPTOR_IN_TOOLING: DevelopmentProjects descriptors must be explicitly non-production fixtures'
+    }
+    if ($null -ne $value.entityType -and $value.entityType -notin $nonProductionEntityTypes) {
+        throw 'entityType must be fixture, test, internal, or example'
+    }
+    if ($value.entityType -in $nonProductionEntityTypes -and
+        $value.productionEligible -ne $false) {
+        throw 'non-production descriptors must set productionEligible to false'
     }
     $value | Add-Member -NotePropertyName ResolvedSource -NotePropertyValue (Resolve-SourceProject ([string]$value.sourceProject))
     $value | Add-Member -NotePropertyName SafeExpectedAssembly -NotePropertyValue (Get-SafeRelativePath ([string]$value.expectedAssembly) 'expectedAssembly')
@@ -547,6 +571,99 @@ function Get-DeploymentManifestPath {
     New-Item -ItemType Directory -Force -Path $directory | Out-Null
     return Join-Path $directory ($Project + '-' + $identityHash.Substring(0, 24) + '.json')
 }
+
+function Get-ProjectPackageId {
+    param([Parameter(Mandatory = $true)]$Descriptor)
+    $candidates = [System.Collections.Generic.List[string]]::new()
+    if ($null -ne $Descriptor.runtimePackage -and
+        -not [string]::IsNullOrWhiteSpace([string]$Descriptor.runtimePackage.sourceRoot)) {
+        $sourceRootValue = [string]$Descriptor.runtimePackage.sourceRoot
+        if ($sourceRootValue -eq '.') {
+            [void]$candidates.Add([IO.Path]::GetFullPath($developmentRoots[0]))
+        } else {
+            $safeSourceRoot = Get-SafeRelativePath $sourceRootValue 'runtimePackage.sourceRoot'
+            [void]$candidates.Add([IO.Path]::GetFullPath(
+                    (Join-Path $developmentRoots[0] $safeSourceRoot)))
+        }
+    }
+    $current = [IO.Directory]::GetParent([IO.Path]::GetFullPath([string]$Descriptor.ResolvedSource))
+    for ($depth = 0; $depth -lt 4 -and $null -ne $current; $depth++) {
+        [void]$candidates.Add($current.FullName)
+        $current = $current.Parent
+    }
+    foreach ($candidate in $candidates | Select-Object -Unique) {
+        $aboutPath = Join-Path $candidate 'About\About.xml'
+        if (-not (Test-Path -LiteralPath $aboutPath -PathType Leaf)) { continue }
+        try {
+            $about = [xml](Get-Content -LiteralPath $aboutPath -Raw)
+            $packageId = [string]$about.ModMetaData.packageId
+            if (-not [string]::IsNullOrWhiteSpace($packageId)) { return $packageId.Trim() }
+        } catch {
+            Throw-CausalFailure 'DEVBRIDGE_DEPLOYMENT_LEGACY_IDENTITY_MISMATCH' 'deployment' `
+                'the source package About/About.xml is not valid XML' `
+                'legacy runtime identity validation' @{ aboutPath = $aboutPath }
+        }
+    }
+    Throw-CausalFailure 'DEVBRIDGE_DEPLOYMENT_LEGACY_IDENTITY_MISMATCH' 'deployment' `
+        'the source project has no readable About/About.xml package identity' `
+        'legacy runtime identity validation' @{}
+}
+
+function Assert-LegacyRuntimeIdentity {
+    param([Parameter(Mandatory = $true)]$Descriptor)
+    $runtimeRoot = [IO.Path]::GetFullPath([string]$Descriptor.ResolvedTargetRoot)
+    $sourceRoot = [IO.Directory]::GetParent(
+        [IO.Directory]::GetParent([IO.Path]::GetFullPath([string]$Descriptor.ResolvedSource)).FullName).FullName
+    if ([string]::Equals($runtimeRoot, $sourceRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        Throw-CausalFailure 'DEVBRIDGE_DEPLOYMENT_LEGACY_IDENTITY_MISMATCH' 'deployment' `
+            'the runtime root is the source repository' 'legacy runtime identity validation' @{
+                sourceRoot = $sourceRoot
+                runtimeRoot = $runtimeRoot
+            }
+    }
+    $parent = [IO.Directory]::GetParent($runtimeRoot)
+    if ($null -ne $parent -and $parent.Name -eq 'Mods') {
+        $rimWorld = $parent.Parent
+        if ($null -eq $rimWorld -or $rimWorld.Name -ne 'RimWorld') {
+            Throw-CausalFailure 'DEVBRIDGE_DEPLOYMENT_LEGACY_IDENTITY_MISMATCH' 'deployment' `
+                'the runtime root is not below the canonical RimWorld Mods boundary' `
+                'legacy runtime identity validation' @{ runtimeRoot = $runtimeRoot }
+        }
+    } elseif ($runtimeRoot -match '(?i)\\RimWorld\\') {
+        Throw-CausalFailure 'DEVBRIDGE_DEPLOYMENT_LEGACY_IDENTITY_MISMATCH' 'deployment' `
+            'the runtime root is outside the canonical RimWorld Mods boundary' `
+            'legacy runtime identity validation' @{ runtimeRoot = $runtimeRoot }
+    }
+    $expectedPackageId = Get-ProjectPackageId $Descriptor
+    $aboutPath = Join-Path $runtimeRoot 'About\About.xml'
+    if (-not (Test-Path -LiteralPath $aboutPath -PathType Leaf)) {
+        Throw-CausalFailure 'DEVBRIDGE_DEPLOYMENT_LEGACY_IDENTITY_MISMATCH' 'deployment' `
+            'the existing runtime has no About/About.xml package identity' `
+            'legacy runtime identity validation' @{ aboutPath = $aboutPath }
+    }
+    try {
+        $runtimeAbout = [xml](Get-Content -LiteralPath $aboutPath -Raw)
+        $actualPackageId = [string]$runtimeAbout.ModMetaData.packageId
+    } catch {
+        Throw-CausalFailure 'DEVBRIDGE_DEPLOYMENT_LEGACY_IDENTITY_MISMATCH' 'deployment' `
+            'the existing runtime About/About.xml is not valid XML' `
+            'legacy runtime identity validation' @{ aboutPath = $aboutPath }
+    }
+    if (-not [string]::Equals($actualPackageId.Trim(), $expectedPackageId,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        Throw-CausalFailure 'DEVBRIDGE_DEPLOYMENT_LEGACY_IDENTITY_MISMATCH' 'deployment' `
+            'the existing runtime packageId does not match the intended project' `
+            'legacy runtime identity validation' @{
+                expectedPackageId = $expectedPackageId
+                actualPackageId = $actualPackageId
+            }
+    }
+    return [ordered]@{
+        sourceRoot = $sourceRoot
+        runtimeRoot = $runtimeRoot
+        packageId = $expectedPackageId
+    }
+}
 function Prepare-RuntimePackage {
     param([Parameter(Mandatory = $true)]$Descriptor,
         [Parameter(Mandatory = $true)][string]$ExpectedArtifact,
@@ -558,14 +675,31 @@ function Prepare-RuntimePackage {
     if ([IO.Path]::IsPathRooted($assemblyTarget) -or $assemblyTarget.StartsWith('../')) {
         throw 'deployment target is not relative to the active runtime root'
     }
+    $ContentPlan = @($ContentPlan | Where-Object {
+        -not [string]::Equals(
+            [string]$_.PackagePath,
+            $assemblyTarget,
+            [StringComparison]::OrdinalIgnoreCase)
+    })
     $entries = [System.Collections.Generic.List[object]]::new()
     $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($content in @($ContentPlan)) {
         if ($null -eq $content -or
             ($content -is [string] -and [string]::IsNullOrWhiteSpace($content))) { continue }
         $targetPath = Get-SafeRelativePath ([string]$content.PackagePath) 'runtime package path'
-        if (-not $seen.Add($targetPath.Replace('\', '/'))) {
-            throw "runtime package contains duplicate path: $targetPath"
+        $normalizedTargetPath = $targetPath.Replace('\', '/')
+        if (-not $seen.Add($normalizedTargetPath)) {
+            $previous = @($entries | Where-Object { $_.TargetPath -eq $normalizedTargetPath } | Select-Object -First 1)
+            Throw-CausalFailure `
+                'DEVBRIDGE_PACKAGE_DUPLICATE_DESTINATION' `
+                'package' `
+                'runtime package construction' `
+                "runtime package contains duplicate path: $normalizedTargetPath" `
+                @{
+                    path = $normalizedTargetPath
+                    expected = 'one authoritative package source per destination'
+                    actual = @([string]$previous.SourcePath, [string]$content.SourcePath)
+                }
         }
         $staged = [IO.Path]::GetFullPath((Join-Path $stagingRoot $targetPath))
         if (-not (Test-PathWithin $staged $stagingRoot)) { throw 'runtime package path escapes staging root' }
@@ -582,7 +716,16 @@ function Prepare-RuntimePackage {
         })
     }
     if (-not $seen.Add($assemblyTarget)) {
-        throw "runtime package content collides with the built assembly: $assemblyTarget"
+        Throw-CausalFailure `
+            'DEVBRIDGE_PACKAGE_ASSEMBLY_COLLISION' `
+            'package' `
+            'runtime package construction' `
+            "runtime package content collides with the built assembly: $assemblyTarget" `
+            @{
+                path = $assemblyTarget
+                expected = 'the built artifact is the sole authoritative source for the assembly destination'
+                actual = 'another runtime package entry remained at the built assembly destination'
+            }
     }
     $entries.Add([pscustomobject]@{
         SourcePath = $ExpectedArtifact
@@ -612,7 +755,9 @@ function Write-DeploymentManifest {
     param([Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][object[]]$Files,
         [Parameter(Mandatory = $true)][string]$PackageSha256,
-        [Parameter(Mandatory = $true)][int]$Generation)
+        [Parameter(Mandatory = $true)][int]$Generation,
+        [string]$OwnershipProvenance = 'NORMAL_DEVBRIDGE_DEPLOYMENT',
+        [string]$MigrationClassification = $null)
     $parentInfo = [IO.Directory]::GetParent($Path)
     $parent = if ($null -eq $parentInfo) { $null } else { $parentInfo.FullName }
     Assert-Directory $parent 'deployment manifest parent'
@@ -623,6 +768,16 @@ function Write-DeploymentManifest {
         sourceFingerprint = $script:Report.sourceFingerprint
         packageSha256 = $PackageSha256
         transactionId = $script:Report.transactionId
+        ownershipProvenance = $OwnershipProvenance
+        adoption = if ([string]::IsNullOrWhiteSpace($MigrationClassification)) {
+            $null
+        } else {
+            [ordered]@{
+                classification = $MigrationClassification
+                adoptedAtUtc = [DateTime]::UtcNow.ToString('o')
+                transactionId = $script:Report.transactionId
+            }
+        }
         workflowId = $script:Report.workflowId
         generation = $Generation
         files = @($Files | Sort-Object TargetPath | ForEach-Object {
@@ -668,6 +823,74 @@ function Release-DeploymentMutationLock {
     }
     $script:DeploymentLockAcquired = $false
     $script:DeploymentMutex = $null
+}
+
+function Move-LegacyRuntimeToRollback {
+    param([Parameter(Mandatory = $true)][string]$RuntimeRoot)
+    if (-not (Test-Path -LiteralPath $RuntimeRoot -PathType Container)) { return }
+    Assert-NoReparsePath $RuntimeRoot
+    $backup = Join-Path $transactionRoot 'legacy-runtime'
+    if (Test-Path -LiteralPath $backup) {
+        Throw-CausalFailure 'DEVBRIDGE_DEPLOYMENT_ADOPTION_UNSAFE' 'deployment' `
+            'the bounded legacy rollback location already exists' `
+            'legacy runtime replacement' @{ rollbackPath = $backup }
+    }
+    Move-Item -LiteralPath $RuntimeRoot -Destination $backup
+    $script:LegacyBackupPath = $backup
+    $script:LegacyRootMoved = $true
+    New-Item -ItemType Directory -Force -Path $RuntimeRoot | Out-Null
+    Assert-NoReparsePath $RuntimeRoot
+}
+
+function Restore-LegacyRuntimeFromRollback {
+    if (-not $script:LegacyRootMoved -or
+        [string]::IsNullOrWhiteSpace($script:LegacyBackupPath)) { return }
+    $runtimeRoot = [IO.Path]::GetFullPath([string]$descriptor.ResolvedTargetRoot)
+    try {
+        if (Test-Path -LiteralPath $runtimeRoot -PathType Container) {
+            Assert-NoReparsePath $runtimeRoot
+            Remove-Item -LiteralPath $runtimeRoot -Recurse -Force
+        }
+        if (Test-Path -LiteralPath $script:LegacyBackupPath -PathType Container) {
+            Move-Item -LiteralPath $script:LegacyBackupPath -Destination $runtimeRoot
+            $script:Report.deployment.rollbackState = 'restored'
+        } else {
+            $script:Report.deployment.rollbackState = 'rollback-missing'
+        }
+    } catch {
+        $script:Report.deployment.rollbackState = 'restore-failed'
+        $script:Report.cleanup.error = Limit-Text $_.Exception.Message
+    }
+    $script:LegacyRootMoved = $false
+}
+
+function Confirm-LegacyExactUnchanged {
+    param([Parameter(Mandatory = $true)]$Descriptor,
+        [Parameter(Mandatory = $true)][object[]]$PackageFiles)
+    $expected = @{}
+    foreach ($file in $PackageFiles) { $expected[[string]$file.TargetPath] = [string]$file.Sha256 }
+    $observed = @{}
+    foreach ($path in [IO.Directory]::EnumerateFiles($Descriptor.ResolvedTargetRoot, '*', [IO.SearchOption]::AllDirectories)) {
+        Assert-NoReparsePath $path
+        $relative = [IO.Path]::GetRelativePath(
+            $Descriptor.ResolvedTargetRoot, $path).Replace('\', '/')
+        $observed[$relative] = Get-Hash $path
+    }
+    if ($observed.Count -ne $expected.Count) {
+        Throw-CausalFailure 'DEVBRIDGE_DEPLOYMENT_ADOPTION_RACE' 'deployment' `
+            'the legacy runtime inventory changed during adoption verification' `
+            'legacy exact adoption verification' @{
+                expectedFileCount = $expected.Count
+                observedFileCount = $observed.Count
+            }
+    }
+    foreach ($path in $expected.Keys) {
+        if (-not $observed.ContainsKey($path) -or $observed[$path] -ne $expected[$path]) {
+            Throw-CausalFailure 'DEVBRIDGE_DEPLOYMENT_ADOPTION_RACE' 'deployment' `
+                "legacy runtime file changed during adoption verification: $path" `
+                'legacy exact adoption verification' @{ path = $path }
+        }
+    }
 }
 
 
@@ -765,6 +988,27 @@ function Get-ArtifactPaths {
         ForEach-Object { [IO.Path]::GetFullPath($_) } | Select-Object -Unique)
 }
 
+function Throw-CausalFailure {
+    param([Parameter(Mandatory = $true)][string]$ErrorCode,
+        [Parameter(Mandatory = $true)][string]$Phase,
+        [Parameter(Mandatory = $true)][string]$Command,
+        [Parameter(Mandatory = $true)][string]$Message,
+        [hashtable]$Details = @{})
+    $exception = [InvalidOperationException]::new($Message)
+    $cause = [ordered]@{
+        errorCode = $ErrorCode
+        phase = $Phase
+        command = $Command
+        message = $Message
+        exceptionType = $exception.GetType().FullName
+    }
+    foreach ($key in $Details.Keys) {
+        $cause[$key] = $Details[$key]
+    }
+    $exception.Data['DevBridgeCause'] = $cause
+    throw $exception
+}
+
 function Set-Failure {
     param([Parameter(Mandatory = $true)][string]$Stage,
         [Parameter(Mandatory = $true)][string]$NextAction,
@@ -780,6 +1024,9 @@ function Set-Failure {
     } else {
         [pscustomobject]@{ Text = Limit-Text ([string]$Output); Truncated = [bool]$OutputTruncated }
     }
+    $script:Report.retrySafety = if ([bool]$script:Report.deploymentStarted) {
+        if ([bool]$script:Report.deploymentCommitted) { 'COMMITTED_RECONCILE' } else { 'UNKNOWN_RECONCILE' }
+    } else { 'SAFE_AFTER_REPAIR' }
     $script:Report.failure = [ordered]@{
         stage = $Stage
         command = $Command
@@ -791,6 +1038,12 @@ function Set-Failure {
         causalDiagnostic = if ($Stage -eq 'build' -and $null -ne $script:Report.build) { $script:Report.build.causalDiagnostic } else { $null }
         diagnosticSignature = if ($Stage -eq 'build' -and $null -ne $script:Report.build) { $script:Report.build.diagnosticSignature } else { $null }
         ownership = if ($Stage -eq 'build' -and $null -ne $script:Report.build) { $script:Report.build.ownership } else { $null }
+        causeErrorCode = $null
+        cause = $null
+        deploymentStarted = [bool]$script:Report.deploymentStarted
+        deploymentCommitted = [bool]$script:Report.deploymentCommitted
+        retrySafety = $script:Report.retrySafety
+        evidence = @($script:TracePath)
         transactionId = $script:Report.transactionId
         workflowId = $script:Report.workflowId
     }
@@ -802,6 +1055,7 @@ function Set-Failure {
     $script:FailureRaised = $true
     throw [InvalidOperationException]::new("$Stage failed: $Message")
 }
+
 
 function Read-JsonLine {
     param([string[]]$Lines)
@@ -1363,10 +1617,13 @@ try {
     }
     Assert-NoReparsePath $expectedArtifact
     $builtHash = Get-Hash $expectedArtifact
+    $script:Report.stage = 'package'
+    Write-TransactionTrace 'package' 'runtime package construction started'
     $contentPlan = Resolve-RuntimePackagePlan $descriptor
     $packageFiles = Prepare-RuntimePackage $descriptor $expectedArtifact $contentPlan
     $packageHash = Get-PackageIdentity $packageFiles
     $manifestPath = Get-DeploymentManifestPath
+    Acquire-DeploymentMutationLock
     $script:DeploymentPendingPath = $manifestPath + '.pending'
     $previousManifest = Read-DeploymentManifest $manifestPath
     $previousOwned = @{}
@@ -1383,23 +1640,28 @@ try {
     $expectedPaths = @{}
     foreach ($file in $packageFiles) { $expectedPaths[[string]$file.TargetPath] = $file }
     $existing = @()
-    foreach ($path in [IO.Directory]::EnumerateFiles($descriptor.ResolvedTargetRoot, '*', [IO.SearchOption]::AllDirectories)) {
-        Assert-NoReparsePath $path
-        $existing += [pscustomobject]@{
-            Path = $path
-            RelativePath = [IO.Path]::GetRelativePath(
-                $descriptor.ResolvedTargetRoot, $path).Replace('\', '/')
+    if (Test-Path -LiteralPath $descriptor.ResolvedTargetRoot -PathType Container) {
+        Assert-NoReparsePath $descriptor.ResolvedTargetRoot
+        foreach ($path in [IO.Directory]::EnumerateFiles($descriptor.ResolvedTargetRoot, '*', [IO.SearchOption]::AllDirectories)) {
+            Assert-NoReparsePath $path
+            $existing += [pscustomobject]@{
+                Path = $path
+                RelativePath = [IO.Path]::GetRelativePath(
+                    $descriptor.ResolvedTargetRoot, $path).Replace('\', '/')
+            }
         }
     }
     $unknown = @($existing | Where-Object {
         -not $previousOwned.ContainsKey($_.RelativePath) -and
         -not $expectedPaths.ContainsKey($_.RelativePath)
     } | ForEach-Object { $_.RelativePath })
-    $ownershipConflict = @($existing | Where-Object {
-        $entry = $previousOwned[$_.RelativePath]
-        ($expectedPaths.ContainsKey($_.RelativePath) -and $null -eq $entry) -or
-        ($null -ne $entry -and (Get-Hash $_.Path) -ne [string]$entry.sha256)
-    } | ForEach-Object { $_.RelativePath })
+    $ownershipConflict = if ($null -ne $previousManifest) {
+        @($existing | Where-Object {
+            $entry = $previousOwned[$_.RelativePath]
+            ($expectedPaths.ContainsKey($_.RelativePath) -and $null -eq $entry) -or
+            ($null -ne $entry -and (Get-Hash $_.Path) -ne [string]$entry.sha256)
+        } | ForEach-Object { $_.RelativePath })
+    } else { @() }
     if ($ownershipConflict.Count -gt 0) {
         Set-Failure 'deployment' 'inspect-deployment-ownership' 'DEVBRIDGE_DEPLOYMENT_OWNERSHIP_AMBIGUOUS' `
             ('managed deployment paths were changed outside DevBridge2: ' + ($ownershipConflict -join ', ')) `
@@ -1411,16 +1673,44 @@ try {
         $target = Join-Path $descriptor.ResolvedTargetRoot $file.TargetPath.Replace('/', '\')
         if ((Get-Hash $target) -ne [string]$file.Sha256) { $currentMatches = $false }
     }
-    if ($null -eq $previousManifest -and $existing.Count -gt 0) { $currentMatches = $false }
-    $deployedPackageBefore = if ($currentMatches -and $null -ne $previousManifest) {
-        [string]$previousManifest.packageSha256
-    } else { $null }
-    $deploymentChanged = $null -eq $previousManifest -or
+    $legacyClassification = $null
+    $legacyExactAdopted = $false
+    $legacyReplacement = $false
+    if ($null -eq $previousManifest -and $existing.Count -gt 0) {
+        $legacyIdentity = Assert-LegacyRuntimeIdentity $descriptor
+        if ($currentMatches -and $unknown.Count -eq 0) {
+            $legacyClassification = 'LEGACY_EXACT'
+            $legacyExactAdopted = $true
+        } elseif ($unknown.Count -gt 0) {
+            $legacyClassification = 'LEGACY_WITH_UNKNOWN_CONTENT'
+            $legacyReplacement = $true
+        } else {
+            $legacyClassification = 'LEGACY_RECONCILABLE'
+            $legacyReplacement = $true
+        }
+    }
+    $deployedPackageBefore = if ($currentMatches) { $packageHash } else { $null }
+    $deploymentChanged = $legacyReplacement -or
+        ($null -eq $previousManifest -and -not $legacyExactAdopted) -or
         $packageHash -ne $deployedPackageBefore -or $staleManaged.Count -gt 0
     $script:Report.deployment = [ordered]@{
         targetRoot = [IO.Path]::GetFullPath($descriptor.ResolvedTargetRoot)
         targetPath = [IO.Path]::GetFullPath($descriptor.ResolvedTarget)
         manifestPath = $manifestPath
+        ownershipReconciliation = if ([string]::IsNullOrWhiteSpace($legacyClassification)) {
+            [ordered]@{
+                classification = if ($null -ne $previousManifest) { 'MANAGED' } else { 'NEW_DEPLOYMENT' }
+                mode = 'NORMAL_DEVBRIDGE_DEPLOYMENT'
+            }
+        } else {
+            [ordered]@{
+                classification = $legacyClassification
+                mode = if ($legacyExactAdopted) { 'LEGACY_EXACT_ADOPTION' } else { 'CONTROLLED_REPLACEMENT' }
+                sourceRoot = $legacyIdentity.sourceRoot
+                packageId = $legacyIdentity.packageId
+                unknownFiles = $unknown
+            }
+        }
         managedFileCount = $packageFiles.Count
         managedFiles = @($packageFiles | ForEach-Object { [string]$_.TargetPath })
         unknownFiles = $unknown
@@ -1435,6 +1725,8 @@ try {
         deployedSha256After = Get-Hash $descriptor.ResolvedTarget
         deployedPackageSha256After = $deployedPackageBefore
         stagingPath = $stagingRoot
+        rollbackPath = $null
+        rollbackState = $null
     }
     $script:Report.artifactFreshness.builtArtifactSha256 = $builtHash
     $script:Report.artifactFreshness.deployedArtifactSha256 = $script:Report.deployment.deployedSha256Before
@@ -1447,12 +1739,7 @@ try {
     $statusBeforeResponse = Require-BridgeSuccess 'planning' 'inspect-runtime-status' 'status-before-registration' $statusBefore
     $generationBefore = [int]$statusBeforeResponse.generation
     $script:Report.runtime.generationBefore = $generationBefore
-    $script:Report.artifactFreshness.generationBefore = $generationBefore
     $profileIncludesProject = @($statusBeforeResponse.requestedProjects | ForEach-Object { [string]$_ }) -contains $Project
-
-    # A READY generation that does not include the requested alias cannot grant
-    # a lease after registration. Acquire the current lease first in that one
-    # case, then queue the owned registration before stopping it.
     $leaseBeforeRegistration = (-not $profileIncludesProject -or [string]$statusBeforeResponse.state -ne 'READY')
     if (-not [string]::IsNullOrWhiteSpace($LeaseId)) {
         $script:Report.runtime.leaseId = $LeaseId
@@ -1485,6 +1772,9 @@ try {
 
     $postPlanResult = Invoke-BridgeJson @('test', 'recipe', 'plan', [string]$descriptor.testRecipe)
     $postPlan = Require-BridgeSuccess 'planning' 'fix-recipe-plan' 'recipe-plan-after-registration' $postPlanResult
+    if ($legacyExactAdopted) {
+        Confirm-LegacyExactUnchanged $descriptor $packageFiles
+    }
     $artifactStateMatches = $null -ne $artifactState -and
         [string]$artifactState.project -eq $Project -and
         [string]$artifactState.deploymentRoot -eq [string]$descriptor.ResolvedTargetRoot -and
@@ -1492,10 +1782,10 @@ try {
         [string]$artifactState.deployedPackageSha256 -eq $packageHash -and
         [int]$artifactState.generation -eq $generationBefore
     $noOp = (-not [bool]$script:Report.deployment.changed) -and
-        [bool]$postPlan.alreadySatisfied -and
-        $artifactStateMatches
+        ($legacyExactAdopted -or
+            ([bool]$postPlan.alreadySatisfied -and $artifactStateMatches))
     if (-not $noOp) {
-        Acquire-DeploymentMutationLock
+        $script:Report.deploymentStarted = $true
         Write-PendingDeployment $manifestPath
         $renew = Invoke-BridgeJson @('test', 'renew', [string]$script:Report.runtime.leaseId)
         Require-BridgeSuccess 'lease' 'renew-or-end-lease' 'test-renew-before-stop' $renew | Out-Null
@@ -1508,6 +1798,16 @@ try {
         $script:Report.runtime.maintenanceReady = $true
         $script:Report.runtime.intentionallyInMaintenance = $true
 
+        if ($legacyReplacement) {
+            try {
+                Move-LegacyRuntimeToRollback $descriptor.ResolvedTargetRoot
+                $script:Report.deployment.rollbackState = 'retained-until-success'
+                $script:Report.deployment.rollbackPath = $script:LegacyBackupPath
+            } catch {
+                Set-Failure 'deployment' 'inspect-maintenance-evidence' 'DEVBRIDGE_DEPLOYMENT_ADOPTION_UNSAFE' `
+                    $_.Exception.Message 'legacy runtime directory replacement' 4 $null $true
+            }
+        }
         foreach ($stalePath in $staleManaged) {
             $staleTarget = Join-Path $descriptor.ResolvedTargetRoot $stalePath.Replace('/', '\')
             if (Test-Path -LiteralPath $staleTarget -PathType Leaf) {
@@ -1572,16 +1872,28 @@ try {
     if ($script:Report.deployment.changed -or $generationAfter -gt $generationBefore) {
         $script:Report.artifactFreshness.loadedArtifactFreshnessProven = $true
         $script:Report.artifactFreshness.proof = 'package-manifest-plus-new-owned-generation'
-    } elseif ($artifactStateMatches) {
+    } elseif ($artifactStateMatches -or $legacyExactAdopted) {
         $script:Report.artifactFreshness.loadedArtifactFreshnessProven = $true
-        $script:Report.artifactFreshness.proof = 'package-manifest-plus-owned-generation-state'
+        $script:Report.artifactFreshness.proof = if ($legacyExactAdopted) {
+            'legacy-exact-adoption-plus-owned-generation-state'
+        } else {
+            'package-manifest-plus-owned-generation-state'
+        }
     } else {
         Set-Failure 'freshness' 'rebuild-or-establish-artifact-state' 'DEVELOPMENT_ARTIFACT_FRESHNESS_UNKNOWN' 'the current generation has no matching DevBridge artifact state evidence' 'artifact freshness proof' 4 $null $false
     }
-    Write-DeploymentManifest $manifestPath $packageFiles $packageHash $generationAfter
+    $ownershipProvenance = 'NORMAL_DEVBRIDGE_DEPLOYMENT'
+    if ($legacyExactAdopted) {
+        $ownershipProvenance = 'LEGACY_EXACT_ADOPTION'
+    } elseif ($null -ne $legacyClassification) {
+        $ownershipProvenance = 'LEGACY_CONTROLLED_REPLACEMENT'
+    }
+    Write-DeploymentManifest $manifestPath $packageFiles $packageHash $generationAfter `
+        $ownershipProvenance $legacyClassification
     Write-ArtifactState $generationAfter ([string]$script:Report.deployment.deployedSha256After) `
         $packageHash $manifestPath
     Clear-PendingDeployment
+    $script:Report.deploymentCommitted = $true
 
     if (-not $SkipRecipe) {
         $renew = Invoke-BridgeJson @('test', 'renew', [string]$script:Report.runtime.leaseId)
@@ -1618,16 +1930,50 @@ try {
 }
 catch {
     if (-not $script:FailureRaised) {
-        $script:Report.stage = if ($script:MaintenanceEstablished) { 'deployment' } else { $script:Report.stage }
+        $exception = $_.Exception
+        $cause = if ($exception.Data.Contains('DevBridgeCause')) {
+            [ordered]@{} + $exception.Data['DevBridgeCause']
+        } else {
+            [ordered]@{
+                errorCode = 'DEVBRIDGE_TRANSACTION_EXCEPTION'
+                phase = $script:Report.stage
+                command = 'mod-test.ps1'
+                message = Limit-Text $exception.Message
+                exceptionType = $exception.GetType().FullName
+            }
+        }
+        $evidence = [System.Collections.Generic.List[string]]::new()
+        [void]$evidence.Add($script:TracePath)
+        if ($null -ne $script:Report.build) {
+            [void]$evidence.Add($script:Report.build.rawStdoutPath)
+            [void]$evidence.Add($script:Report.build.rawStderrPath)
+        }
+        $cause.evidence = @($evidence)
+        $script:Report.stage = if ($script:MaintenanceEstablished) { 'deployment' } else { [string]$cause.phase }
         $script:Report.nextAction = if ($script:MaintenanceEstablished) { 'inspect-maintenance-evidence' } else { 'inspect-result' }
         $script:Report.exitCode = 1
+        $script:Report.retrySafety = if ([bool]$script:Report.deploymentStarted) {
+            if ([bool]$script:Report.deploymentCommitted) { 'COMMITTED_RECONCILE' } else { 'UNKNOWN_RECONCILE' }
+        } else { 'SAFE_AFTER_REPAIR' }
         $script:Report.failure = [ordered]@{
             stage = $script:Report.stage
-            command = 'mod-test.ps1'
+            command = if ($cause.Contains('command')) { [string]$cause.command } else { 'mod-test.ps1' }
             exitCode = 1
             errorCode = 'DEVELOPMENT_TRANSACTION_FAILED'
-            message = Limit-Text $_.Exception.Message
+            message = Limit-Text $exception.Message
             output = Limit-Text $_.ScriptStackTrace
+            outputTruncated = $false
+            causalDiagnostic = $null
+            diagnosticSignature = $null
+            ownership = $null
+            causeErrorCode = [string]$cause.errorCode
+            cause = $cause
+            deploymentStarted = [bool]$script:Report.deploymentStarted
+            deploymentCommitted = [bool]$script:Report.deploymentCommitted
+            retrySafety = $script:Report.retrySafety
+            evidence = @($cause.evidence)
+            transactionId = $script:Report.transactionId
+            workflowId = $script:Report.workflowId
         }
         $script:Report.artifactFreshness.errorCode = 'DEVELOPMENT_TRANSACTION_FAILED'
         $script:Report.artifactFreshness.loadedArtifactFreshnessProven = $false
@@ -1635,6 +1981,15 @@ catch {
     }
 }
 finally {
+    if ($script:LegacyRootMoved) {
+        if (-not $script:Report.success -and $script:MaintenanceEstablished) {
+            Restore-LegacyRuntimeFromRollback
+        } elseif ($script:Report.success -and $null -ne $script:Report.deployment) {
+            $script:Report.deployment.rollbackState = 'retained-after-success'
+        } elseif ($null -ne $script:Report.deployment) {
+            $script:Report.deployment.rollbackState = 'retained-recoverable'
+        }
+    }
     if ($script:Report.success -or (-not $script:KeepOwnership -and -not $script:MaintenanceEstablished)) {
         Release-OwnedResources
     } else {
@@ -1690,6 +2045,9 @@ function Get-CompactJsonReport {
             deployedPackageSha256Before = [string]$script:Report.deployment.deployedPackageSha256Before
             deployedPackageSha256After = [string]$script:Report.deployment.deployedPackageSha256After
             manifestPath = [string]$script:Report.deployment.manifestPath
+            ownershipReconciliation = $script:Report.deployment.ownershipReconciliation
+            rollbackPath = [string]$script:Report.deployment.rollbackPath
+            rollbackState = [string]$script:Report.deployment.rollbackState
             managedFileCount = [int]$script:Report.deployment.managedFileCount
             managedFiles = @($script:Report.deployment.managedFiles)
             staleManagedFiles = @($script:Report.deployment.staleManagedFiles)
@@ -1734,6 +2092,12 @@ function Get-CompactJsonReport {
             causalDiagnostic = [string]$script:Report.failure.causalDiagnostic
             diagnosticSignature = [string]$script:Report.failure.diagnosticSignature
             ownership = $script:Report.failure.ownership
+            causeErrorCode = [string]$script:Report.failure.causeErrorCode
+            cause = $script:Report.failure.cause
+            deploymentStarted = [bool]$script:Report.failure.deploymentStarted
+            deploymentCommitted = [bool]$script:Report.failure.deploymentCommitted
+            retrySafety = [string]$script:Report.failure.retrySafety
+            evidence = @($script:Report.failure.evidence)
             transactionId = [string]$script:Report.transactionId
             workflowId = [string]$script:Report.workflowId
         }
@@ -1748,6 +2112,9 @@ function Get-CompactJsonReport {
         stage = $script:Report.stage
         nextAction = $script:Report.nextAction
         exitCode = [int]$script:Report.exitCode
+        deploymentStarted = [bool]$script:Report.deploymentStarted
+        deploymentCommitted = [bool]$script:Report.deploymentCommitted
+        retrySafety = $script:Report.retrySafety
         buildDiscrimination = $script:Report.buildDiscrimination
         build = $build
         deployment = $deployment

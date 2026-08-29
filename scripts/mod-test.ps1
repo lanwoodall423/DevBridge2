@@ -1739,6 +1739,7 @@ try {
     $statusBeforeResponse = Require-BridgeSuccess 'planning' 'inspect-runtime-status' 'status-before-registration' $statusBefore
     $generationBefore = [int]$statusBeforeResponse.generation
     $script:Report.runtime.generationBefore = $generationBefore
+    $script:Report.artifactFreshness.generationBefore = $generationBefore
     $profileIncludesProject = @($statusBeforeResponse.requestedProjects | ForEach-Object { [string]$_ }) -contains $Project
     $leaseBeforeRegistration = (-not $profileIncludesProject -or [string]$statusBeforeResponse.state -ne 'READY')
     if (-not [string]::IsNullOrWhiteSpace($LeaseId)) {

@@ -1201,6 +1201,7 @@ $results.Add((Invoke-Case 'bounded mod build deploy run test transaction' {
         if ([bool]$report.deployment.changed -ne $true -or
             [string]$report.deployment.stagedSha256 -ne [string]$report.deployment.deployedSha256After -or
             [string]$report.artifactFreshness.deploymentDecision -ne 'deployed' -or
+            [int]$report.artifactFreshness.generationBefore -ne [int]$report.runtime.generationBefore -or
             -not [bool]$report.artifactFreshness.loadedArtifactFreshnessProven -or
             [int]$report.artifactFreshness.generation -ne [int]$report.runtime.generationAfter -or
             -not [bool]$report.cleanup.leaseReleased -or
@@ -1227,6 +1228,7 @@ $results.Add((Invoke-Case 'bounded mod build deploy run test transaction' {
         $second = Get-JsonResponse $secondOutput
         if ($secondExitCode -ne 0 -or -not [bool]$second.success -or [bool]$second.deployment.changed -or
             [string]$second.artifactFreshness.deploymentDecision -ne 'unchanged' -or
+            [int]$second.artifactFreshness.generationBefore -ne [int]$second.runtime.generationBefore -or
             -not [bool]$second.artifactFreshness.loadedArtifactFreshnessProven) {
             throw "identical mod-test transaction was not a no-op: $secondOutput"
         }

@@ -38,12 +38,15 @@ internal static class Program
             ParsedArguments parsed = ParsedArguments.Parse(args);
             if (string.IsNullOrWhiteSpace(parsed.Root))
                 throw new ArgumentException("missing --root");
+            string root = Path.GetFullPath(parsed.Root);
+            if (parsed.IsControlPlaneCommand)
+                return RunControlPlane(root, parsed.RuntimeSlotId, parsed.Command[1]);
 
             RuntimeIdentityResolution identity = RuntimeIdentityResolver.Resolve(parsed.Root);
             if (!identity.IsValid)
                 return WriteRuntimeIdentityFailure(parsed.Command, identity);
 
-            string root = Path.GetFullPath(identity.DevBridgeRuntimeRoot);
+            root = Path.GetFullPath(identity.DevBridgeRuntimeRoot);
             Directory.CreateDirectory(root);
 
             if (parsed.Server)
@@ -68,6 +71,16 @@ internal static class Program
             Console.Error.WriteLine("DevBridge error: " + exception.Message);
             return 2;
         }
+    }
+
+    private static int RunControlPlane(string root, string requestedSlot, string action)
+    {
+        CoordinatorControlSnapshot result = string.Equals(action, "probe",
+            StringComparison.OrdinalIgnoreCase)
+            ? CoordinatorControlPlane.Probe(root, requestedSlot)
+            : CoordinatorControlPlane.Recover(root, requestedSlot);
+        Console.WriteLine(JsonSerializer.Serialize(result, JsonOptions));
+        return result.Success ? 0 : 4;
     }
 
     private static int WriteRuntimeIdentityFailure(
@@ -97,7 +110,7 @@ internal static class Program
 
     private static void PrintUsage()
     {
-        Console.WriteLine("DevBridge commands: status | bridge status | bridge policy | bridge endpoint | bridge tools | bridge call <tool-name> [JSON arguments] [--lease <lease-id>] | game inspect|action|wait|advance|save|load|errors | environment viewport begin|restore|status | project register <alias[,alias...]> | project status | project renew <registration-id> | project release <registration-id> | mods status | mods capture-baseline | mods restore-baseline | test begin | test session | test renew <lease-id> | test end <lease-id> | stop <lease-id> | coordinator shutdown | coordinator recover-process <source-state-path> | coordinator migrate-legacy-slot | ensure-ready <lease-id> | restart [--projects none|alias[,alias...]] [--legacy-production] | wait-ready | history [show <generation>|last-good] | doctor | logs | evidence | help");
+        Console.WriteLine("DevBridge commands: status | bridge status | bridge policy | bridge endpoint | bridge tools | bridge call <tool-name> [JSON arguments] [--lease <lease-id>] | game inspect|action|wait|advance|save|load|errors | environment viewport begin|restore|status | project register <alias[,alias...]> | project status | project renew <registration-id> | project release <registration-id> | mods status | mods capture-baseline | mods restore-baseline | test begin | test session | test renew <lease-id> | test end <lease-id> | stop <lease-id> | coordinator probe|recover|shutdown | coordinator recover-process <source-state-path> | coordinator migrate-legacy-slot | ensure-ready <lease-id> | restart [--projects none|alias[,alias...]] [--legacy-production] | wait-ready | history [show <generation>|last-good] | doctor | logs | evidence | help");
         Console.WriteLine("Append --json to a non-session command for machine-readable output.");
         Console.WriteLine("Canonical live gate: pwsh -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\live-stack-smoke.ps1 -Json");
     }
@@ -110,6 +123,13 @@ internal sealed class ParsedArguments
     internal string TicketId { get; private set; }
     internal bool Server { get; private set; }
     internal List<string> Command { get; } = new();
+    internal bool IsControlPlaneCommand =>
+        Command.Count >= 2 && string.Equals(Command[0], "coordinator",
+            StringComparison.OrdinalIgnoreCase) &&
+        (string.Equals(Command[1], "probe", StringComparison.OrdinalIgnoreCase) ||
+         string.Equals(Command[1], "recover", StringComparison.OrdinalIgnoreCase)) &&
+        Command.Skip(2).All(value => string.Equals(value, "--json",
+            StringComparison.OrdinalIgnoreCase));
 
     internal static ParsedArguments Parse(string[] args)
     {
@@ -210,7 +230,7 @@ internal static class CoordinatorClient
 
     internal static int Run(string root, IReadOnlyList<string> command, string runtimeSlotId = null,
         string ticketId = null, Action<string> receivedLine = null,
-        TimeSpan? terminalResponseTimeout = null)
+        TimeSpan? terminalResponseTimeout = null, bool allowRecovery = true)
     {
         string effectiveSlot = RuntimeScope.ResolveEffectiveSlot(root, runtimeSlotId, ticketId);
         bool json = command.Any(argument => string.Equals(argument, "--json", StringComparison.OrdinalIgnoreCase));
@@ -252,8 +272,25 @@ internal static class CoordinatorClient
         }
 
         if (pipe == null || !pipe.IsConnected)
+        {
+            CoordinatorControlSnapshot liveness = CoordinatorControlPlane.Probe(root, effectiveSlot);
+            if (allowRecovery && liveness.RecoverySafe &&
+                liveness.State is CoordinatorLivenessState.Unresponsive or
+                    CoordinatorLivenessState.AcceptedOperationOwned)
+            {
+                CoordinatorControlSnapshot recovery = CoordinatorControlPlane.Recover(root, effectiveSlot);
+                if (recovery.Success && IsRetrySafeCommand(normalizedCommand))
+                    return Run(root, command, runtimeSlotId, ticketId, receivedLine,
+                        terminalResponseTimeout, allowRecovery: false);
+                liveness = recovery;
+            }
+
+            if (json)
+                return WriteClientLivenessFailure(normalizedCommand[0], liveness,
+                    lastError?.Message);
             throw new InvalidOperationException("could not connect to the DevBridge coordinator" +
                 (lastError == null ? string.Empty : ": " + lastError.Message));
+        }
 
         using (pipe)
         using (StreamReader reader = new(pipe, Encoding.UTF8, false, 4096, leaveOpen: true))
@@ -287,6 +324,7 @@ internal static class CoordinatorClient
                 ? new CancellationTokenSource(terminalResponseTimeout ?? CoordinatorResponsePolicy.FiniteTimeout)
                 : null;
             bool terminalSeen = false;
+            long receivedBytes = 0;
             while (true)
             {
                 string line;
@@ -299,6 +337,23 @@ internal static class CoordinatorClient
                 }
                 catch (OperationCanceledException) when (responseTimeout?.IsCancellationRequested == true)
                 {
+                    CoordinatorControlSnapshot liveness = CoordinatorControlPlane.Probe(root, effectiveSlot);
+                    if (allowRecovery && liveness.RecoverySafe &&
+                        liveness.State is CoordinatorLivenessState.Unresponsive or
+                            CoordinatorLivenessState.AcceptedOperationOwned)
+                    {
+                        CoordinatorControlSnapshot recovery = CoordinatorControlPlane.Recover(root, effectiveSlot);
+                        if (recovery.Success && IsRetrySafeCommand(normalizedCommand))
+                            return Run(root, command, runtimeSlotId, ticketId, receivedLine,
+                                terminalResponseTimeout, allowRecovery: false);
+                        liveness = recovery;
+                    }
+                    if (json)
+                        return WriteClientLivenessFailure(normalizedCommand[0], liveness,
+                            errorCodeOverride: "DEVBRIDGE_COMMAND_TIMEOUT",
+                            errorOverride: CoordinatorResponsePolicy.TimeoutMessage(normalizedCommand[0]),
+                            bytesReceived: receivedBytes, commandMayHaveBeenAccepted: true,
+                            retrySafe: IsRetrySafeCommand(normalizedCommand));
                     throw new IOException(
                         "the coordinator disconnected or timed out before returning a terminal IPC result; " +
                         CoordinatorResponsePolicy.TimeoutMessage(normalizedCommand[0]));
@@ -313,20 +368,43 @@ internal static class CoordinatorClient
                 }
                 catch (IOException exception)
                 {
+                    if (json)
+                    {
+                        CoordinatorControlSnapshot liveness = CoordinatorControlPlane.Probe(root, effectiveSlot);
+                        return WriteClientLivenessFailure(normalizedCommand[0], liveness,
+                            exception.Message, errorCodeOverride: liveness.ErrorCode ??
+                                "DEVBRIDGE_IPC_UNAVAILABLE", commandMayHaveBeenAccepted: true,
+                            retrySafe: false);
+                    }
                     throw new IOException(
                         "the coordinator disconnected before returning a terminal IPC result; use DevBridge.cmd wait-ready or status",
                         exception);
                 }
                 catch (ObjectDisposedException exception)
                 {
+                    if (json)
+                    {
+                        CoordinatorControlSnapshot liveness = CoordinatorControlPlane.Probe(root, effectiveSlot);
+                        return WriteClientLivenessFailure(normalizedCommand[0], liveness,
+                            exception.Message, errorCodeOverride: "DEVBRIDGE_IPC_UNAVAILABLE",
+                            commandMayHaveBeenAccepted: true, retrySafe: false);
+                    }
                     throw new IOException(
                         "the coordinator disconnected before returning a terminal IPC result; use DevBridge.cmd wait-ready or status",
                         exception);
                 }
-
                 if (line == null)
+                {
+                    CoordinatorControlSnapshot liveness = CoordinatorControlPlane.Probe(root, effectiveSlot);
+                    if (json)
+                        return WriteClientLivenessFailure(normalizedCommand[0], liveness,
+                            errorCodeOverride: "DEVBRIDGE_COORDINATOR_EXITED_BEFORE_RESPONSE",
+                            errorOverride: "The coordinator exited before emitting a terminal response.",
+                            commandMayHaveBeenAccepted: true, retrySafe: false);
                     throw new IOException(
                         "the coordinator disconnected before returning a terminal IPC result; use DevBridge.cmd wait-ready or status");
+                }
+                receivedBytes += Encoding.UTF8.GetByteCount(line);
 
                 CoordinatorIpcFrame frame;
                 try
@@ -335,6 +413,15 @@ internal static class CoordinatorClient
                 }
                 catch (JsonException exception)
                 {
+                    if (json)
+                    {
+                        CoordinatorControlSnapshot liveness = CoordinatorControlPlane.Probe(root, effectiveSlot);
+                        return WriteClientLivenessFailure(normalizedCommand[0], liveness,
+                            exception.Message, errorCodeOverride: "DEVBRIDGE_RESPONSE_MALFORMED",
+                            errorOverride: "The coordinator emitted malformed structured response data.",
+                            bytesReceived: receivedBytes, commandMayHaveBeenAccepted: true,
+                            retrySafe: false);
+                    }
                     throw new IOException("coordinator returned malformed IPC JSON: " + exception.Message,
                         exception);
                 }
@@ -372,6 +459,66 @@ internal static class CoordinatorClient
         }
 
         throw new IOException("the coordinator disconnected before returning a terminal IPC result; use DevBridge.cmd wait-ready or status");
+    }
+
+    private static bool IsRetrySafeCommand(IReadOnlyList<string> command)
+    {
+        if (command == null || command.Count == 0)
+            return false;
+
+        if (command[0].Equals("status", StringComparison.OrdinalIgnoreCase) ||
+            command[0].Equals("doctor", StringComparison.OrdinalIgnoreCase) ||
+            command[0].Equals("logs", StringComparison.OrdinalIgnoreCase) ||
+            command[0].Equals("evidence", StringComparison.OrdinalIgnoreCase) ||
+            command[0].Equals("history", StringComparison.OrdinalIgnoreCase) ||
+            command[0].Equals("help", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return command[0].Equals("bridge", StringComparison.OrdinalIgnoreCase) &&
+            command.Count > 1 &&
+            (command[1].Equals("status", StringComparison.OrdinalIgnoreCase) ||
+             command[1].Equals("policy", StringComparison.OrdinalIgnoreCase) ||
+             command[1].Equals("endpoint", StringComparison.OrdinalIgnoreCase) ||
+             command[1].Equals("tools", StringComparison.OrdinalIgnoreCase));
+    }
+    private static int WriteClientLivenessFailure(string command,
+        CoordinatorControlSnapshot liveness, string transportError = null,
+        string errorCodeOverride = null, string errorOverride = null, long bytesReceived = 0,
+        bool commandMayHaveBeenAccepted = false, bool retrySafe = false)
+    {
+        var failure = new
+        {
+            success = false,
+            command,
+            exitCode = 4,
+            errorCode = errorCodeOverride ?? liveness.ErrorCode ?? "DEVBRIDGE_IPC_UNAVAILABLE",
+            error = errorOverride ?? liveness.Error ?? transportError ??
+                "The coordinator control plane is unavailable.",
+            nextAction = liveness.NextAction,
+            state = liveness.State.ToString(),
+            timeoutBoundary = errorCodeOverride == "DEVBRIDGE_COMMAND_TIMEOUT"
+                ? "coordinator-response" : "coordinator-connect",
+            wrapperPid = Environment.ProcessId,
+            processExited = false,
+            bytesReceived,
+            partialStructuredOutput = bytesReceived > 0,
+            commandMayHaveBeenAccepted,
+            retrySafe,
+            durableOperationId = (string)null,
+            runtimeRoot = liveness.RuntimeRoot,
+            runtimeSlotId = liveness.RuntimeSlotId,
+            coordinatorPid = liveness.CoordinatorPid,
+            coordinatorStartIdentity = liveness.CoordinatorStartIdentity,
+            coordinatorExecutable = liveness.CoordinatorExecutable,
+            coordinatorExecutableSha256 = liveness.CoordinatorExecutableSha256,
+            expectedCoordinatorExecutableSha256 = liveness.ExpectedCoordinatorExecutableSha256,
+            healthPipeAvailable = liveness.HealthPipeAvailable,
+            durableStatePreserved = liveness.DurableStatePreserved,
+            acceptedOperationOwned = liveness.AcceptedOperationOwned,
+            recoverySafe = liveness.RecoverySafe
+        };
+        WriteJsonPayload(JsonSerializer.Serialize(failure, Program.JsonOptions));
+        return 4;
     }
 
     private static string AgentName()
@@ -618,18 +765,23 @@ internal static class CoordinatorServer
         }
 
         CoordinatorState state = null;
+        IDisposable healthServer = null;
         try
         {
+            bool shutdownRequested = false;
+            CoordinatorControlPlane.PublishIdentity(root, slot);
+            healthServer = CoordinatorControlPlane.StartHealthServer(root, slot,
+                () => shutdownRequested);
+
             CoordinatorOptions configured = optionsOverride ?? CoordinatorOptions.ForProduction(root, slot);
             state = new(root, configured.ForScope(root, slot));
-            state.StartRecoveryWork();
-            started?.Invoke(state);
 
             using CancellationTokenSource acceptShutdown = new();
             List<ClientSession> clients = new();
             object clientsGate = new();
-            bool shutdownRequested = false;
             ClientSession shutdownRequester = null;
+            state.StartRecoveryWork();
+            started?.Invoke(state);
 
             void RequestShutdown(ClientSession requester)
             {
@@ -702,6 +854,8 @@ internal static class CoordinatorServer
         }
         finally
         {
+            healthServer?.Dispose();
+            CoordinatorControlPlane.RemoveIdentityIfOwned(root);
             state?.TraceHostEvent("coordinator.process.shutting_down");
             try
             {

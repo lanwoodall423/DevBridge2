@@ -233,6 +233,7 @@ internal static partial class OfflineTests
         Run("legacy runtime slots migrate atomically and fail closed", TestLegacyRuntimeSlotMigration);
         Run("two coordinators cannot own one runtime slot", TestTwoCoordinatorsCannotOwnSameSlot);
         Run("finite commands have bounded terminal responses", TestFiniteCommandsHaveBoundedTerminalResponses);
+        Run("finite JSON timeout reports liveness evidence", TestFiniteJsonTimeoutReportsLiveness);
         Run("durable wait response policy remains unbounded", TestDurableWaitResponsePolicyRemainsUnbounded);
         Run("simultaneous shutdown clients are bounded and durable", TestSimultaneousShutdownClientsAreBoundedAndDurable);
         Run("coordinator trace lifecycle events are ordered", TestCoordinatorTraceLifecycleOrder);

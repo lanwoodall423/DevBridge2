@@ -190,6 +190,53 @@ internal static partial class OfflineTests
             "finite command timeout was not explicit about possible durable acceptance");
     }
 
+    private static void TestFiniteJsonTimeoutReportsLiveness()
+    {
+        using Fixture fixture = Fixture.ReadyWithLease();
+        string slot = RuntimeScope.ForRoot(fixture.Root);
+        using NamedPipeServerStream server = new(PipeNames.ForSlot(fixture.Root, slot),
+            PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+        Task accept = Task.Run(() =>
+        {
+            try
+            {
+                server.WaitForConnection();
+                using StreamReader reader = new(server, Encoding.UTF8, false, 4096, leaveOpen: true);
+                reader.ReadLine();
+                Thread.Sleep(500);
+            }
+            catch (IOException)
+            {
+            }
+        });
+
+        TextWriter previousOut = Console.Out;
+        using StringWriter output = new();
+        Console.SetOut(output);
+        try
+        {
+            int exitCode = CoordinatorClient.Run(fixture.Root, new[] { "status", "--json" },
+                slot, null, null, TimeSpan.FromMilliseconds(150));
+            Assert(exitCode == 4, "finite JSON timeout did not return the liveness failure exit code");
+        }
+        finally
+        {
+            Console.SetOut(previousOut);
+            server.Dispose();
+            accept.Wait(TimeSpan.FromSeconds(2));
+        }
+
+        using JsonDocument document = JsonDocument.Parse(output.ToString());
+        JsonElement response = document.RootElement;
+        Assert(response.GetProperty("errorCode").GetString() == "DEVBRIDGE_COMMAND_TIMEOUT",
+            "finite JSON timeout did not preserve its error code");
+        Assert(response.GetProperty("timeoutBoundary").GetString() == "coordinator-response",
+            "finite JSON timeout did not identify the response boundary");
+        Assert(response.GetProperty("commandMayHaveBeenAccepted").GetBoolean() &&
+            response.GetProperty("retrySafe").GetBoolean(),
+            "finite JSON timeout did not classify a read-only retry as safe");
+    }
+
     private static void TestDurableWaitResponsePolicyRemainsUnbounded()
     {
         Assert(!CoordinatorResponsePolicy.IsFinite("wait-ready", Array.Empty<string>()),

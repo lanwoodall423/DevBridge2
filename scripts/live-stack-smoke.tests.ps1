@@ -109,7 +109,11 @@ exit /b %ERRORLEVEL%
     Set-Content -LiteralPath (Join-Path $gameRoot 'Mods\Frontier\About\About.xml') -Value '<ModMetaData><packageId>lan.frontier</packageId><modVersion>fixture.test</modVersion></ModMetaData>' -Encoding utf8
     Set-Content -LiteralPath (Join-Path $fixtureRoot 'fixture.csproj') -Value '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net472</TargetFramework><LangVersion>latest</LangVersion><AssemblyName>Fixture</AssemblyName><Version>1.0.0</Version><AssemblyVersion>1.0.0.0</AssemblyVersion><FileVersion>1.0.0.0</FileVersion><InformationalVersion>fixture.test</InformationalVersion><Nullable>disable</Nullable><ImplicitUsings>disable</ImplicitUsings><Deterministic>true</Deterministic><ContinuousIntegrationBuild>true</ContinuousIntegrationBuild><DebugType>None</DebugType><DebugSymbols>false</DebugSymbols></PropertyGroup></Project>' -Encoding utf8
     Set-Content -LiteralPath (Join-Path $fixtureRoot 'Fixture.cs') -Value 'public static class Fixture { public const int Version = 1; }' -Encoding utf8
+    New-Item -ItemType Directory -Force -Path (Join-Path $devRoot 'About') | Out-Null
+    Set-Content -LiteralPath (Join-Path $devRoot 'About\About.xml') -Value '<ModMetaData><packageId>lan.frontier</packageId><modVersion>fixture.test</modVersion></ModMetaData>' -Encoding utf8
     Set-Content -LiteralPath (Join-Path $devRoot 'DevelopmentProjects\live-stack-fixture.json') -Value (@{
+        entityType = 'fixture'
+        productionEligible = $false
         schemaVersion = 'devbridge-mod-development/v1'
         project = 'frontier'
         sourceProject = 'fixture/fixture.csproj'
@@ -117,6 +121,10 @@ exit /b %ERRORLEVEL%
         expectedAssembly = 'Fixture.dll'
         deploymentTarget = '1.6/Assemblies/Fixture.dll'
         testRecipe = 'live-stack-smoke'
+        runtimePackage = @{
+            sourceRoot = '.'
+            include = @('About/About.xml')
+        }
     } | ConvertTo-Json -Depth 5) -Encoding utf8
     Set-Content -LiteralPath (Join-Path $devRoot 'Source\BridgeTools\DevBridge2.BridgeTools.csproj') -Value '<Project><ItemGroup><PackageReference Include="RimBridgeServer.Sdk" Version="2.0.0" /></ItemGroup></Project>' -Encoding utf8
     Set-Content -LiteralPath (Join-Path $devRoot 'RimBridgeProtocolCompatibility.json') -Value (@{

@@ -91,6 +91,39 @@ internal static partial class OfflineTests
             "shell and arbitrary command injection fields must be rejected");
     }
 
+    private static void TestExplicitProjectRecipeFile()
+    {
+        using Fixture fixture = Fixture.ReadyWithoutLease();
+        string projectRecipeDirectory = Path.Combine(Path.GetTempPath(),
+            "devbridge-project-recipe-" + Guid.NewGuid().ToString("N"));
+        string projectRecipePath = Path.Combine(projectRecipeDirectory, "quicktest-smoke.json");
+        try
+        {
+            Directory.CreateDirectory(projectRecipeDirectory);
+            File.WriteAllText(projectRecipePath, SmokeRecipe);
+            BridgeRequest request = Request("test", "recipe-agent", 991,
+                "recipe", "show", "quicktest-smoke", "--recipe-file", projectRecipePath);
+            request.Json = true;
+            List<string> output = new();
+            int exitCode = fixture.State.Execute(request, output.Add, () => true);
+            RecipeResponse show = fixture.State.CreateRecipeJsonResponse(request, exitCode);
+            Assert(show is RecipeShowResponse response &&
+                   response.ExitCode == 0 &&
+                   response.Recipe?.Id == "quicktest-smoke",
+                "explicit project-owned recipe files must bypass the central catalog (type=" +
+                    show.GetType().Name + ", errorCode=" +
+                    (show is RecipeShowResponse showFailure ? showFailure.ErrorCode :
+                        show is RecipeListResponse listFailure ? listFailure.ErrorCode : null) +
+                    ", error=" + (show is RecipeShowResponse showError ? showError.Error :
+                        show is RecipeListResponse listError ? listError.Error : null) +
+                    ", output=" + string.Join("|", output) + ")");
+        }
+        finally
+        {
+            try { Directory.Delete(projectRecipeDirectory, recursive: true); } catch { }
+        }
+    }
+
     private static void TestV2RecipeContractIsExplicitAndBounded()
     {
         using Fixture fixture = Fixture.ReadyWithoutLease();

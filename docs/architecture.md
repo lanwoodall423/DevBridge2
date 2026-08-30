@@ -65,6 +65,19 @@ mismatches, and missing installed runtime layout have distinct error codes. Doct
 preflight failures expose the bounded attempted executable, resolution source, identity roots,
 existence flags, and next action. Tooling-only operations do not resolve a live game identity.
 
+## Project metadata boundary
+
+DevBridge2 is an execution owner, not a production-project catalog. A content repository owns its
+production identity in `.rimdev/stack.json`: package ID, source project, configuration, expected
+assembly, deployment target, test recipe, dependencies, and the complete runtime package.
+RimLiaison validates that manifest against the repository and materializes a temporary execution
+contract when DevBridge2 needs descriptor-shaped input.
+
+`DevelopmentProjects` is reserved for explicit non-production fixtures, tests, internal examples,
+and examples. Each retained descriptor must declare `entityType` as one of those categories and
+set `productionEligible` to `false`; the static validator and descriptor path guard reject
+unclassified production metadata with `EXTERNAL_PRODUCTION_DESCRIPTOR_IN_TOOLING`.
+
 Leases are durable, owner/session-bound records. The lease ID and stable agent identity authorize
 renew/end/stop/ensure-ready operations. Connected test sessions renew only while connected. Expiry,
 disconnect, and restart recovery never transfer authorization to another owner.
@@ -99,6 +112,22 @@ ten polls over ten seconds means 10 requests plus 10 snapshot responses). Wait-e
 request and one terminal response, regardless of how long it remains pending; the pending response is not
 written until a matching change, condition, timeout, shutdown, or disconnect occurs. Both use the existing
 IPC v2 frame limits; the agent projection is deliberately much smaller than the legacy response.
+
+### Coordinator control-plane liveness
+
+The coordinator publishes a small control identity under `Runtime/coordinator-control.json` and
+answers `ping` on a separate current-user named pipe. `coordinator probe --json` reads that boundary
+without dispatching a normal command. It distinguishes an absent or starting coordinator, a
+responsive or draining coordinator, unavailable health IPC, an unresponsive process, and identity
+mismatch. A process is eligible for recovery only when its PID, process-start identity, canonical
+executable path, executable SHA-256, runtime slot, and durable `Runtime/state.json` all agree.
+
+`coordinator recover --json` is a bounded coordinator-only recycle. It terminates only the verified
+coordinator, never RimWorld, waits for the slot mutex to be released, and starts exactly one
+canonical replacement. Durable state is not rewritten; accepted restart, readiness, maintenance,
+and drain operations are therefore reloaded by the replacement. Ambiguous identity, conflicting
+slot ownership, unreadable state, and replacement health failure return structured
+`DEVBRIDGE_COORDINATOR_RECOVERY_FAILED` evidence and fail closed.
 
 ## Lease-safe game primitives
 
@@ -144,15 +173,19 @@ equivalent transition), with responses that expose the state fields a caller can
 the action and after reload. The current Frontier build registers no such capability, so DevBridge2 does
 not use coordinate clicks, screenshots, or Frontier-specific action IDs to fake that contract.
 
-Autonomous test recipes are repository-owned files under `TestRecipes/`. `devbridge-test-recipe/v1`
-retains its strict read-only contract: project aliases, typed generation inputs, readiness/Quicktest
-and companion evidence requirements, bounded budgets, and policy-approved read-only RimBridge calls.
-V1 does not acquire a new mutation meaning. Shell commands, arbitrary argv or environment values,
-filesystem writes, profile mutation, and RimWorld lifecycle tools are not recipe concepts. Discovery
-uses `test recipe list|show|plan`; `agent plan --recipe <id>` returns the versioned
-`devbridge-agent-plan/v1` projection without acquiring a lease, registering intent, saving state,
-restarting, writing ModsConfig, or calling RimBridge. The planner reuses project/profile resolution
-and frozen-generation evidence, so an already-satisfied recipe reports zero estimated launches.
+Autonomous test recipes are owned by the repository that defines their semantics. DevBridge2 retains
+only genuinely generic built-ins in its central `TestRecipes/` catalog. A caller with a project-owned
+recipe must pass `--recipe-file <absolute-json-path>`; the coordinator loads exactly that file and does
+not search source checkouts, worktrees, or arbitrary catalog paths. The legacy command without this
+option remains bounded to the central catalog for generic built-ins and exact compatibility files.
+`devbridge-test-recipe/v1` retains its strict read-only contract: project aliases, typed generation inputs,
+readiness/Quicktest and companion evidence requirements, bounded budgets, and policy-approved read-only
+RimBridge calls. V1 does not acquire a new mutation meaning. Shell commands, arbitrary argv or
+environment values, filesystem writes, profile mutation, and RimWorld lifecycle tools are not recipe
+concepts. Discovery uses `test recipe list|show|plan`; `agent plan --recipe <id>` returns the versioned
+`devbridge-agent-plan/v1` projection without acquiring a lease, registering intent, saving state, restarting,
+writing ModsConfig, or calling RimBridge. The planner reuses project/profile resolution and frozen-generation
+evidence, so an already-satisfied recipe reports zero estimated launches.
 
 `devbridge-test-recipe/v2` adds a deliberately smaller behavioral-fixture contract. A recipe must set
 `allowInGameMutation: true` before it may include policy-classified in-game tools, and each operation

@@ -81,30 +81,50 @@ internal sealed class RecipeCatalog
         recipes.TryGetValue(id ?? string.Empty, out recipe);
 
     internal static bool TryLoad(string root, out RecipeCatalog catalog,
-        out string errorCode, out string error)
+        out string errorCode, out string error, string recipeFilePath = null)
     {
         catalog = null;
         errorCode = null;
         error = null;
-        string directory = Path.Combine(root, "TestRecipes");
-        if (!Directory.Exists(directory))
-        {
-            errorCode = "TEST_RECIPE_DIRECTORY_MISSING";
-            error = "The repository-owned TestRecipes directory is missing.";
-            return false;
-        }
-
         string[] paths;
-        try
+        if (!string.IsNullOrWhiteSpace(recipeFilePath))
         {
-            paths = Directory.GetFiles(directory, "*.json", SearchOption.TopDirectoryOnly)
-                .OrderBy(value => value, StringComparer.OrdinalIgnoreCase).ToArray();
+            if (!Path.IsPathRooted(recipeFilePath) ||
+                !string.Equals(Path.GetExtension(recipeFilePath), ".json", StringComparison.OrdinalIgnoreCase))
+            {
+                errorCode = "TEST_RECIPE_FILE_PATH_INVALID";
+                error = "An explicit recipe file must be an absolute JSON path.";
+                return false;
+            }
+            if (!File.Exists(recipeFilePath))
+            {
+                errorCode = "TEST_RECIPE_FILE_NOT_FOUND";
+                error = "The explicit project-owned recipe file is missing.";
+                return false;
+            }
+            paths = [Path.GetFullPath(recipeFilePath)];
         }
-        catch (Exception exception) when (exception is IOException || exception is UnauthorizedAccessException)
+        else
         {
-            errorCode = "TEST_RECIPE_CATALOG_UNAVAILABLE";
-            error = "The repository-owned TestRecipes directory could not be read.";
-            return false;
+            string directory = Path.Combine(root, "TestRecipes");
+            if (!Directory.Exists(directory))
+            {
+                errorCode = "TEST_RECIPE_DIRECTORY_MISSING";
+                error = "The repository-owned TestRecipes directory is missing.";
+                return false;
+            }
+
+            try
+            {
+                paths = Directory.GetFiles(directory, "*.json", SearchOption.TopDirectoryOnly)
+                    .OrderBy(value => value, StringComparer.OrdinalIgnoreCase).ToArray();
+            }
+            catch (Exception exception) when (exception is IOException || exception is UnauthorizedAccessException)
+            {
+                errorCode = "TEST_RECIPE_CATALOG_UNAVAILABLE";
+                error = "The repository-owned TestRecipes directory could not be read.";
+                return false;
+            }
         }
 
         if (paths.Length > MaxRecipes)
@@ -1080,29 +1100,56 @@ internal sealed partial class CoordinatorState
             string.Equals(operation, "show", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(operation, "plan", StringComparison.OrdinalIgnoreCase);
     }
-
     private int TestRecipe(IReadOnlyList<string> arguments, BridgeRequest request,
         Action<string> emit, Func<bool> connected)
     {
-        if (arguments.Count < 2)
+        List<string> normalized = arguments.ToList();
+        if (!TryExtractRecipeFile(normalized, request, out string recipeError))
+            return RecipeUsage(request, recipeError);
+        if (normalized.Count < 2)
         {
-            emit("Usage: DevBridge.cmd test recipe list|show <id>|plan <id>|run <id> [budget options]");
+            emit("Usage: DevBridge.cmd test recipe list|show <id>|plan <id>|run <id> [--recipe-file <path>] [options]");
             return 2;
         }
-        string operation = arguments[1]?.Trim().ToLowerInvariant();
+        string operation = normalized[1]?.Trim().ToLowerInvariant();
         return operation switch
         {
-            "list" => RecipeList(arguments, request),
-            "show" => RecipeShow(arguments, request),
-            "plan" => RecipePlan(arguments, request),
-            "run" => RecipeRun(arguments, request, emit, connected),
+            "list" => RecipeList(normalized, request),
+            "show" => RecipeShow(normalized, request),
+            "plan" => RecipePlan(normalized, request),
+            "run" => RecipeRun(normalized, request, emit, connected),
             _ => RecipeUsage(request, "unknown recipe operation")
         };
     }
 
+    private static bool TryExtractRecipeFile(
+        List<string> arguments,
+        BridgeRequest request,
+        out string error)
+    {
+        error = null;
+        for (int index = arguments.Count - 1; index >= 0; index--)
+        {
+            if (!string.Equals(arguments[index], "--recipe-file", StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (!string.IsNullOrWhiteSpace(request.RecipeFilePath) ||
+                index + 1 >= arguments.Count ||
+                !Path.IsPathRooted(arguments[index + 1]) ||
+                !string.Equals(Path.GetExtension(arguments[index + 1]), ".json", StringComparison.OrdinalIgnoreCase))
+            {
+                error = "recipe --recipe-file requires one absolute JSON path.";
+                return false;
+            }
+            request.RecipeFilePath = Path.GetFullPath(arguments[index + 1]);
+            arguments.RemoveAt(index + 1);
+            arguments.RemoveAt(index);
+        }
+        return true;
+    }
     private int RecipeList(IReadOnlyList<string> arguments, BridgeRequest request)
     {
-        if (!RecipeCatalog.TryLoad(root, out RecipeCatalog catalog, out string code, out string error))
+        if (!RecipeCatalog.TryLoad(root, out RecipeCatalog catalog, out string code, out string error,
+                request.RecipeFilePath))
         {
             request.RecipeResponse = new RecipeListResponse { ErrorCode = code, Error = error, ExitCode = 4 };
             return 4;
@@ -1125,7 +1172,8 @@ internal sealed partial class CoordinatorState
         if (arguments.Count < 3 || string.IsNullOrWhiteSpace(arguments[2]) || arguments.Count > 4 ||
             (arguments.Count == 4 && !string.Equals(arguments[3], "--json", StringComparison.OrdinalIgnoreCase)))
             return RecipeUsage(request, "recipe show requires one recipe id");
-        if (!RecipeCatalog.TryLoad(root, out RecipeCatalog catalog, out string code, out string error))
+        if (!RecipeCatalog.TryLoad(root, out RecipeCatalog catalog, out string code, out string error,
+                request.RecipeFilePath))
         {
             request.RecipeResponse = new RecipeShowResponse { ErrorCode = code, Error = error, ExitCode = 4 };
             return 4;
@@ -1168,7 +1216,8 @@ internal sealed partial class CoordinatorState
 
     private RecipePlanData BuildRecipePlan(string id, BridgeRequest request)
     {
-        if (!RecipeCatalog.TryLoad(root, out RecipeCatalog catalog, out string code, out string error))
+        if (!RecipeCatalog.TryLoad(root, out RecipeCatalog catalog, out string code, out string error,
+                request.RecipeFilePath))
             return FailedRecipePlan(id, code, error);
         if (!catalog.TryGet(id, out TestRecipeDefinition recipe))
             return FailedRecipePlan(id, "TEST_RECIPE_NOT_FOUND", "The requested recipe is not present in the repository-owned catalog.");
@@ -1287,7 +1336,8 @@ internal sealed partial class CoordinatorState
                 "inspect-evidence", null, request.WorkflowId, RecipeRunId(request));
             return 4;
         }
-        RecipeCatalog.TryLoad(root, out RecipeCatalog catalog, out _, out _);
+        RecipeCatalog.TryLoad(root, out RecipeCatalog catalog, out _, out _,
+            request.RecipeFilePath);
         catalog.TryGet(id, out TestRecipeDefinition recipe);
         EffectiveRecipeBudget budget = EffectiveBudget(recipe.Budget, callerBudget);
         RecipeBudgetResult budgetResult = new()

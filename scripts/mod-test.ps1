@@ -351,7 +351,7 @@ function Read-Descriptor {
     try { $value = Get-Content -LiteralPath $descriptorPath -Raw | ConvertFrom-Json -Depth 16 }
     catch { throw "descriptor is not bounded valid JSON: $($_.Exception.Message)" }
     $allowed = @('schemaVersion', 'entityType', 'productionEligible', 'project', 'sourceProject', 'configuration', 'expectedAssembly',
-        'deploymentTarget', 'testRecipe', 'buildProperties', 'runtimePackage', 'deploymentRole')
+        'deploymentTarget', 'testRecipe', 'testRecipePath', 'buildProperties', 'runtimePackage', 'deploymentRole')
     foreach ($property in $value.PSObject.Properties.Name) {
         if ($property -notin $allowed) { throw "descriptor field is not allowed: $property" }
     }
@@ -391,6 +391,20 @@ function Read-Descriptor {
     $value | Add-Member -NotePropertyName ResolvedTarget -NotePropertyValue (Resolve-DeploymentTarget ([string]$value.deploymentTarget))
     $value | Add-Member -NotePropertyName ResolvedTargetRoot -NotePropertyValue $deploymentRoot
     return $value
+}
+
+function Get-RecipeArguments {
+    param([Parameter(Mandatory = $true)]$Descriptor)
+    if ([string]::IsNullOrWhiteSpace([string]$Descriptor.testRecipePath)) {
+        return @()
+    }
+    $safe = Get-SafeRelativePath ([string]$Descriptor.testRecipePath) 'testRecipePath'
+    if ([IO.Path]::GetExtension($safe) -ine '.json') { throw 'testRecipePath must identify a JSON file' }
+    $descriptorDirectory = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($descriptorPath))
+    $recipePath = [IO.Path]::GetFullPath((Join-Path $descriptorDirectory $safe))
+    if (-not (Test-PathWithin $recipePath $descriptorDirectory)) { throw 'testRecipePath escapes the descriptor directory' }
+    if (-not (Test-Path -LiteralPath $recipePath -PathType Leaf)) { throw "testRecipePath was not found: $recipePath" }
+    return @('--recipe-file', $recipePath)
 }
 
 function Get-DescriptorBuildProperties {
@@ -1398,7 +1412,7 @@ try {
             'mod-test descriptor validation' 4 $null $false
     }
 
-    $show = Invoke-BridgeJson @('test', 'recipe', 'show', [string]$descriptor.testRecipe)
+    $show = Invoke-BridgeJson (@('test', 'recipe', 'show', [string]$descriptor.testRecipe) + (Get-RecipeArguments $descriptor))
     Write-TransactionTrace 'planning' 'recipe show completed'
     $recipeInfo = Require-BridgeSuccess 'planning' 'fix-recipe-descriptor' 'recipe-show' $show
     $recipeProjects = @($recipeInfo.recipe.projects | ForEach-Object { [string]$_ })
@@ -1409,7 +1423,7 @@ try {
     $projectPlanResult = Invoke-BridgeJson @('project', 'resolve', $Project)
     Write-TransactionTrace 'planning' 'project resolve completed'
     $projectPlan = Require-BridgeSuccess 'planning' 'fix-project-resolution' 'project-resolve' $projectPlanResult
-    $recipePlanResult = Invoke-BridgeJson @('test', 'recipe', 'plan', [string]$descriptor.testRecipe)
+    $recipePlanResult = Invoke-BridgeJson (@('test', 'recipe', 'plan', [string]$descriptor.testRecipe) + (Get-RecipeArguments $descriptor))
     Write-TransactionTrace 'planning' 'recipe plan completed'
     $recipePlan = Require-BridgeSuccess 'planning' 'fix-recipe-plan' 'recipe-plan-before-build' $recipePlanResult
     $script:Report.planning = [ordered]@{
@@ -1771,7 +1785,7 @@ try {
         Set-Failure 'lease' 'inspect-runtime-status' 'DEVELOPMENT_LEASE_INVALID' 'the coordinator returned an invalid lease capability ID' 'test begin' 4 $script:Report.runtime.leaseId $false
     }
 
-    $postPlanResult = Invoke-BridgeJson @('test', 'recipe', 'plan', [string]$descriptor.testRecipe)
+    $postPlanResult = Invoke-BridgeJson (@('test', 'recipe', 'plan', [string]$descriptor.testRecipe) + (Get-RecipeArguments $descriptor))
     $postPlan = Require-BridgeSuccess 'planning' 'fix-recipe-plan' 'recipe-plan-after-registration' $postPlanResult
     if ($legacyExactAdopted) {
         Confirm-LegacyExactUnchanged $descriptor $packageFiles
@@ -1899,7 +1913,7 @@ try {
     if (-not $SkipRecipe) {
         $renew = Invoke-BridgeJson @('test', 'renew', [string]$script:Report.runtime.leaseId)
         Require-BridgeSuccess 'lease' 'renew-or-end-lease' 'test-renew-before-recipe' $renew | Out-Null
-        $recipeArguments = @('test', 'recipe', 'run', [string]$descriptor.testRecipe, '--lease', [string]$script:Report.runtime.leaseId)
+        $recipeArguments = @('test', 'recipe', 'run', [string]$descriptor.testRecipe, '--lease', [string]$script:Report.runtime.leaseId) + (Get-RecipeArguments $descriptor)
         if (-not [string]::IsNullOrWhiteSpace($WorkflowId)) {
             $recipeArguments += @('--workflow-id', $WorkflowId)
         }

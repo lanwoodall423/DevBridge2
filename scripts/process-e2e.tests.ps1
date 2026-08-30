@@ -200,6 +200,25 @@ $activeMods
 
     $recipesSource = Join-Path $repoRoot 'TestRecipes'
     Copy-Item -LiteralPath $recipesSource -Destination (Join-Path $root 'TestRecipes') -Recurse
+    Write-Utf8File (Join-Path $root 'TestRecipes\mod-development-smoke.json') @'
+{
+  "schemaVersion": "devbridge-test-recipe/v1",
+  "id": "mod-development-smoke",
+  "description": "Process E2E project-owned recipe fixture.",
+  "projects": ["frontier"],
+  "inputs": { "quicktest": true },
+  "requiresReady": true,
+  "success": { "quicktestReady": true },
+  "budget": {
+    "timeoutSeconds": 120,
+    "maxRimWorldLaunches": 1,
+    "maxRecipeAttempts": 1,
+    "maxCoordinatorRefreshes": 4,
+    "stopOnRepeatedFailureFingerprint": true,
+    "maxRepeatedFailureCount": 1
+  }
+}
+'@
 
     $slot = 'e2e-' + $fixtureId.Substring(0, 8)
     $env:DEVBRIDGE_TEST_RIMWORLD_PATH = $fakeExe

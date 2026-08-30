@@ -1,12 +1,16 @@
-# DevBridge2
+# RimLiaison.Runtime
 
-DevBridge2 is a Windows/.NET developer coordinator for RimWorld. It owns safe local lifecycle
-operations, test leases, readiness evidence, ModsConfig profiles, generation history, recovery, and
-optional authenticated RimBridgeServer routing. It is designed for multiple agents sharing one local
-RimWorld installation; it does not replace RimBridgeServer's live-game tools.
-When RimLiaison is present, it is the normal agent entry point. DevBridge2 remains the sole lifecycle
-owner: agents must not start RimWorld independently through GABS, and profile/ModsConfig mutations
-remain with DevBridge2 while it owns a generation.
+This repository contains the modular Windows/.NET runtime component used by RimLiaison for
+RimWorld lifecycle, leases, readiness, deployment, generations, recovery, and runtime execution.
+The source remains separate from RimLiaison to preserve module ownership and focused validation.
+Its installed package lives under `RimWorld\Mods` for technical reasons, but it is not an
+independent production product: RimLiaison owns its qualification, single production fingerprint,
+promotion, and ordinary agent workflow. It does not replace the separate RimBridgeServer game-side
+control boundary.
+
+When RimLiaison is present, it is the only ordinary agent entry point. DevBridge commands below are
+component diagnostics and development operations; human production administration uses the
+RimLiaison `doctor`, `status`, `reset`, `recover`, qualification, and promotion commands.
 
 ## Support and requirements
 
@@ -66,7 +70,7 @@ self-hosted runner labeled `Windows` and `rimworld`, with `RIMWORLD_ROOT` set to
 root and the active `brrainz.rimbridgeserver` mod directly under `RimWorld\Mods`. Ordinary hosted CI
 uses only `scripts\validate.ps1` and never claims live compatibility.
 
-## Build and release
+## Build and component packaging
 
 The canonical impact-aware offline gate is:
 
@@ -74,43 +78,29 @@ The canonical impact-aware offline gate is:
 pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\validate.ps1
 ```
 
-It inspects the Git change set, always performs cheap repository invariants, and selects the minimum
-safe affected restore/build/test stages. Coordinator.Tests transitively covers Coordinator and
-Coordinator.Core; unrelated BridgeTools, FakeRimWorld, publish, live-stack, and process matrices are
-skipped. Use `scripts\validate.ps1 -Full` for an explicit complete safe offline run. To intentionally
-update the NuGet lock file, run `scripts\validate.ps1 -UpdatePackages`, review
-`Source\BridgeTools\packages.lock.json`, and rerun the normal gate.
+It inspects the Git change set and selects the minimum safe restore/build/test stages. The
+deterministic `scripts\release.ps1` entrypoint produces an internal runtime component package for
+RimLiaison integration and local inspection. It does not publish a standalone production identity;
+RimLiaison qualification and promotion are the only production release path.
 
-The deterministic package entrypoint is:
-
-```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\release.ps1 `
-  -RimWorldManagedDir "<RimWorld root>\RimWorldWin64_Data\Managed"
-```
-
-It refuses a dirty source tree, checks version/changelog consistency, reruns validation, builds the
-coordinator and companion, builds the Mod when the managed directory is available, and writes an
-ignored `artifacts\release\DevBridge2-<version>` directory with a manifest and SHA-256 checksums.
-`-DryRun -AllowDirty` is for local inspection only and marks the resulting identity `.dirty`.
-
-The package contains only the Mod metadata/runtime assembly when available, coordinator runtime files,
-the optional companion DLL, wrapper, compatibility contract, and concise documentation. Source,
+The package contains the Mod metadata/runtime assembly when available, coordinator runtime files,
+the optional companion DLL, wrapper, protocol contract, and concise documentation. Source,
 `bin`/`obj`, Runtime state, PDBs, and proprietary SDK/game assemblies are excluded.
 
 More operational guidance is in [`START_HERE.md`](START_HERE.md) and [`MAINTENANCE.md`](MAINTENANCE.md).
 The ownership and state model is summarized in [`docs/architecture.md`](docs/architecture.md).
-The optional cross-stack workflow correlation contract is summarized in [`docs/correlation.md`](docs/correlation.md).
+The optional cross-stack workflow correlation contract is summarized in
+[`docs/correlation.md`](docs/correlation.md).
 
-When working from a RimLiaison target repository, the normal loop is simply edit, run
-`rimliaison affected --run --json`, inspect the result, and edit again. RimLiaison automatically invokes
-the owner transaction for build-relevant changes. Inspect `artifactFreshness` before treating a
-source-change PASS as valid; `loadedArtifactFreshnessProven: false` is a fail-closed result, not a
-successful Quicktest.
 
-DevBridge2's independent Windows validation includes the complete deterministic fake/process-host
-E2E suite. The no-RimWorld cross-stack contract gate is owned by RimLiaison and consumes pinned
-DevBridge2 revisions through the versioned recipe, generation, and artifact-freshness envelopes;
-it is a composition check, not a replacement for this repository's lifecycle tests or the
-self-hosted real-RimWorld smoke.
+When working from a RimLiaison target repository, the only ordinary agent loop is:
+`rimliaison affected --run --fail-fast --json`. RimLiaison invokes the internal runtime transaction
+for build-relevant changes and owns the production evidence. Inspect `artifactFreshness` before
+treating a source-change PASS as valid; `loadedArtifactFreshnessProven: false` is fail-closed.
+
+This repository's validation covers the runtime component's deterministic fake/process-host
+behavior. RimLiaison owns the cross-stack contract, production qualification, promotion, and
+artifact-freshness proof; the self-hosted real-RimWorld smoke remains a separate component
+integration gate.
 
 There is currently no explicit root `LICENSE` file; licensing must be resolved before a public release.

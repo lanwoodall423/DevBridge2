@@ -330,6 +330,9 @@ if (-not [string]::IsNullOrWhiteSpace($assemblyProductVersion) -and
 $fileRecords = @(Get-PackageFileRecords $releaseRoot)
 $manifest = [ordered]@{
     contract = 'devbridge-release/v1'
+    ownerProduct = 'RimLiaison'
+    componentRole = 'runtime'
+    productionEligible = $false
     productVersion = $productVersion
     informationalVersion = $informationalVersion
     sourceRevision = $revision
